@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
+import Sidebar from "./components/Sidebar";
+import MissionControl from "./components/MissionControl";
 
 const API_BASE_URL = "http://127.0.0.1:8000";
 
@@ -530,44 +532,10 @@ function App() {
 
   return (
     <div style={styles.app}>
-      <aside style={styles.sidebar}>
-        <div>
-          <h2 style={styles.logo}>⚡ PulseAI</h2>
-          <p style={styles.tagline}>Your AI content team</p>
-        </div>
-
-        <div style={styles.divider} />
-
-        <nav>
-          {menuItems.map((item) => {
-            const isActive = activePage === item.name;
-
-            return (
-              <button
-                key={item.name}
-                onClick={() => setActivePage(item.name)}
-                style={{
-                  ...styles.menuButton,
-                  backgroundColor: isActive ? "#1d4ed8" : "transparent",
-                  color: isActive ? "#ffffff" : "#cbd5e1",
-                }}
-              >
-                <span style={styles.menuIcon}>{item.icon}</span>
-                <span>{item.name}</span>
-              </button>
-            );
-          })}
-        </nav>
-
-        <div style={styles.sidebarFooter}>
-          <div style={styles.userAvatar}>D</div>
-
-          <div>
-            <div style={styles.userName}>Daniel</div>
-            <div style={styles.userPlan}>Founder workspace</div>
-          </div>
-        </div>
-      </aside>
+      <Sidebar
+  activePage={activePage}
+  setActivePage={setActivePage}
+/>
 
       <main style={styles.main}>
         {activePage === "Mission Control"
