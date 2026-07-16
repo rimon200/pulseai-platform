@@ -55,6 +55,7 @@ function App() {
     },
   ];
 
+  const [clips, setClips] = useState([]);
   useEffect(() => {
   const loadClips = async () => {
     try {
@@ -75,7 +76,6 @@ function App() {
 
   loadClips();
 }, []);
-  const [clips, setClips] = useState([]);
 
   const formatDuration = (startedAt) => {
     if (!startedAt) return "—";

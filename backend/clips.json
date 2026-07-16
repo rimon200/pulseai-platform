@@ -16,5 +16,29 @@
     "creator": "pokimane",
     "score": 81,
     "status": "Ready to review"
+  },
+  {
+    "title": "Test clip from API",
+    "creator": "PulseAI",
+    "score": 75,
+    "status": "Ready to review"
+  },
+  {
+    "title": "Perfect timing",
+    "creator": "pokimane",
+    "score": 76,
+    "status": "Ready to review"
+  },
+  {
+    "title": "Streamer loses it",
+    "creator": "KaiCenat",
+    "score": 99,
+    "status": "Ready to review"
+  },
+  {
+    "title": "Insane 1v5 clutch",
+    "creator": "pokimane",
+    "score": 81,
+    "status": "Ready to review"
   }
 ]

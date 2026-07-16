@@ -1,14 +1,40 @@
 function AIClips({ styles, clips }) {
+  const generateClip = async () => {
+    try {
+      const response = await fetch(
+        "http://127.0.0.1:8000/api/clips/generate",
+        {
+          method: "POST",
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error("Clip generation failed");
+      }
+
+      window.location.reload();
+    } catch (error) {
+      console.error(error);
+      alert("Could not generate a clip.");
+    }
+  };
   return (
     <div>
       <div style={styles.pageHeader}>
-        <div>
-          <h1 style={styles.pageTitle}>AI Clips</h1>
-          <p style={styles.subtitle}>
-            Viral moments detected by PulseAI will appear here.
-          </p>
-        </div>
-      </div>
+  <div>
+    <h1 style={styles.pageTitle}>AI Clips</h1>
+    <p style={styles.subtitle}>
+      Viral moments detected by PulseAI will appear here.
+    </p>
+  </div>
+
+  <button
+    onClick={generateClip}
+    style={styles.addCreatorButton}
+  >
+    Generate Clip
+  </button>
+</div>
 
       <section style={styles.panel}>
         <div style={styles.panelHeader}>

@@ -382,3 +382,77 @@ async def get_performance():
 @app.get("/api/published")
 async def get_published():
     return load_published()
+
+def generate_demo_clip():
+    import random
+
+    titles = [
+        "Insane 1v5 clutch",
+        "Streamer loses it",
+        "Impossible comeback",
+        "Funniest Twitch moment",
+        "Perfect timing",
+        "Unexpected victory",
+    ]
+
+    creators = [
+        "KaiCenat",
+        "xQc",
+        "pokimane",
+        "shroud",
+        "tarik",
+    ]
+
+    return {
+        "title": random.choice(titles),
+        "creator": random.choice(creators),
+        "score": random.randint(75, 99),
+        "status": "Ready to review",
+    }
+
+@app.post("/api/clips")
+async def create_clip(clip: dict):
+    clips_file = Path(__file__).resolve().parent / "clips.json"
+
+    try:
+        with clips_file.open("r", encoding="utf-8") as file:
+            clips = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        clips = []
+
+    new_clip = {
+        "title": clip.get("title", "Untitled clip"),
+        "creator": clip.get("creator", "Unknown creator"),
+        "score": clip.get("score", 0),
+        "status": clip.get("status", "Ready to review"),
+    }
+
+    clips.append(new_clip)
+
+    with clips_file.open("w", encoding="utf-8") as file:
+        json.dump(clips, file, indent=2)
+
+    return {
+        "success": True,
+        "clip": new_clip,
+        "clip_count": len(clips),
+    }
+
+@app.post("/api/clips/generate")
+async def generate_clip():
+    clip = generate_demo_clip()
+
+    clips_file = Path(__file__).resolve().parent / "clips.json"
+
+    try:
+        with clips_file.open("r", encoding="utf-8") as file:
+            clips = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        clips = []
+
+    clips.append(clip)
+
+    with clips_file.open("w", encoding="utf-8") as file:
+        json.dump(clips, file, indent=2)
+
+    return clip
