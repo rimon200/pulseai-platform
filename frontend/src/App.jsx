@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import Sidebar from "./components/Sidebar";
 import MissionControl from "./components/MissionControl";
+import LiveStreams from "./components/LiveStreams";
+import AIClips from "./components/AIClips";
+import Publishing from "./components/Publishing";
+import Performance from "./components/Performance";
+import AIAgents from "./components/AIAgents";
+import Settings from "./components/Settings";
 
 const API_BASE_URL = "http://127.0.0.1:8000";
 
@@ -49,14 +55,27 @@ function App() {
     },
   ];
 
-  const clips = [
-    {
-      title: "No real clips generated yet",
-      creator: "PulseAI",
-      score: "—",
-      status: "Waiting for clip intelligence",
-    },
-  ];
+  useEffect(() => {
+  const loadClips = async () => {
+    try {
+      const response = await fetch("http://localhost:8000/api/clips");
+
+      if (!response.ok) {
+        setClips([]);
+        return;
+      }
+
+      const data = await response.json();
+      setClips(data);
+    } catch (error) {
+      console.error(error);
+      setClips([]);
+    }
+  };
+
+  loadClips();
+}, []);
+  const [clips, setClips] = useState([]);
 
   const formatDuration = (startedAt) => {
     if (!startedAt) return "—";
@@ -268,6 +287,16 @@ function App() {
         </div>
 
         <div style={styles.creatorActions}>
+          {isLive && (
+  <a
+    href={`https://www.twitch.tv/${creator.channel}`}
+    target="_blank"
+    rel="noreferrer"
+    style={styles.watchButton}
+  >
+    Watch Live
+  </a>
+)}
           <span
             style={{
               ...styles.statusBadge,
@@ -334,6 +363,7 @@ function App() {
   clips={clips}
   showCreatorForm={showCreatorForm}
   setShowCreatorForm={setShowCreatorForm}
+  closeCreatorForm={closeCreatorForm}
   creatorName={creatorName}
   setCreatorName={setCreatorName}
   creatorChannel={creatorChannel}
@@ -343,7 +373,30 @@ function App() {
   addCreator={addCreator}
   isAddingCreator={isAddingCreator}
 />
-          : renderPlaceholder()}
+          : activePage === "Live Streams" ? (
+  <LiveStreams
+    styles={styles}
+    creators={creators}
+    liveCreators={liveCreators}
+    isLoadingCreators={isLoadingCreators}
+    renderCreatorRow={renderCreatorRow}
+  />
+) : activePage === "AI Clips" ? (
+  <AIClips
+  styles={styles}
+  clips={clips}
+/>
+) : activePage === "Publishing" ? (
+  <Publishing />
+) : activePage === "Performance" ? (
+  <Performance />
+) : activePage === "AI Agents" ? (
+  <AIAgents />
+) : activePage === "Settings" ? (
+  <Settings />
+) : (
+  renderPlaceholder()
+)}
       </main>
     </div>
   );
@@ -648,6 +701,18 @@ const styles = {
     fontSize: "12px",
     fontWeight: "bold",
   },
+
+  watchButton: {
+  background: "#9146FF",
+  color: "#fff",
+  padding: "8px 14px",
+  borderRadius: "8px",
+  textDecoration: "none",
+  fontSize: "13px",
+  fontWeight: "600",
+  marginRight: "10px",
+  transition: "0.2s ease",
+},
 
   deleteButton: {
     width: "29px",

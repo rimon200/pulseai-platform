@@ -10,6 +10,7 @@ function MissionControl({
   clips,
   showCreatorForm,
   setShowCreatorForm,
+  closeCreatorForm,
   creatorName,
   setCreatorName,
   creatorChannel,
@@ -75,8 +76,8 @@ function MissionControl({
 
         <div style={styles.statCard}>
           <span style={styles.statLabel}>Clips Today</span>
-          <strong style={styles.statNumber}>0</strong>
-          <span style={styles.statDetail}>Clip engine coming next</span>
+          <strong style={styles.statNumber}>{clips.length}</strong>
+          <span style={styles.statDetail}>Clips loaded from backend</span>
         </div>
 
         <div style={styles.statCard}>

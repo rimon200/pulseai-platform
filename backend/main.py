@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from pathlib import Path
 
 load_dotenv()
 
@@ -100,6 +101,20 @@ def save_creators(creators: list[dict[str, str]]) -> None:
         ) from error
 
 
+PUBLISHED_FILE = "published_clips.json"
+
+
+def load_published():
+    try:
+        with open(PUBLISHED_FILE, "r") as file:
+            return json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_published(data):
+    with open(PUBLISHED_FILE, "w") as file:
+        json.dump(data, file, indent=2)
 def verify_twitch_credentials() -> None:
     if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
         raise HTTPException(
@@ -330,3 +345,40 @@ def delete_creator(channel_name: str):
     return {
         "message": f"{clean_channel} was removed from monitoring.",
     }
+@app.get("/api/clips")
+async def get_clips():
+    clips_file = Path(__file__).resolve().parent / "clips.json"
+
+    try:
+        with clips_file.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+@app.post("/api/publish")
+async def publish_clip(clip: dict):
+    published = load_published()
+
+    # Don't save duplicates
+    if not any(item["title"] == clip["title"] for item in published):
+        published.append(clip)
+        save_published(published)
+
+    return {
+        "success": True,
+        "message": f"Published '{clip['title']}' successfully!",
+        "published_count": len(published),
+    }
+published_count = 0
+@app.get("/api/performance")
+async def get_performance():
+    published = load_published()
+
+    return {
+        "views": 1247381,
+        "followers": 4392,
+        "revenue": 327.84,
+        "published": len(published),
+    }
+@app.get("/api/published")
+async def get_published():
+    return load_published()
