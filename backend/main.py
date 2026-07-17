@@ -206,6 +206,7 @@ async def get_twitch_channel_data(channel_name: str) -> dict[str, Any]:
             )
 
     streams = stream_response.json().get("data", [])
+    
 
     if not streams:
         return {
@@ -421,11 +422,15 @@ async def create_clip(clip: dict):
         clips = []
 
     new_clip = {
-        "title": clip.get("title", "Untitled clip"),
-        "creator": clip.get("creator", "Unknown creator"),
-        "score": clip.get("score", 0),
-        "status": clip.get("status", "Ready to review"),
-    }
+    "title": clip.get("title", "Untitled clip"),
+    "creator": clip.get("creator", "Unknown creator"),
+    "score": clip.get("score", 0),
+    "status": clip.get("status", "Ready to review"),
+    "viewer_count": clip.get("viewer_count"),
+    "game": clip.get("game"),
+    "started_at": clip.get("started_at"),
+    "thumbnail_url": clip.get("thumbnail_url"),
+}
 
     clips.append(new_clip)
 
@@ -456,3 +461,35 @@ async def generate_clip():
         json.dump(clips, file, indent=2)
 
     return clip
+
+@app.post("/api/clips/auto")
+async def auto_generate_clip():
+    creators = load_creators()
+
+    for creator in creators:
+        try:
+            stream = await get_twitch_channel_data(creator["channel"])
+        except Exception:
+            continue
+
+        if stream.get("is_live"):
+            viewer_count = stream.get("viewer_count", 0)
+            stream_title = stream.get("title") or f"{creator['name']} Live Moment"
+
+            clip = {
+                "title": stream_title,
+                "creator": creator["name"],
+                "score": min(99, 80 + viewer_count // 50000),
+                "status": "Ready to review",
+                "viewer_count": viewer_count,
+                "game": stream.get("game_name"),
+                "started_at": stream.get("started_at"),
+                "thumbnail_url": stream.get("thumbnail_url"),
+            }
+
+            await create_clip(clip)
+            return clip
+
+    return {
+        "message": "No monitored creators are currently live."
+    }
