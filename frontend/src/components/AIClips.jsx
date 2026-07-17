@@ -48,8 +48,11 @@ function AIClips({ styles, clips }) {
 
         <div style={styles.clipGrid}>
           {clips.length > 0 ? (
-            clips.map((clip) => (
-              <div key={clip.title} style={styles.clipCard}>
+            clips.map((clip, index) => (
+              <div
+  key={`${clip.title}-${clip.started_at || "clip"}-${index}`}
+  style={styles.clipCard}
+>
                 <div style={styles.clipPreview}>
   {clip.thumbnail_url ? (
     <img
@@ -86,6 +89,11 @@ function AIClips({ styles, clips }) {
 {clip.game && (
   <div style={{ fontSize: 12, opacity: 0.8 }}>
     🎮 {clip.game}
+  </div>
+)}
+{clip.duration && (
+  <div style={{ fontSize: 12, opacity: 0.8 }}>
+    ⏱️ {clip.duration}s
   </div>
 )}
                   </div>

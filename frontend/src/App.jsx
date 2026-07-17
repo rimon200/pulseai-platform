@@ -58,23 +58,26 @@ function App() {
   const [clips, setClips] = useState([]);
   useEffect(() => {
   const loadClips = async () => {
-    try {
-      const response = await fetch("http://localhost:8000/api/clips");
 
-      if (!response.ok) {
-        setClips([]);
-        return;
-      }
+  try {
+    const response = await fetch("http://localhost:8000/api/clips");
 
-      const data = await response.json();
-      setClips(data);
-    } catch (error) {
-      console.error(error);
+    if (!response.ok) {
       setClips([]);
+      return;
     }
-  };
+
+    const data = await response.json();
+    setClips([...data].reverse().slice(0, 12));
+  } catch (error) {
+    console.error(error);
+    setClips([]);
+  }
+};
 
   loadClips();
+  const interval = setInterval(loadClips, 30000);
+  return () => clearInterval(interval);
 }, []);
 
   const formatDuration = (startedAt) => {

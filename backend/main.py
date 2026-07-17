@@ -2,7 +2,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
-
+import uuid
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, status
@@ -422,6 +422,7 @@ async def create_clip(clip: dict):
         clips = []
 
     new_clip = {
+    "id": str(uuid.uuid4()),
     "title": clip.get("title", "Untitled clip"),
     "creator": clip.get("creator", "Unknown creator"),
     "score": clip.get("score", 0),
@@ -430,6 +431,8 @@ async def create_clip(clip: dict):
     "game": clip.get("game"),
     "started_at": clip.get("started_at"),
     "thumbnail_url": clip.get("thumbnail_url"),
+    "timestamp": clip.get("timestamp"),
+    "duration": clip.get("duration", 30),
 }
 
     clips.append(new_clip)
@@ -475,8 +478,26 @@ async def auto_generate_clip():
         if stream.get("is_live"):
             viewer_count = stream.get("viewer_count", 0)
             stream_title = stream.get("title") or f"{creator['name']} Live Moment"
+            clips_file = Path(__file__).resolve().parent / "clips.json"
 
-            clip = {
+    try:
+        with clips_file.open("r", encoding="utf-8") as file:
+            existing_clips = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        existing_clips = []
+
+    already_created = any(
+        item.get("creator") == creator["name"]
+        and item.get("started_at") == stream.get("started_at")
+        for item in existing_clips
+    )
+
+    if already_created:
+        return {
+            "message": f"A clip for {creator['name']} already exists for this live stream."
+        }
+
+        clip = {
                 "title": stream_title,
                 "creator": creator["name"],
                 "score": min(99, 80 + viewer_count // 50000),
@@ -487,8 +508,8 @@ async def auto_generate_clip():
                 "thumbnail_url": stream.get("thumbnail_url"),
             }
 
-            await create_clip(clip)
-            return clip
+        result = await create_clip(clip)
+        return result["clip"]
 
     return {
         "message": "No monitored creators are currently live."

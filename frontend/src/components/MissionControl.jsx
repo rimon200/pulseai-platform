@@ -154,8 +154,11 @@ function MissionControl({
         </div>
 
         <div style={styles.clipGrid}>
-          {clips.map((clip) => (
-            <div key={clip.title} style={styles.clipCard}>
+          {clips.map((clip, index) => (
+            <div
+  key={clip.id || `${clip.title}-${index}`}
+  style={styles.clipCard}
+>
               <div style={styles.clipPreview}>
                 <span style={styles.playButton}>▶</span>
               </div>
