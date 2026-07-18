@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pathlib import Path
+from fastapi.responses import RedirectResponse
+from urllib.parse import urlencode
 
 load_dotenv()
 
@@ -27,6 +29,7 @@ app.add_middleware(
 
 TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
+TWITCH_REDIRECT_URI = "http://localhost:8000/auth/twitch/callback"
 
 BASE_DIR = Path(__file__).resolve().parent
 CREATORS_FILE = BASE_DIR / "creators.json"
@@ -122,7 +125,27 @@ def verify_twitch_credentials() -> None:
             detail="Twitch credentials are missing from backend/.env",
         )
 
+def get_twitch_user_access_token() -> str:
+    token_file = Path(__file__).resolve().parent / "twitch_user_token.json"
 
+    if not token_file.exists():
+        raise HTTPException(
+            status_code=401,
+            detail="Twitch account is not connected. Visit /auth/twitch first.",
+        )
+
+    with token_file.open("r", encoding="utf-8") as file:
+        token_data = json.load(file)
+
+    access_token = token_data.get("access_token")
+
+    if not access_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Twitch user access token is missing.",
+        )
+
+    return access_token
 async def get_twitch_access_token() -> str:
     verify_twitch_credentials()
 
@@ -211,6 +234,7 @@ async def get_twitch_channel_data(channel_name: str) -> dict[str, Any]:
     if not streams:
         return {
             "channel": user["login"],
+            "user_id": user["id"],
             "display_name": user["display_name"],
             "profile_image_url": user["profile_image_url"],
             "is_live": False,
@@ -234,6 +258,7 @@ async def get_twitch_channel_data(channel_name: str) -> dict[str, Any]:
 
     return {
         "channel": user["login"],
+        "user_id": user["id"],
         "display_name": user["display_name"],
         "profile_image_url": user["profile_image_url"],
         "is_live": True,
@@ -245,6 +270,58 @@ async def get_twitch_channel_data(channel_name: str) -> dict[str, Any]:
         "thumbnail_url": thumbnail_url,
     }
 
+async def create_twitch_clip(broadcaster_id: str) -> dict:
+    def get_twitch_clip_url(twitch_clip_id: str) -> str:
+        return f"https://clips.twitch.tv/{twitch_clip_id}"
+    user_access_token = get_twitch_user_access_token()
+
+    headers = {
+        "Client-Id": TWITCH_CLIENT_ID,
+        "Authorization": f"Bearer {user_access_token}",
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.post(
+            "https://api.twitch.tv/helix/clips",
+            headers=headers,
+            params={"broadcaster_id": broadcaster_id},
+        )
+
+    if response.status_code != 202:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Twitch clip creation failed: {response.text}",
+        )
+
+    clips = response.json().get("data", [])
+
+    if not clips:
+        raise HTTPException(
+            status_code=502,
+            detail="Twitch did not return clip data.",
+        )
+
+    clip = clips[0]
+    clip["public_url"] = get_twitch_clip_url(clip["id"])
+    return clip
+
+@app.get("/auth/twitch/validate")
+async def validate_twitch_token():
+    access_token = get_twitch_user_access_token()
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            "https://id.twitch.tv/oauth2/validate",
+            headers={"Authorization": f"OAuth {access_token}"},
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Twitch token validation failed: {response.text}",
+        )
+
+    return response.json()
 
 @app.get("/")
 def home():
@@ -433,6 +510,9 @@ async def create_clip(clip: dict):
     "thumbnail_url": clip.get("thumbnail_url"),
     "timestamp": clip.get("timestamp"),
     "duration": clip.get("duration", 30),
+    "twitch_clip_id": clip.get("twitch_clip_id"),
+    "twitch_edit_url": clip.get("twitch_edit_url"),
+    "public_url": clip.get("public_url"),
 }
 
     clips.append(new_clip)
@@ -472,45 +552,135 @@ async def auto_generate_clip():
     for creator in creators:
         try:
             stream = await get_twitch_channel_data(creator["channel"])
+            broadcaster_id = stream.get("user_id")
+        
         except Exception:
             continue
 
-        if stream.get("is_live"):
-            viewer_count = stream.get("viewer_count", 0)
-            stream_title = stream.get("title") or f"{creator['name']} Live Moment"
-            clips_file = Path(__file__).resolve().parent / "clips.json"
+        if not stream.get("is_live"):
+            continue
+        twitch_clip = await create_twitch_clip(broadcaster_id)
 
-    try:
-        with clips_file.open("r", encoding="utf-8") as file:
-            existing_clips = json.load(file)
-    except (FileNotFoundError, json.JSONDecodeError):
-        existing_clips = []
+        viewer_count = stream.get("viewer_count", 0)
 
-    already_created = any(
-        item.get("creator") == creator["name"]
-        and item.get("started_at") == stream.get("started_at")
-        for item in existing_clips
-    )
+        stream_title = (
+            stream.get("title")
+            or f"{creator['name']} Live Moment"
+        )
 
-    if already_created:
-        return {
-            "message": f"A clip for {creator['name']} already exists for this live stream."
-        }
+        clips_file = Path(__file__).resolve().parent / "clips.json"
+
+        try:
+            with clips_file.open("r", encoding="utf-8") as file:
+                existing_clips = json.load(file)
+        except (FileNotFoundError, json.JSONDecodeError):
+            existing_clips = []
+
+        already_created = any(
+            item.get("creator") == creator["name"]
+            and item.get("started_at") == stream.get("started_at")
+            for item in existing_clips
+        )
+
+        if already_created:
+            return {
+                "message": (
+                    f"A clip for {creator['name']} already exists "
+                    "for this live stream."
+                )
+            }
 
         clip = {
-                "title": stream_title,
-                "creator": creator["name"],
-                "score": min(99, 80 + viewer_count // 50000),
-                "status": "Ready to review",
-                "viewer_count": viewer_count,
-                "game": stream.get("game_name"),
-                "started_at": stream.get("started_at"),
-                "thumbnail_url": stream.get("thumbnail_url"),
-            }
+            "title": stream_title,
+            "creator": creator["name"],
+            "score": min(99, 80 + viewer_count // 50000),
+            "status": "Ready to review",
+            "viewer_count": viewer_count,
+            "game": stream.get("game_name"),
+            "started_at": stream.get("started_at"),
+            "thumbnail_url": stream.get("thumbnail_url"),
+            "twitch_clip_id": twitch_clip.get("id"),
+            "twitch_edit_url": twitch_clip.get("edit_url"),
+            "public_url": twitch_clip.get("public_url"),
+        }
 
         result = await create_clip(clip)
         return result["clip"]
 
     return {
         "message": "No monitored creators are currently live."
+    }
+@app.post("/api/clips/{clip_id}/publish")
+async def publish_clip(clip_id: str):
+    clips_file = Path(__file__).resolve().parent / "clips.json"
+
+    try:
+        with clips_file.open("r", encoding="utf-8") as file:
+            clips = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        clips = []
+
+    for clip in clips:
+        if clip.get("id") == clip_id:
+            clip["status"] = "Published"
+
+            with clips_file.open("w", encoding="utf-8") as file:
+                json.dump(clips, file, indent=2)
+
+            return {"success": True, "clip": clip}
+
+    raise HTTPException(status_code=404, detail="Clip not found")
+
+@app.get("/auth/twitch")
+async def twitch_login():
+    params = {
+        "client_id": TWITCH_CLIENT_ID,
+        "redirect_uri": TWITCH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "clips:edit",
+    }
+
+    return RedirectResponse(
+        "https://id.twitch.tv/oauth2/authorize?" + urlencode(params)
+    )
+
+@app.get("/auth/twitch/callback")
+async def twitch_callback(code: str):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.post(
+            "https://id.twitch.tv/oauth2/token",
+            data={
+                "client_id": TWITCH_CLIENT_ID,
+                "client_secret": TWITCH_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": TWITCH_REDIRECT_URI,
+            },
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Twitch token exchange failed: {response.text}",
+        )
+
+    token_data = response.json()
+
+    token_file = Path(__file__).resolve().parent / "twitch_user_token.json"
+
+    with token_file.open("w", encoding="utf-8") as file:
+        json.dump(
+            {
+                "access_token": token_data.get("access_token"),
+                "refresh_token": token_data.get("refresh_token"),
+                "expires_in": token_data.get("expires_in"),
+                "scope": token_data.get("scope", []),
+            },
+            file,
+            indent=2,
+        )
+
+    return {
+        "success": True,
+        "message": "Twitch account connected. You may close this tab.",
     }

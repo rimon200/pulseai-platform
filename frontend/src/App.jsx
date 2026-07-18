@@ -388,6 +388,7 @@ function App() {
   <AIClips
   styles={styles}
   clips={clips}
+  setClips={setClips}
 />
 ) : activePage === "Publishing" ? (
   <Publishing />
