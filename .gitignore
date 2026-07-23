@@ -188,3 +188,4 @@ backend/.DS_Store
 backend/clips.json
 backend/creators.json
 backend/twitch_user_token.json
+backend/tiktok_user_token.json

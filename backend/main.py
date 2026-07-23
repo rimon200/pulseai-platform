@@ -983,3 +983,50 @@ async def tiktok_login():
     )
 
     return RedirectResponse(url=authorization_url)
+
+@app.get("/api/tiktok/callback")
+async def tiktok_callback(code: str, state: str):
+    client_key = os.getenv("TIKTOK_CLIENT_KEY")
+    client_secret = os.getenv("TIKTOK_CLIENT_SECRET")
+    redirect_uri = os.getenv("TIKTOK_REDIRECT_URI")
+
+    if not client_key or not client_secret or not redirect_uri:
+        raise HTTPException(
+            status_code=500,
+            detail="TikTok OAuth configuration is incomplete.",
+        )
+
+    code_verifier = app.state.tiktok_pkce_verifiers.pop(state, None)
+    if not code_verifier:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired TikTok OAuth state.",
+        )
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.post(
+            "https://open.tiktokapis.com/v2/oauth/token/",
+            data={
+                "client_key": client_key,
+                "client_secret": client_secret,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": redirect_uri,
+                "code_verifier": code_verifier,
+            },
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"TikTok token exchange failed: {response.text}",
+        )
+
+    token_file = Path(__file__).resolve().parent / "tiktok_user_token.json"
+    with token_file.open("w", encoding="utf-8") as file:
+        json.dump(response.json(), file, indent=2)
+
+    return {
+        "success": True,
+        "message": "TikTok account connected successfully.",
+    }
