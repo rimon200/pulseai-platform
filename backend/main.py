@@ -78,7 +78,10 @@ app.add_middleware(
 
 TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
-TWITCH_REDIRECT_URI = "http://localhost:8000/auth/twitch/callback"
+TWITCH_REDIRECT_URI = os.getenv(
+    "TWITCH_REDIRECT_URI",
+    "http://localhost:8000/auth/twitch/callback"
+)
 
 app.state.auto_clip_task = None
 app.state.auto_clip_lock = asyncio.Lock()
