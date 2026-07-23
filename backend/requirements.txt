@@ -5,7 +5,7 @@ av==15.1.0
 brotli==1.2.0
 certifi==2026.6.17
 charset-normalizer==3.4.9
-click==8.1.8
+click==8.2.1
 coloredlogs==15.0.1
 ctranslate2==4.8.1
 distro==1.9.0
