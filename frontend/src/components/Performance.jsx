@@ -1,12 +1,14 @@
 import { useEffect, useState } from "react";
 
+const API_BASE_URL = import.meta.env.VITE_API_URL;
+
 function Performance() {
   const [clips, setClips] = useState([]);
 
   useEffect(() => {
     async function loadPerformance() {
       try {
-        const response = await fetch("http://127.0.0.1:8000/api/published");
+        const response = await fetch(`${API_BASE_URL}/api/published`);
         const data = await response.json();
         setClips(data);
       } catch (error) {

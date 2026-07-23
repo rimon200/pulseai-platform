@@ -1,8 +1,9 @@
+const API_BASE_URL = import.meta.env.VITE_API_URL;
 function AIClips({ styles, clips, setClips }) {
   const generateClip = async () => {
     try {
       const response = await fetch(
-        "http://127.0.0.1:8000/api/clips/auto",
+        `${API_BASE_URL}/api/clips/auto`,
         {
           method: "POST",
         }
@@ -17,7 +18,7 @@ if (result.message) {
   alert(result.message);
   return;
 }
-      const clipsResponse = await fetch("http://127.0.0.1:8000/api/clips");
+      const clipsResponse = await fetch(`${API_BASE_URL}/api/clips`);
 const updatedClips = await clipsResponse.json();
 
 if (Array.isArray(updatedClips)) {
@@ -37,7 +38,7 @@ const publishClip = async (clip) => {
     }
 
     const response = await fetch(
-      `http://127.0.0.1:8000/api/clips/${clip.id}/publish`,
+      `${API_BASE_URL}/api/clips/${clip.id}/publish`,
       {
         method: "POST",
       }

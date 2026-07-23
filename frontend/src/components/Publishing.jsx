@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 
+const API_BASE_URL = import.meta.env.VITE_API_URL;
+
 function Publishing() {
   const [clips, setClips] = useState([]);
   const [publishedClips, setPublishedClips] = useState({});
@@ -7,7 +9,7 @@ function Publishing() {
   useEffect(() => {
     async function loadClips() {
       try {
-        const response = await fetch("http://127.0.0.1:8000/api/clips");
+        const response = await fetch(`${API_BASE_URL}/api/clips`);
         const data = await response.json();
         setClips(data);
       } catch (error) {
@@ -50,7 +52,7 @@ function Publishing() {
           disabled={publishedClips[index]}
   onClick={async () => {
     try {
-      const response = await fetch("http://127.0.0.1:8000/api/publish", {
+      const response = await fetch(`${API_BASE_URL}/api/publish`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

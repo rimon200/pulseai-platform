@@ -8,7 +8,7 @@ import Performance from "./components/Performance";
 import AIAgents from "./components/AIAgents";
 import Settings from "./components/Settings";
 
-const API_BASE_URL = "http://127.0.0.1:8000";
+const API_BASE_URL = import.meta.env.VITE_API_URL;
 
 function App() {
   const [activePage, setActivePage] = useState("Mission Control");
@@ -60,7 +60,7 @@ function App() {
   const loadClips = async () => {
 
   try {
-    const response = await fetch("http://localhost:8000/api/clips");
+    const response = await fetch(`${import.meta.env.VITE_API_URL}/api/clips`);
 
     if (!response.ok) {
       setClips([]);
