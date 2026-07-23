@@ -115,7 +115,7 @@ return (
 </div>
 
                 <div style={styles.clipContent}>
-                  <div style={styles.clipTitle}>{clip.title}</div>
+                  <div style={styles.clipTitle}>{clip.ai_title || clip.title}</div>
                   <div style={styles.clipCreator}>{clip.creator}</div>
 
                   <div style={styles.clipFooter}>
@@ -160,6 +160,11 @@ return (
 {clip.duration && (
   <div style={{ fontSize: 12, opacity: 0.8 }}>
     ⏱️ {clip.duration}s
+    {clip.transcript && (
+  <p className="clip-transcript">
+    {clip.transcript}
+  </p>
+)}
   </div>
 )}
                   </div>

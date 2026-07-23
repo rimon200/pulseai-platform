@@ -1,5 +1,8 @@
+import base64
+import hashlib
 import json
 import os
+import secrets
 from pathlib import Path
 from typing import Any
 import uuid
@@ -11,10 +14,55 @@ from pydantic import BaseModel, Field
 from pathlib import Path
 from fastapi.responses import RedirectResponse
 from urllib.parse import urlencode
+import subprocess
+from download_service import DownloadService
+import asyncio
+import time
+from ai import (
+    client,
+    generate_ai_title,
+    generate_ai_description,
+    transcribe_video,
+    score_multimodal_clip,
+)
 
 load_dotenv()
 
+
 app = FastAPI(title="PulseAI Backend")
+AUTO_CLIP_INTERVAL_SECONDS = 300
+AUTO_CLIP_MIN_SCORE = 75
+app.state.tiktok_pkce_verifiers = {}
+
+
+def _generate_pkce_pair() -> tuple[str, str]:
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _get_tiktok_authorization_url(state: str, code_challenge: str) -> str:
+    client_key = os.getenv("TIKTOK_CLIENT_KEY")
+    redirect_uri = os.getenv("TIKTOK_REDIRECT_URI")
+
+    if not client_key or not redirect_uri:
+        raise HTTPException(
+            status_code=500,
+            detail="TikTok client key and redirect URI must be configured.",
+        )
+
+    params = {
+        "client_key": client_key,
+        "response_type": "code",
+        "scope": "user.info.basic,video.upload",
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+
+    return "https://www.tiktok.com/v2/auth/authorize/?" + urlencode(params)
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,6 +78,47 @@ app.add_middleware(
 TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID")
 TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET")
 TWITCH_REDIRECT_URI = "http://localhost:8000/auth/twitch/callback"
+
+app.state.auto_clip_task = None
+app.state.auto_clip_lock = asyncio.Lock()
+
+
+async def _auto_clip_loop():
+    await asyncio.sleep(AUTO_CLIP_INTERVAL_SECONDS)
+    print("AUTO MODE STARTED")
+
+    while True:
+        print("AUTO CYCLE START")
+        if app.state.auto_clip_lock.locked():
+            print("AUTO CYCLE SKIPPED: previous cycle still running")
+        else:
+            async with app.state.auto_clip_lock:
+                try:
+                    result = await auto_generate_clip()
+                    print("AUTO RESULT:", result)
+                except Exception as error:
+                    print("AUTO ERROR:", repr(error))
+        print("AUTO CYCLE COMPLETE")
+        await asyncio.sleep(AUTO_CLIP_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def _start_auto_clip_task():
+    if app.state.auto_clip_task is None or app.state.auto_clip_task.done():
+        app.state.auto_clip_task = asyncio.create_task(_auto_clip_loop())
+
+
+@app.on_event("shutdown")
+async def _stop_auto_clip_task():
+    task = app.state.auto_clip_task
+    if task is None:
+        return
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 BASE_DIR = Path(__file__).resolve().parent
 CREATORS_FILE = BASE_DIR / "creators.json"
@@ -146,6 +235,56 @@ def get_twitch_user_access_token() -> str:
         )
 
     return access_token
+
+def refresh_twitch_user_access_token() -> str:
+    token_file = Path(__file__).resolve().parent / "twitch_user_token.json"
+
+    with token_file.open("r", encoding="utf-8") as file:
+        token_data = json.load(file)
+
+    refresh_token = token_data.get("refresh_token")
+
+    if not refresh_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Twitch refresh token is missing. Reconnect Twitch.",
+        )
+
+    response = httpx.post(
+        "https://id.twitch.tv/oauth2/token",
+        params={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": TWITCH_CLIENT_ID,
+            "client_secret": TWITCH_CLIENT_SECRET,
+        },
+        timeout=15.0,
+    )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Twitch token refresh failed: {response.text}",
+        )
+
+    refreshed_data = response.json()
+
+    token_data["access_token"] = refreshed_data["access_token"]
+    token_data["refresh_token"] = refreshed_data.get(
+        "refresh_token",
+        refresh_token,
+    )
+    token_data["expires_in"] = refreshed_data.get("expires_in")
+    token_data["scope"] = refreshed_data.get(
+        "scope",
+        token_data.get("scope", []),
+    )
+
+    with token_file.open("w", encoding="utf-8") as file:
+        json.dump(token_data, file, indent=2)
+
+    return token_data["access_token"]
+
 async def get_twitch_access_token() -> str:
     verify_twitch_credentials()
 
@@ -186,59 +325,104 @@ async def get_twitch_channel_data(channel_name: str) -> dict[str, Any]:
             detail="A Twitch channel name is required.",
         )
 
-    access_token = await get_twitch_access_token()
+    try:
+        access_token = await get_twitch_access_token()
 
-    headers = {
-        "Client-Id": TWITCH_CLIENT_ID,
-        "Authorization": f"Bearer {access_token}",
-    }
+        headers = {
+            "Client-Id": TWITCH_CLIENT_ID,
+            "Authorization": f"Bearer {access_token}",
+        }
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        user_response = await client.get(
-            "https://api.twitch.tv/helix/users",
-            headers=headers,
-            params={"login": clean_channel},
-        )
+        timeout = httpx.Timeout(15.0, connect=20.0)
 
-        if user_response.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Twitch user request failed: {user_response.text}",
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            user_response = await client.get(
+                "https://api.twitch.tv/helix/users",
+                headers=headers,
+                params={"login": clean_channel},
             )
 
-        users = user_response.json().get("data", [])
+            if user_response.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Twitch user request failed: {user_response.text}",
+                )
 
-        if not users:
-            raise HTTPException(
-                status_code=404,
-                detail=f'Twitch channel "{clean_channel}" was not found.',
+            users = user_response.json().get("data", [])
+
+            if not users:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f'Twitch channel "{clean_channel}" was not found.',
+                )
+
+            user = users[0]
+
+            stream_response = await client.get(
+                "https://api.twitch.tv/helix/streams",
+                headers=headers,
+                params={"user_login": clean_channel},
             )
 
-        user = users[0]
+            if stream_response.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Twitch stream request failed: {stream_response.text}",
+                )
 
-        stream_response = await client.get(
-            "https://api.twitch.tv/helix/streams",
-            headers=headers,
-            params={"user_login": clean_channel},
-        )
+        streams = stream_response.json().get("data", [])
 
-        if stream_response.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Twitch stream request failed: {stream_response.text}",
+        print("Checking channel:", clean_channel)
+        print("Streams returned:", streams)
+
+        if not streams:
+            return {
+                "channel": user["login"],
+                "user_id": user["id"],
+                "display_name": user["display_name"],
+                "profile_image_url": user["profile_image_url"],
+                "is_live": False,
+                "status": "OFFLINE",
+                "title": None,
+                "game_name": None,
+                "viewer_count": 0,
+                "started_at": None,
+                "thumbnail_url": None,
+            }
+
+        stream = streams[0]
+        thumbnail_url = stream.get("thumbnail_url")
+
+        if thumbnail_url:
+            thumbnail_url = (
+                thumbnail_url.replace("{width}", "640")
+                .replace("{height}", "360")
             )
 
-    streams = stream_response.json().get("data", [])
-    
-
-    if not streams:
         return {
             "channel": user["login"],
             "user_id": user["id"],
             "display_name": user["display_name"],
             "profile_image_url": user["profile_image_url"],
+            "is_live": True,
+            "status": "LIVE",
+            "title": stream.get("title"),
+            "game_name": stream.get("game_name"),
+            "viewer_count": stream.get("viewer_count", 0),
+            "started_at": stream.get("started_at"),
+            "thumbnail_url": thumbnail_url,
+        }
+
+    except httpx.RequestError as error:
+        print(f"TWITCH CONNECTION ERROR for {clean_channel}: {repr(error)}")
+
+        return {
+            "channel": clean_channel,
+            "user_id": None,
+            "display_name": clean_channel,
+            "profile_image_url": None,
             "is_live": False,
-            "status": "OFFLINE",
+            "status": "UNAVAILABLE",
             "title": None,
             "game_name": None,
             "viewer_count": 0,
@@ -246,33 +430,10 @@ async def get_twitch_channel_data(channel_name: str) -> dict[str, Any]:
             "thumbnail_url": None,
         }
 
-    stream = streams[0]
-
-    thumbnail_url = stream.get("thumbnail_url")
-
-    if thumbnail_url:
-        thumbnail_url = (
-            thumbnail_url.replace("{width}", "640")
-            .replace("{height}", "360")
-        )
-
-    return {
-        "channel": user["login"],
-        "user_id": user["id"],
-        "display_name": user["display_name"],
-        "profile_image_url": user["profile_image_url"],
-        "is_live": True,
-        "status": "LIVE",
-        "title": stream.get("title"),
-        "game_name": stream.get("game_name"),
-        "viewer_count": stream.get("viewer_count", 0),
-        "started_at": stream.get("started_at"),
-        "thumbnail_url": thumbnail_url,
-    }
-
 async def create_twitch_clip(broadcaster_id: str) -> dict:
     def get_twitch_clip_url(twitch_clip_id: str) -> str:
         return f"https://clips.twitch.tv/{twitch_clip_id}"
+
     user_access_token = get_twitch_user_access_token()
 
     headers = {
@@ -286,6 +447,19 @@ async def create_twitch_clip(broadcaster_id: str) -> dict:
             headers=headers,
             params={"broadcaster_id": broadcaster_id},
         )
+
+        if response.status_code == 401:
+            user_access_token = refresh_twitch_user_access_token()
+            headers["Authorization"] = f"Bearer {user_access_token}"
+
+            response = await client.post(
+                "https://api.twitch.tv/helix/clips",
+                headers=headers,
+                params={"broadcaster_id": broadcaster_id},
+            )
+
+    print("TWITCH CLIP STATUS:", response.status_code)
+    print("TWITCH CLIP RESPONSE:", response.text)
 
     if response.status_code != 202:
         raise HTTPException(
@@ -302,8 +476,36 @@ async def create_twitch_clip(broadcaster_id: str) -> dict:
         )
 
     clip = clips[0]
+
+    await asyncio.sleep(30)
+
     clip["public_url"] = get_twitch_clip_url(clip["id"])
+
     return clip
+
+def download_twitch_clip(clip_url: str, output_name: str) -> str:
+    output_path = f"downloads/{output_name}.mp4"
+
+    for _ in range(12):
+        try:
+            subprocess.run(
+                [
+                    "yt-dlp",
+                    "-o",
+                    output_path,
+                    clip_url,
+                ],
+                check=True,
+            )
+            return output_path
+
+        except subprocess.CalledProcessError:
+            time.sleep(5)
+
+    return ""
+
+    return output_path
+
 
 @app.get("/auth/twitch/validate")
 async def validate_twitch_token():
@@ -513,6 +715,9 @@ async def create_clip(clip: dict):
     "twitch_clip_id": clip.get("twitch_clip_id"),
     "twitch_edit_url": clip.get("twitch_edit_url"),
     "public_url": clip.get("public_url"),
+    "transcript": clip.get("transcript", ""),
+    "ai_title": clip.get("ai_title", ""),
+    "ai_description": clip.get("ai_description", ""),
 }
 
     clips.append(new_clip)
@@ -553,16 +758,18 @@ async def auto_generate_clip():
         try:
             stream = await get_twitch_channel_data(creator["channel"])
             broadcaster_id = stream.get("user_id")
-        
-        except Exception:
+
+        except Exception as error:
+            print(
+                f"TWITCH CHECK FAILED for {creator['channel']}:",
+                repr(error),
+            )
             continue
 
         if not stream.get("is_live"):
             continue
-        twitch_clip = await create_twitch_clip(broadcaster_id)
 
         viewer_count = stream.get("viewer_count", 0)
-
         stream_title = (
             stream.get("title")
             or f"{creator['name']} Live Moment"
@@ -576,40 +783,115 @@ async def auto_generate_clip():
         except (FileNotFoundError, json.JSONDecodeError):
             existing_clips = []
 
-        already_created = any(
-            item.get("creator") == creator["name"]
-            and item.get("started_at") == stream.get("started_at")
-            for item in existing_clips
-        )
-
-        if already_created:
-            return {
-                "message": (
-                    f"A clip for {creator['name']} already exists "
-                    "for this live stream."
+        candidates = []
+        for candidate_index in range(1, 6):
+            try:
+                twitch_clip = await create_twitch_clip(broadcaster_id)
+            except Exception as error:
+                print(
+                    f"TWITCH CLIP CREATION FAILED for candidate {candidate_index}:",
+                    repr(error),
                 )
+                continue
+
+            clip = {
+                "title": stream_title,
+                "creator": creator["name"],
+                "status": "Ready to review",
+                "viewer_count": viewer_count,
+                "game": stream.get("game_name"),
+                "started_at": stream.get("started_at"),
+                "thumbnail_url": stream.get("thumbnail_url"),
+                "twitch_clip_id": twitch_clip.get("id"),
+                "twitch_edit_url": twitch_clip.get("edit_url"),
+                "public_url": twitch_clip.get("public_url"),
+                "candidate_number": candidate_index,
             }
 
-        clip = {
-            "title": stream_title,
-            "creator": creator["name"],
-            "score": min(99, 80 + viewer_count // 50000),
-            "status": "Ready to review",
-            "viewer_count": viewer_count,
-            "game": stream.get("game_name"),
-            "started_at": stream.get("started_at"),
-            "thumbnail_url": stream.get("thumbnail_url"),
-            "twitch_clip_id": twitch_clip.get("id"),
-            "twitch_edit_url": twitch_clip.get("edit_url"),
-            "public_url": twitch_clip.get("public_url"),
-        }
+            video_path = download_twitch_clip(
+                clip["public_url"],
+                clip["twitch_clip_id"],
+            )
 
-        result = await create_clip(clip)
+            print("RETURNED:", video_path)
+            print(
+                "VIDEO PATH DEBUG:",
+                repr(video_path),
+                type(video_path),
+            )
+
+            if not video_path:
+                print(f"Candidate {candidate_index} skipped: download failed.")
+                continue
+
+            clip["transcript"] = transcribe_video(video_path)
+            multimodal = score_multimodal_clip(
+                video_path=video_path,
+                transcript=clip["transcript"],
+                creator=clip["creator"],
+                game=clip.get("game") or "",
+                stream_title=clip["title"],
+                viewer_count=clip["viewer_count"],
+                duration=clip.get("duration", 0),
+            )
+            clip["viral_score"] = multimodal["score"]
+            clip["score"] = multimodal["score"]
+            clip["score_reason"] = multimodal["reason"]
+            clip["score_hook"] = multimodal["hook"]
+            clip["visual_score"] = multimodal["visual_score"]
+            clip["transcript_score"] = multimodal["transcript_score"]
+            clip["context_score"] = multimodal["context_score"]
+            clip["score_confidence"] = multimodal["confidence"]
+            clip["decision"] = multimodal["decision"]
+
+            candidates.append(clip)
+
+        if not candidates:
+            return {
+                "message": "No viral clips found.",
+                "best_score": 0,
+            }
+
+        print("------------------------")
+        for candidate in candidates:
+            print(f"Candidate {candidate['candidate_number']}: {candidate['score']}")
+
+        best_clip = max(candidates, key=lambda c: c["score"])
+        print("")
+        print(f"Best Clip: #{best_clip['candidate_number']}")
+        print(f"Final Score: {best_clip['score']}")
+        print("------------------------")
+
+        if best_clip["decision"] == "reject" or best_clip["score"] < AUTO_CLIP_MIN_SCORE:
+            return {
+                "message": "No viral clips found.",
+                "best_score": best_clip["score"],
+            }
+
+        is_duplicate = any(
+            existing.get("twitch_clip_id") == best_clip["twitch_clip_id"]
+            or existing.get("public_url") == best_clip["public_url"]
+            for existing in existing_clips
+        )
+
+        if is_duplicate:
+            return {
+                "message": "No viral clips found.",
+                "best_score": best_clip["score"],
+            }
+
+        best_clip["ai_title"] = generate_ai_title(best_clip["transcript"])
+        best_clip["ai_description"] = generate_ai_description(best_clip["transcript"])
+
+        
+
+        result = await create_clip(best_clip)
         return result["clip"]
 
     return {
         "message": "No monitored creators are currently live."
     }
+
 @app.post("/api/clips/{clip_id}/publish")
 async def publish_clip(clip_id: str):
     clips_file = Path(__file__).resolve().parent / "clips.json"
@@ -684,3 +966,16 @@ async def twitch_callback(code: str):
         "success": True,
         "message": "Twitch account connected. You may close this tab.",
     }
+
+@app.get("/api/tiktok/login")
+async def tiktok_login():
+    state = secrets.token_urlsafe(24)
+    verifier, challenge = _generate_pkce_pair()
+    app.state.tiktok_pkce_verifiers[state] = verifier
+
+    authorization_url = _get_tiktok_authorization_url(
+        state=state,
+        code_challenge=challenge,
+    )
+
+    return RedirectResponse(url=authorization_url)
