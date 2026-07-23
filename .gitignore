@@ -179,3 +179,12 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignorebackend/twitch_user_token.json
+downloads/
+
+.env
+backend/.env
+.DS_Store
+backend/.DS_Store
+backend/clips.json
+backend/creators.json
+backend/twitch_user_token.json
