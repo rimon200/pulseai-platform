@@ -101,7 +101,7 @@ def _build_filter_chain(title_file_path: Path, subtitle_file_path: Path) -> str:
             "fontcolor=white:fontsize=48:line_spacing=10:"
             "box=1:boxcolor=black@0.45:boxborderw=24:"
             f"textfile='{safe_title_file}':"
-            "x=max(72,min((w-text_w)/2,w-72-text_w)):y=170"
+            "x=(w-text_w)/2:y=170"
             "[title]"
         )
     else:
