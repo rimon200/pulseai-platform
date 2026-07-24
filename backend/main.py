@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pathlib import Path
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from urllib.parse import urlencode
 import subprocess
 import traceback
@@ -88,8 +88,22 @@ TWITCH_REDIRECT_URI = os.getenv(
 )
 
 app.state.auto_clip_task = None
-app.state.auto_clip_lock = asyncio.Lock()
+app.state.clip_generation_admission_lock = asyncio.Lock()
+app.state.clip_generation_busy = False
 app.state.video_edit_lock = asyncio.Lock()
+
+
+async def try_begin_clip_generation() -> bool:
+    async with app.state.clip_generation_admission_lock:
+        if app.state.clip_generation_busy:
+            return False
+        app.state.clip_generation_busy = True
+        return True
+
+
+async def end_clip_generation() -> None:
+    async with app.state.clip_generation_admission_lock:
+        app.state.clip_generation_busy = False
 
 
 async def _auto_clip_loop():
@@ -98,15 +112,17 @@ async def _auto_clip_loop():
 
     while True:
         print("AUTO CYCLE START")
-        if app.state.auto_clip_lock.locked():
-            print("AUTO CYCLE SKIPPED: previous cycle still running")
+        started = await try_begin_clip_generation()
+        if not started:
+            print("AUTO CYCLE SKIPPED: generation already in progress")
         else:
-            async with app.state.auto_clip_lock:
-                try:
-                    result = await auto_generate_clip()
-                    print("AUTO RESULT:", result)
-                except Exception as error:
-                    print("AUTO ERROR:", repr(error))
+            try:
+                result = await _run_auto_generate_clip_pipeline()
+                print("AUTO RESULT:", result)
+            except Exception as error:
+                print("AUTO ERROR:", repr(error))
+            finally:
+                await end_clip_generation()
         print("AUTO CYCLE COMPLETE")
         await asyncio.sleep(AUTO_CLIP_INTERVAL_SECONDS)
 
@@ -989,6 +1005,20 @@ async def generate_clip():
 
 @app.post("/api/clips/auto")
 async def auto_generate_clip():
+    started = await try_begin_clip_generation()
+    if not started:
+        return JSONResponse(
+            status_code=409,
+            content={"message": "Clip generation already in progress."},
+        )
+
+    try:
+        return await _run_auto_generate_clip_pipeline()
+    finally:
+        await end_clip_generation()
+
+
+async def _run_auto_generate_clip_pipeline():
     creators = load_creators()
 
     for creator in creators:
