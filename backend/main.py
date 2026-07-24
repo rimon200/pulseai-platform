@@ -490,25 +490,20 @@ async def create_twitch_clip(broadcaster_id: str) -> dict:
 def download_twitch_clip(clip_url: str, output_name: str) -> str:
     output_path = f"downloads/{output_name}.mp4"
 
-    for _ in range(12):
-        try:
-            subprocess.run(
-                [
-                    "yt-dlp",
-                    "-o",
-                    output_path,
-                    clip_url,
-                ],
-                check=True,
-            )
-            return output_path
-
-        except subprocess.CalledProcessError:
-            time.sleep(5)
-
-    return ""
-
-    return output_path
+    try:
+        subprocess.run(
+            [
+                "yt-dlp",
+                "-o",
+                output_path,
+                clip_url,
+            ],
+            check=True,
+        )
+        return output_path
+    except subprocess.CalledProcessError as error:
+        print(f"TWITCH CLIP DOWNLOAD FAILED for {clip_url}:", repr(error))
+        return None
 
 
 async def upload_tiktok_draft(video_path: str) -> dict:
