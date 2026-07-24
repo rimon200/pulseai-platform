@@ -589,8 +589,12 @@ async def upload_tiktok_draft(video_path: str) -> dict:
             detail=f"Video file not found: {video_path}",
         )
 
-    video_bytes = video_file.read_bytes()
-    video_size = len(video_bytes)
+    video_size = video_file.stat().st_size
+
+    async def stream_video():
+        with video_file.open("rb") as file:
+            while chunk := await asyncio.to_thread(file.read, 1024 * 1024):
+                yield chunk
     if video_size == 0:
         raise HTTPException(
             status_code=400,
@@ -636,7 +640,7 @@ async def upload_tiktok_draft(video_path: str) -> dict:
 
         upload_response = await client.put(
             upload_url,
-            content=video_bytes,
+            content=stream_video(),
             headers={
                 "Content-Type": "video/mp4",
                 "Content-Length": str(video_size),
