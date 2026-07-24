@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import textwrap
 from typing import Dict, List, Optional
 
 
@@ -46,13 +47,13 @@ def _build_ass_subtitles_content(transcript_segments: List[Dict[str, object]]) -
     header = [
         "[Script Info]",
         "ScriptType: v4.00+",
-        "PlayResX: 720",
-        "PlayResY: 1280",
+        "PlayResX: 1080",
+        "PlayResY: 1920",
         "ScaledBorderAndShadow: yes",
         "",
         "[V4+ Styles]",
         "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
-        "Style: Caption,Arial,46,&H00FFFFFF,&H000000FF,&H00000000,&H70000000,1,0,0,0,100,100,0,0,1,2,0,2,60,60,420,1",
+        "Style: Caption,Arial,40,&H00FFFFFF,&H000000FF,&H00000000,&H70000000,1,0,0,0,100,100,0,0,1,2,0,2,72,72,520,1",
         "",
         "[Events]",
         "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
@@ -85,24 +86,40 @@ def _build_ass_subtitles_content(transcript_segments: List[Dict[str, object]]) -
 
 def _build_filter_chain(title_file_path: Path, subtitle_file_path: Path) -> str:
     filters = [
-        "scale=720:1280:force_original_aspect_ratio=increase",
-        "crop=720:1280",
+        "split=2[bgsrc][fgsrc]",
+        "[bgsrc]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10[bg]",
+        "[fgsrc]scale=1080:1920:force_original_aspect_ratio=decrease[fg]",
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2[composed]",
+        "[composed]copy[base]",
     ]
 
     if title_file_path and title_file_path.is_file() and title_file_path.stat().st_size > 0:
         safe_title_file = _escape_filter_path(title_file_path)
         filters.append(
+            "[base]"
             "drawtext="
-            "fontcolor=white:fontsize=64:line_spacing=8:"
+            "fontcolor=white:fontsize=48:line_spacing=10:"
             "box=1:boxcolor=black@0.45:boxborderw=24:"
             f"textfile='{safe_title_file}':"
-            "x=(w-text_w)/2:y=120"
+            "x=max(72,min((w-text_w)/2,w-72-text_w)):y=170"
+            "[title]"
         )
+    else:
+        filters.append("[base]copy[title]")
 
     safe_subtitle_file = _escape_filter_path(subtitle_file_path)
-    filters.append(f"subtitles='{safe_subtitle_file}'")
+    filters.append(f"[title]subtitles='{safe_subtitle_file}'")
 
-    return ",".join(filters)
+    return ";".join(filters)
+
+
+def _prepare_title_text(value: str) -> str:
+    title_text = (value or "").strip()
+    if not title_text:
+        return ""
+    wrapped_lines = textwrap.wrap(title_text, width=26)
+    wrapped_lines = wrapped_lines[:3]
+    return "\n".join(wrapped_lines)
 
 
 def create_tiktok_edited_video(
@@ -138,7 +155,7 @@ def create_tiktok_edited_video(
             dir=str(edited_path.parent),
             delete=False,
         ) as title_temp:
-            title_temp.write((title or "").strip())
+            title_temp.write(_prepare_title_text(title))
             title_temp_path = Path(title_temp.name)
 
         subtitles_content = _build_ass_subtitles_content(transcript_segments)
@@ -174,7 +191,7 @@ def create_tiktok_edited_video(
             "-preset",
             "ultrafast",
             "-crf",
-            "21",
+            "24",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
