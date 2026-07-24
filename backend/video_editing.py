@@ -46,8 +46,8 @@ def _build_ass_subtitles_content(transcript_segments: List[Dict[str, object]]) -
     header = [
         "[Script Info]",
         "ScriptType: v4.00+",
-        "PlayResX: 1080",
-        "PlayResY: 1920",
+        "PlayResX: 720",
+        "PlayResY: 1280",
         "ScaledBorderAndShadow: yes",
         "",
         "[V4+ Styles]",
@@ -85,8 +85,8 @@ def _build_ass_subtitles_content(transcript_segments: List[Dict[str, object]]) -
 
 def _build_filter_chain(title_file_path: Path, subtitle_file_path: Path) -> str:
     filters = [
-        "scale=1080:1920:force_original_aspect_ratio=increase",
-        "crop=1080:1920",
+        "scale=720:1280:force_original_aspect_ratio=increase",
+        "crop=720:1280",
     ]
 
     if title_file_path and title_file_path.is_file() and title_file_path.stat().st_size > 0:
@@ -161,16 +161,18 @@ def create_tiktok_edited_video(
         command = [
             ffmpeg_path,
             "-y",
+            "-threads",
+            "1",
             "-i",
             str(raw_path),
             "-vf",
             filter_chain,
             "-r",
-            "30",
+            "24",
             "-c:v",
             "libx264",
             "-preset",
-            "medium",
+            "ultrafast",
             "-crf",
             "21",
             "-pix_fmt",
