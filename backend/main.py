@@ -481,11 +481,59 @@ async def create_twitch_clip(broadcaster_id: str) -> dict:
 
     clip = clips[0]
 
-    await asyncio.sleep(30)
-
     clip["public_url"] = get_twitch_clip_url(clip["id"])
 
     return clip
+
+
+async def wait_for_twitch_clip(clip_id: str) -> dict:
+    try:
+        access_token = await get_twitch_access_token()
+    except Exception as error:
+        print(
+            f"TWITCH CLIP AVAILABILITY CHECK FAILED for {clip_id}:",
+            repr(error),
+        )
+        return None
+
+    headers = {
+        "Client-Id": TWITCH_CLIENT_ID,
+        "Authorization": f"Bearer {access_token}",
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for attempt in range(8):
+            try:
+                response = await client.get(
+                    "https://api.twitch.tv/helix/clips",
+                    headers=headers,
+                    params={"id": clip_id},
+                )
+            except httpx.RequestError as error:
+                print(
+                    f"TWITCH CLIP AVAILABILITY CHECK FAILED for {clip_id}:",
+                    repr(error),
+                )
+                return None
+
+            if response.status_code == 200:
+                clips = response.json().get("data", [])
+                if clips:
+                    return clips[0]
+            else:
+                print(
+                    f"TWITCH CLIP AVAILABILITY CHECK FAILED for {clip_id}: "
+                    f"HTTP {response.status_code} {response.text}"
+                )
+                return None
+
+            if attempt < 7:
+                await asyncio.sleep(2)
+
+    print(
+        f"TWITCH CLIP UNAVAILABLE after 15 seconds; skipping candidate {clip_id}"
+    )
+    return None
 
 def download_twitch_clip(clip_url: str, output_name: str) -> str:
     output_path = f"downloads/{output_name}.mp4"
@@ -914,6 +962,11 @@ async def auto_generate_clip():
                 )
                 continue
 
+            twitch_clip_id = twitch_clip.get("id")
+            available_clip = await wait_for_twitch_clip(twitch_clip_id)
+            if not available_clip:
+                continue
+
             clip = {
                 "title": stream_title,
                 "creator": creator["name"],
@@ -922,9 +975,11 @@ async def auto_generate_clip():
                 "game": stream.get("game_name"),
                 "started_at": stream.get("started_at"),
                 "thumbnail_url": stream.get("thumbnail_url"),
-                "twitch_clip_id": twitch_clip.get("id"),
+                "twitch_clip_id": twitch_clip_id,
                 "twitch_edit_url": twitch_clip.get("edit_url"),
-                "public_url": twitch_clip.get("public_url"),
+                "public_url": (
+                    f"https://clips.twitch.tv/{twitch_clip_id}"
+                ),
                 "candidate_number": candidate_index,
             }
 
