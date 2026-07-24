@@ -511,6 +511,110 @@ def download_twitch_clip(clip_url: str, output_name: str) -> str:
     return output_path
 
 
+async def upload_tiktok_draft(video_path: str) -> dict:
+    token_file = Path(__file__).resolve().parent / "tiktok_user_token.json"
+
+    if not token_file.exists():
+        raise HTTPException(
+            status_code=401,
+            detail="TikTok account is not connected.",
+        )
+
+    try:
+        with token_file.open("r", encoding="utf-8") as file:
+            token_response = json.load(file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to read TikTok token storage: {error}",
+        ) from error
+
+    access_token = token_response.get("data", {}).get("access_token")
+    if not access_token:
+        access_token = token_response.get("access_token")
+
+    if not access_token:
+        raise HTTPException(
+            status_code=401,
+            detail="TikTok access token is missing.",
+        )
+
+    video_file = Path(video_path)
+    if not video_file.is_file():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Video file not found: {video_path}",
+        )
+
+    video_bytes = video_file.read_bytes()
+    video_size = len(video_bytes)
+    if video_size == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Video file is empty.",
+        )
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json; charset=UTF-8",
+    }
+    init_payload = {
+        "source_info": {
+            "source": "FILE_UPLOAD",
+            "video_size": video_size,
+            "chunk_size": video_size,
+            "total_chunk_count": 1,
+        }
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        init_response = await client.post(
+            "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
+            headers=headers,
+            json=init_payload,
+        )
+
+        if init_response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"TikTok draft upload initialization failed: {init_response.text}",
+            )
+
+        init_result = init_response.json()
+        upload_data = init_result.get("data", {})
+        upload_url = upload_data.get("upload_url")
+        publish_id = upload_data.get("publish_id")
+
+        if not upload_url or not publish_id:
+            raise HTTPException(
+                status_code=502,
+                detail="TikTok did not return an upload URL and publish ID.",
+            )
+
+        upload_response = await client.put(
+            upload_url,
+            content=video_bytes,
+            headers={
+                "Content-Type": "video/mp4",
+                "Content-Length": str(video_size),
+                "Content-Range": f"bytes 0-{video_size - 1}/{video_size}",
+            },
+        )
+
+    if upload_response.status_code not in {200, 201, 202, 204}:
+        raise HTTPException(
+            status_code=502,
+            detail=f"TikTok draft video upload failed: {upload_response.text}",
+        )
+
+    return {
+        "publish_id": publish_id,
+        "upload_result": upload_response.json()
+        if upload_response.content
+        else None,
+    }
+
+
 @app.get("/auth/twitch/validate")
 async def validate_twitch_token():
     access_token = get_twitch_user_access_token()
