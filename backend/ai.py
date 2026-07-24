@@ -6,15 +6,24 @@ import cv2
 import json
 import os
 import re
+from typing import Optional
 
 load_dotenv()
 AUTO_CLIP_MIN_SCORE = int(os.getenv("AUTO_CLIP_MIN_SCORE", "45"))
 
 client = OpenAI()
+_WHISPER_MODEL: Optional[WhisperModel] = None
+
+
+def _get_whisper_model() -> WhisperModel:
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        _WHISPER_MODEL = WhisperModel("tiny", device="cpu", compute_type="int8")
+    return _WHISPER_MODEL
 
 
 def _transcribe_video_data(video_path: str) -> tuple[str, list[dict[str, object]]]:
-    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    model = _get_whisper_model()
     segments, _ = model.transcribe(video_path, language="en")
 
     transcript_parts = []

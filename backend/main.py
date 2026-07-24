@@ -1009,7 +1009,9 @@ async def auto_generate_clip():
                 continue
 
             clip["video_path"] = video_path
-            clip["transcript"] = transcribe_video(video_path)
+            transcription = transcribe_video_with_segments(video_path)
+            clip["transcript"] = transcription.get("transcript", "")
+            clip["segments"] = transcription.get("segments", [])
             multimodal = score_multimodal_clip(
                 video_path=video_path,
                 transcript=clip["transcript"],
@@ -1071,12 +1073,7 @@ async def auto_generate_clip():
 
         try:
             title_for_overlay = best_clip.get("ai_title") or best_clip.get("title", "")
-            transcription = transcribe_video_with_segments(best_clip["raw_video_path"])
-            caption_segments = transcription.get("segments", [])
-
-            # Keep existing transcript data unless it is missing.
-            if not best_clip.get("transcript"):
-                best_clip["transcript"] = transcription.get("transcript", "")
+            caption_segments = best_clip.get("segments", [])
 
             async with app.state.video_edit_lock:
                 edited_video_path = await asyncio.to_thread(
