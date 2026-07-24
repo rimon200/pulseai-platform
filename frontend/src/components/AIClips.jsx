@@ -37,14 +37,29 @@ const publishClip = async (clip) => {
       return;
     }
 
+    if (!clip.video_path) {
+      alert("This clip is missing its local video file path.");
+      return;
+    }
+
+    const requestUrl = `${API_BASE_URL}/api/publish`;
+
     const response = await fetch(
-      `${API_BASE_URL}/api/clips/${clip.id}/publish`,
+      requestUrl,
       {
         method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(clip),
       }
     );
 
     const result = await response.json();
+
+    console.log("Publish request URL:", requestUrl);
+    console.log("Publish response status:", response.status);
+    console.log("Publish response JSON:", result);
 
     if (!response.ok) {
       throw new Error(result.detail || "Publish failed");

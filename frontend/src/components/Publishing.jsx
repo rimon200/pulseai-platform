@@ -51,8 +51,17 @@ function Publishing() {
           <button
           disabled={publishedClips[index]}
   onClick={async () => {
+    const requestUrl = `${API_BASE_URL}/api/publish`;
+
+    if (!clip.video_path) {
+      const errorMessage = "This clip is missing its local video file path.";
+      console.error("Publish request not sent:", errorMessage, clip);
+      alert(errorMessage);
+      return;
+    }
+
     try {
-      const response = await fetch(`${API_BASE_URL}/api/publish`, {
+      const response = await fetch(requestUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -60,8 +69,22 @@ function Publishing() {
         body: JSON.stringify(clip),
       });
 
-      const data = await response.json();
-      alert(data.message);
+      let data = null;
+      try {
+        data = await response.json();
+      } catch {
+        data = { detail: "The backend returned invalid JSON." };
+      }
+
+      console.log("Publish request URL:", requestUrl);
+      console.log("Publish response status:", response.status);
+      console.log("Publish response JSON:", data);
+
+      if (!response.ok) {
+        throw new Error(data.detail || data.message || "Publishing failed.");
+      }
+
+      alert(data.message || "Published successfully.");
 
       setPublishedClips((current) => ({
   ...current,
@@ -69,7 +92,7 @@ function Publishing() {
 }));
     } catch (error) {
       console.error(error);
-      alert("Publishing failed.");
+      alert(error.message || "Publishing failed.");
     }
   }}
 >
