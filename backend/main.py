@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 from pathlib import Path
 from typing import Any
 import uuid
@@ -19,6 +20,11 @@ import traceback
 from download_service import DownloadService
 import asyncio
 import time
+try:
+    import psutil
+except ImportError:
+    psutil = None
+    import resource
 from ai import (
     client,
     generate_ai_title,
@@ -37,6 +43,26 @@ app = FastAPI(title="PulseAI Backend")
 AUTO_CLIP_INTERVAL_SECONDS = 300
 AUTO_CLIP_MIN_SCORE = int(os.getenv("AUTO_CLIP_MIN_SCORE", "45"))
 app.state.tiktok_pkce_verifiers = {}
+
+
+def _get_current_rss_mb() -> float:
+    if psutil is not None:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / (1024 * 1024)
+
+    rss_value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return rss_value / (1024 * 1024)
+    return rss_value / 1024
+
+
+def _log_memory_check(stage: str, candidate_number: int, total_candidates: int) -> None:
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    rss_mb = _get_current_rss_mb()
+    print(
+        f"MEMORY CHECK | stage={stage} | candidate={candidate_number}/{total_candidates} | "
+        f"rss_mb={rss_mb:.1f} | ts={timestamp}"
+    )
 
 
 def _generate_pkce_pair() -> tuple[str, str]:
@@ -1064,16 +1090,27 @@ async def _run_auto_generate_clip_pipeline():
         attempted_clip_ids: set[str] = set()
         attempted_clip_urls: set[str] = set()
         candidates = []
+        target_candidate_count = 5
 
         for batch_attempt in range(1, 3):
             ignored_ids = cached_clip_ids | attempted_clip_ids
             ignored_urls = cached_clip_urls | attempted_clip_urls
 
+            _log_memory_check(
+                stage="before_twitch_clip_fetch",
+                candidate_number=0,
+                total_candidates=target_candidate_count,
+            )
             fresh_batch = await fetch_fresh_twitch_clips(
                 broadcaster_id=broadcaster_id,
                 ignored_clip_ids=ignored_ids,
                 ignored_clip_urls=ignored_urls,
                 limit=5,
+            )
+            _log_memory_check(
+                stage="after_twitch_clip_fetch",
+                candidate_number=0,
+                total_candidates=max(len(fresh_batch), target_candidate_count),
             )
 
             if not fresh_batch:
@@ -1083,6 +1120,7 @@ async def _run_auto_generate_clip_pipeline():
                 )
                 continue
 
+            total_candidates = len(fresh_batch)
             for candidate_index, twitch_clip in enumerate(fresh_batch, start=1):
                 twitch_clip_id = str(twitch_clip.get("id", "")).strip()
                 if not twitch_clip_id:
@@ -1110,9 +1148,19 @@ async def _run_auto_generate_clip_pipeline():
                     "candidate_number": candidate_index,
                 }
 
+                _log_memory_check(
+                    stage="before_ytdlp_download",
+                    candidate_number=candidate_index,
+                    total_candidates=total_candidates,
+                )
                 video_path = download_twitch_clip(
                     clip["public_url"],
                     clip["twitch_clip_id"],
+                )
+                _log_memory_check(
+                    stage="after_ytdlp_download",
+                    candidate_number=candidate_index,
+                    total_candidates=total_candidates,
                 )
 
                 if not video_path:
@@ -1121,9 +1169,24 @@ async def _run_auto_generate_clip_pipeline():
 
                 clip["video_path"] = video_path
                 try:
+                    _log_memory_check(
+                        stage="before_whisper_transcription",
+                        candidate_number=candidate_index,
+                        total_candidates=total_candidates,
+                    )
                     transcription = transcribe_video_with_segments(video_path)
+                    _log_memory_check(
+                        stage="after_whisper_transcription",
+                        candidate_number=candidate_index,
+                        total_candidates=total_candidates,
+                    )
                     clip["transcript"] = transcription.get("transcript", "")
                     clip["segments"] = transcription.get("segments", [])
+                    _log_memory_check(
+                        stage="before_multimodal_scoring",
+                        candidate_number=candidate_index,
+                        total_candidates=total_candidates,
+                    )
                     multimodal = score_multimodal_clip(
                         video_path=video_path,
                         transcript=clip["transcript"],
@@ -1132,6 +1195,11 @@ async def _run_auto_generate_clip_pipeline():
                         stream_title=clip["title"],
                         viewer_count=clip["viewer_count"],
                         duration=clip.get("duration", 0),
+                    )
+                    _log_memory_check(
+                        stage="after_multimodal_scoring",
+                        candidate_number=candidate_index,
+                        total_candidates=total_candidates,
                     )
                     clip["viral_score"] = multimodal["score"]
                     clip["score"] = multimodal["score"]
@@ -1143,7 +1211,17 @@ async def _run_auto_generate_clip_pipeline():
                     clip["score_confidence"] = multimodal["confidence"]
                     clip["decision"] = multimodal["decision"]
                 finally:
+                    _log_memory_check(
+                        stage="before_whisper_release",
+                        candidate_number=candidate_index,
+                        total_candidates=total_candidates,
+                    )
                     release_whisper_model()
+                    _log_memory_check(
+                        stage="after_whisper_release",
+                        candidate_number=candidate_index,
+                        total_candidates=total_candidates,
+                    )
 
                 candidates.append(clip)
 
@@ -1196,13 +1274,25 @@ async def _run_auto_generate_clip_pipeline():
         try:
             title_for_overlay = best_clip.get("ai_title") or best_clip.get("title", "")
             caption_segments = best_clip.get("segments", [])
+            best_candidate_number = int(best_clip.get("candidate_number", 0) or 0)
+            total_candidates = len(candidates)
 
             async with app.state.video_edit_lock:
+                _log_memory_check(
+                    stage="before_ffmpeg_video_editing",
+                    candidate_number=best_candidate_number,
+                    total_candidates=total_candidates,
+                )
                 edited_video_path = await asyncio.to_thread(
                     create_tiktok_edited_video,
                     best_clip["raw_video_path"],
                     title_for_overlay,
                     caption_segments,
+                )
+                _log_memory_check(
+                    stage="after_ffmpeg_video_editing",
+                    candidate_number=best_candidate_number,
+                    total_candidates=total_candidates,
                 )
 
             best_clip["video_path"] = edited_video_path
@@ -1211,9 +1301,17 @@ async def _run_auto_generate_clip_pipeline():
             print(traceback.format_exc())
             best_clip["video_path"] = best_clip.get("raw_video_path")
 
-        
-
+        _log_memory_check(
+            stage="before_clip_persistence",
+            candidate_number=int(best_clip.get("candidate_number", 0) or 0),
+            total_candidates=len(candidates),
+        )
         result = await create_clip(best_clip)
+        _log_memory_check(
+            stage="after_clip_persistence",
+            candidate_number=int(best_clip.get("candidate_number", 0) or 0),
+            total_candidates=len(candidates),
+        )
         return result["clip"]
 
     return {
