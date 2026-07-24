@@ -744,6 +744,20 @@ async def get_clips():
         return []
 @app.post("/api/publish")
 async def publish_clip(clip: dict):
+    video_path = clip.get("video_path")
+    if not video_path:
+        raise HTTPException(
+            status_code=400,
+            detail="Clip is missing video_path.",
+        )
+
+    if not Path(video_path).is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Video file not found: {video_path}",
+        )
+
+    tiktok_result = await upload_tiktok_draft(video_path)
     published = load_published()
 
     # Don't save duplicates
@@ -755,6 +769,8 @@ async def publish_clip(clip: dict):
         "success": True,
         "message": f"Published '{clip['title']}' successfully!",
         "published_count": len(published),
+        "publish_id": tiktok_result.get("publish_id"),
+        "upload_result": tiktok_result.get("upload_result"),
     }
 published_count = 0
 @app.get("/api/performance")
