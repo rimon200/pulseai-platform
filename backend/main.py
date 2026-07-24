@@ -15,6 +15,7 @@ from pathlib import Path
 from fastapi.responses import RedirectResponse
 from urllib.parse import urlencode
 import subprocess
+import traceback
 from download_service import DownloadService
 import asyncio
 import time
@@ -23,8 +24,10 @@ from ai import (
     generate_ai_title,
     generate_ai_description,
     transcribe_video,
+    transcribe_video_with_segments,
     score_multimodal_clip,
 )
+from video_editing import create_tiktok_edited_video
 
 load_dotenv()
 
@@ -85,6 +88,7 @@ TWITCH_REDIRECT_URI = os.getenv(
 
 app.state.auto_clip_task = None
 app.state.auto_clip_lock = asyncio.Lock()
+app.state.video_edit_lock = asyncio.Lock()
 
 
 async def _auto_clip_loop():
@@ -887,6 +891,7 @@ async def create_clip(clip: dict):
     "twitch_edit_url": clip.get("twitch_edit_url"),
     "public_url": clip.get("public_url"),
     "video_path": clip.get("video_path"),
+    "raw_video_path": clip.get("raw_video_path"),
     "transcript": clip.get("transcript", ""),
     "ai_title": clip.get("ai_title", ""),
     "ai_description": clip.get("ai_description", ""),
@@ -1062,6 +1067,30 @@ async def auto_generate_clip():
 
         best_clip["ai_title"] = generate_ai_title(best_clip["transcript"])
         best_clip["ai_description"] = generate_ai_description(best_clip["transcript"])
+        best_clip["raw_video_path"] = best_clip.get("video_path")
+
+        try:
+            title_for_overlay = best_clip.get("ai_title") or best_clip.get("title", "")
+            transcription = transcribe_video_with_segments(best_clip["raw_video_path"])
+            caption_segments = transcription.get("segments", [])
+
+            # Keep existing transcript data unless it is missing.
+            if not best_clip.get("transcript"):
+                best_clip["transcript"] = transcription.get("transcript", "")
+
+            async with app.state.video_edit_lock:
+                edited_video_path = await asyncio.to_thread(
+                    create_tiktok_edited_video,
+                    best_clip["raw_video_path"],
+                    title_for_overlay,
+                    caption_segments,
+                )
+
+            best_clip["video_path"] = edited_video_path
+        except Exception as error:
+            print("TIKTOK VIDEO EDIT FAILED:", repr(error))
+            print(traceback.format_exc())
+            best_clip["video_path"] = best_clip.get("raw_video_path")
 
         
 

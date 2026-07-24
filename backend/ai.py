@@ -11,6 +11,37 @@ load_dotenv()
 AUTO_CLIP_MIN_SCORE = int(os.getenv("AUTO_CLIP_MIN_SCORE", "45"))
 
 client = OpenAI()
+
+
+def _transcribe_video_data(video_path: str) -> tuple[str, list[dict[str, object]]]:
+    model = WhisperModel("tiny", device="cpu", compute_type="int8")
+    segments, _ = model.transcribe(video_path, language="en")
+
+    transcript_parts = []
+    transcript_segments = []
+    for segment in segments:
+        text = segment.text.strip()
+        if not text:
+            continue
+
+        start = float(getattr(segment, "start", 0.0) or 0.0)
+        end = float(getattr(segment, "end", start) or start)
+        if end < start:
+            end = start
+
+        transcript_parts.append(text)
+        transcript_segments.append(
+            {
+                "start": start,
+                "end": end,
+                "text": text,
+            }
+        )
+
+    transcript = " ".join(transcript_parts)
+    return transcript, transcript_segments
+
+
 def generate_ai_title(transcript: str) -> str:
         if not transcript.strip():
              return ""
@@ -49,11 +80,16 @@ Return only the description.
     return response.output_text.strip()
 
 def transcribe_video(video_path: str) -> str:
-    model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    segments, _ = model.transcribe(video_path, language="en")
-
-    transcript = " ".join(segment.text.strip() for segment in segments)
+    transcript, _ = _transcribe_video_data(video_path)
     return transcript
+
+
+def transcribe_video_with_segments(video_path: str) -> dict[str, object]:
+    transcript, segments = _transcribe_video_data(video_path)
+    return {
+        "transcript": transcript,
+        "segments": segments,
+    }
 
 def analyze_video_frames(video_path: str) -> int:
     capture = cv2.VideoCapture(video_path)
