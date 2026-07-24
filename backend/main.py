@@ -823,6 +823,7 @@ async def create_clip(clip: dict):
     "twitch_clip_id": clip.get("twitch_clip_id"),
     "twitch_edit_url": clip.get("twitch_edit_url"),
     "public_url": clip.get("public_url"),
+    "video_path": clip.get("video_path"),
     "transcript": clip.get("transcript", ""),
     "ai_title": clip.get("ai_title", ""),
     "ai_description": clip.get("ai_description", ""),
@@ -932,6 +933,7 @@ async def auto_generate_clip():
                 print(f"Candidate {candidate_index} skipped: download failed.")
                 continue
 
+            clip["video_path"] = video_path
             clip["transcript"] = transcribe_video(video_path)
             multimodal = score_multimodal_clip(
                 video_path=video_path,
