@@ -540,6 +540,65 @@ async def wait_for_twitch_clip(clip_id: str) -> dict:
     )
     return None
 
+
+async def fetch_fresh_twitch_clips(
+    broadcaster_id: str,
+    ignored_clip_ids: set[str],
+    ignored_clip_urls: set[str],
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    try:
+        access_token = await get_twitch_access_token()
+    except Exception as error:
+        print(
+            f"TWITCH CLIP FETCH FAILED for broadcaster {broadcaster_id}:",
+            repr(error),
+        )
+        return []
+
+    headers = {
+        "Client-Id": TWITCH_CLIENT_ID,
+        "Authorization": f"Bearer {access_token}",
+    }
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            response = await client.get(
+                "https://api.twitch.tv/helix/clips",
+                headers=headers,
+                params={"broadcaster_id": broadcaster_id, "first": 20},
+            )
+        except httpx.RequestError as error:
+            print(
+                f"TWITCH CLIP FETCH FAILED for broadcaster {broadcaster_id}:",
+                repr(error),
+            )
+            return []
+
+    if response.status_code != 200:
+        print(
+            "TWITCH CLIP FETCH FAILED:",
+            response.status_code,
+            response.text,
+        )
+        return []
+
+    fresh_clips = []
+    for twitch_clip in response.json().get("data", []):
+        clip_id = str(twitch_clip.get("id", "")).strip()
+        if not clip_id or clip_id in ignored_clip_ids:
+            continue
+
+        public_url = twitch_clip.get("url") or f"https://clips.twitch.tv/{clip_id}"
+        if public_url in ignored_clip_urls:
+            continue
+
+        fresh_clips.append(twitch_clip)
+        if len(fresh_clips) >= limit:
+            break
+
+    return fresh_clips
+
 def download_twitch_clip(clip_url: str, output_name: str) -> str:
     output_path = f"downloads/{output_name}.mp4"
 
@@ -961,81 +1020,110 @@ async def auto_generate_clip():
         except (FileNotFoundError, json.JSONDecodeError):
             existing_clips = []
 
+        cached_clip_ids = {
+            str(existing.get("twitch_clip_id", "")).strip()
+            for existing in existing_clips
+            if existing.get("twitch_clip_id")
+        }
+        cached_clip_urls = {
+            str(existing.get("public_url", "")).strip()
+            for existing in existing_clips
+            if existing.get("public_url")
+        }
+
+        attempted_clip_ids: set[str] = set()
+        attempted_clip_urls: set[str] = set()
         candidates = []
-        for candidate_index in range(1, 6):
-            try:
-                twitch_clip = await create_twitch_clip(broadcaster_id)
-            except Exception as error:
+
+        for batch_attempt in range(1, 3):
+            ignored_ids = cached_clip_ids | attempted_clip_ids
+            ignored_urls = cached_clip_urls | attempted_clip_urls
+
+            fresh_batch = await fetch_fresh_twitch_clips(
+                broadcaster_id=broadcaster_id,
+                ignored_clip_ids=ignored_ids,
+                ignored_clip_urls=ignored_urls,
+                limit=5,
+            )
+
+            if not fresh_batch:
                 print(
-                    f"TWITCH CLIP CREATION FAILED for candidate {candidate_index}:",
-                    repr(error),
+                    f"No fresh Twitch clips available for {creator['channel']} "
+                    f"(batch {batch_attempt}/2)."
                 )
                 continue
 
-            twitch_clip_id = twitch_clip.get("id")
-            available_clip = await wait_for_twitch_clip(twitch_clip_id)
-            if not available_clip:
-                continue
+            for candidate_index, twitch_clip in enumerate(fresh_batch, start=1):
+                twitch_clip_id = str(twitch_clip.get("id", "")).strip()
+                if not twitch_clip_id:
+                    continue
 
-            clip = {
-                "title": stream_title,
-                "creator": creator["name"],
-                "status": "Ready to review",
-                "viewer_count": viewer_count,
-                "game": stream.get("game_name"),
-                "started_at": stream.get("started_at"),
-                "thumbnail_url": stream.get("thumbnail_url"),
-                "twitch_clip_id": twitch_clip_id,
-                "twitch_edit_url": twitch_clip.get("edit_url"),
-                "public_url": (
-                    f"https://clips.twitch.tv/{twitch_clip_id}"
-                ),
-                "candidate_number": candidate_index,
-            }
+                public_url = (
+                    twitch_clip.get("url")
+                    or f"https://clips.twitch.tv/{twitch_clip_id}"
+                )
 
-            video_path = download_twitch_clip(
-                clip["public_url"],
-                clip["twitch_clip_id"],
-            )
+                attempted_clip_ids.add(twitch_clip_id)
+                attempted_clip_urls.add(public_url)
 
-            print("RETURNED:", video_path)
+                clip = {
+                    "title": stream_title,
+                    "creator": creator["name"],
+                    "status": "Ready to review",
+                    "viewer_count": viewer_count,
+                    "game": stream.get("game_name"),
+                    "started_at": stream.get("started_at"),
+                    "thumbnail_url": stream.get("thumbnail_url"),
+                    "twitch_clip_id": twitch_clip_id,
+                    "twitch_edit_url": twitch_clip.get("edit_url"),
+                    "public_url": public_url,
+                    "candidate_number": candidate_index,
+                }
+
+                video_path = download_twitch_clip(
+                    clip["public_url"],
+                    clip["twitch_clip_id"],
+                )
+
+                if not video_path:
+                    print(f"Candidate {candidate_index} skipped: download failed.")
+                    continue
+
+                clip["video_path"] = video_path
+                try:
+                    transcription = transcribe_video_with_segments(video_path)
+                    clip["transcript"] = transcription.get("transcript", "")
+                    clip["segments"] = transcription.get("segments", [])
+                    multimodal = score_multimodal_clip(
+                        video_path=video_path,
+                        transcript=clip["transcript"],
+                        creator=clip["creator"],
+                        game=clip.get("game") or "",
+                        stream_title=clip["title"],
+                        viewer_count=clip["viewer_count"],
+                        duration=clip.get("duration", 0),
+                    )
+                    clip["viral_score"] = multimodal["score"]
+                    clip["score"] = multimodal["score"]
+                    clip["score_reason"] = multimodal["reason"]
+                    clip["score_hook"] = multimodal["hook"]
+                    clip["visual_score"] = multimodal["visual_score"]
+                    clip["transcript_score"] = multimodal["transcript_score"]
+                    clip["context_score"] = multimodal["context_score"]
+                    clip["score_confidence"] = multimodal["confidence"]
+                    clip["decision"] = multimodal["decision"]
+                finally:
+                    release_whisper_model()
+
+                candidates.append(clip)
+
+            if candidates:
+                break
+
             print(
-                "VIDEO PATH DEBUG:",
-                repr(video_path),
-                type(video_path),
+                f"All clips in batch {batch_attempt} failed to download/score for "
+                f"{creator['channel']}."
             )
-
-            if not video_path:
-                print(f"Candidate {candidate_index} skipped: download failed.")
-                continue
-
-            clip["video_path"] = video_path
-            try:
-                transcription = transcribe_video_with_segments(video_path)
-                clip["transcript"] = transcription.get("transcript", "")
-                clip["segments"] = transcription.get("segments", [])
-                multimodal = score_multimodal_clip(
-                    video_path=video_path,
-                    transcript=clip["transcript"],
-                    creator=clip["creator"],
-                    game=clip.get("game") or "",
-                    stream_title=clip["title"],
-                    viewer_count=clip["viewer_count"],
-                    duration=clip.get("duration", 0),
-                )
-                clip["viral_score"] = multimodal["score"]
-                clip["score"] = multimodal["score"]
-                clip["score_reason"] = multimodal["reason"]
-                clip["score_hook"] = multimodal["hook"]
-                clip["visual_score"] = multimodal["visual_score"]
-                clip["transcript_score"] = multimodal["transcript_score"]
-                clip["context_score"] = multimodal["context_score"]
-                clip["score_confidence"] = multimodal["confidence"]
-                clip["decision"] = multimodal["decision"]
-            finally:
-                release_whisper_model()
-
-            candidates.append(clip)
 
         if not candidates:
             return {
