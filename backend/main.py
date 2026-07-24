@@ -31,7 +31,7 @@ load_dotenv()
 
 app = FastAPI(title="PulseAI Backend")
 AUTO_CLIP_INTERVAL_SECONDS = 300
-AUTO_CLIP_MIN_SCORE = 75
+AUTO_CLIP_MIN_SCORE = int(os.getenv("AUTO_CLIP_MIN_SCORE", "45"))
 app.state.tiktok_pkce_verifiers = {}
 
 
@@ -853,7 +853,7 @@ def generate_demo_clip():
     return {
         "title": random.choice(titles),
         "creator": random.choice(creators),
-        "score": random.randint(75, 99),
+        "score": random.randint(AUTO_CLIP_MIN_SCORE, 99),
         "status": "Ready to review",
     }
 

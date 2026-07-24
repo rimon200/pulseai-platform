@@ -4,9 +4,11 @@ from faster_whisper import WhisperModel
 import base64
 import cv2
 import json
+import os
 import re
 
 load_dotenv()
+AUTO_CLIP_MIN_SCORE = int(os.getenv("AUTO_CLIP_MIN_SCORE", "45"))
 
 client = OpenAI()
 def generate_ai_title(transcript: str) -> str:
@@ -236,7 +238,7 @@ def score_multimodal_clip(
         "Scoring guide:\n"
         "95-100: Exceptional viral clip, would likely perform extremely well.\n"
         "85-94: Very strong clip, definitely worth publishing.\n"
-        "75-84: Good clip. Return \"accept\".\n"
+        f"{AUTO_CLIP_MIN_SCORE}-84: Good clip. Return \"accept\".\n"
         "60-74: Borderline, some entertainment but lacks a major viral moment.\n"
         "40-59: Weak, little reason to publish.\n"
         "0-39: Do not publish.\n"
@@ -292,7 +294,11 @@ def score_multimodal_clip(
     confidence = _clamp_score(parsed.get("confidence"))
     decision = parsed.get("decision", "reject")
     if decision not in {"accept", "reject"}:
-        decision = "accept" if score >= 75 else "reject"
+        decision = (
+            "accept"
+            if score >= AUTO_CLIP_MIN_SCORE
+            else "reject"
+        )
 
     result = {
         "score": score,
@@ -305,7 +311,7 @@ def score_multimodal_clip(
         "confidence": confidence,
     }
 
-    if decision == "accept" and score < 75:
+    if decision == "accept" and score < AUTO_CLIP_MIN_SCORE:
         result["decision"] = "reject"
 
     print("MULTIMODAL SCORE:", result["score"])
