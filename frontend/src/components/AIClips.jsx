@@ -142,7 +142,7 @@ return (
                     <span style={styles.clipStatus}>{clip.status}</span>
                     <button
   onClick={() => publishClip(clip)}
-  disabled={clip.status === "Published"}
+  disabled={false}
   style={{
     ...styles.secondaryButton,
     opacity: clip.status === "Published" ? 0.6 : 1,
