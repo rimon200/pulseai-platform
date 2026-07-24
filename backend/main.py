@@ -23,6 +23,7 @@ from ai import (
     client,
     generate_ai_title,
     generate_ai_description,
+    release_whisper_model,
     transcribe_video,
     transcribe_video_with_segments,
     score_multimodal_clip,
@@ -1009,27 +1010,30 @@ async def auto_generate_clip():
                 continue
 
             clip["video_path"] = video_path
-            transcription = transcribe_video_with_segments(video_path)
-            clip["transcript"] = transcription.get("transcript", "")
-            clip["segments"] = transcription.get("segments", [])
-            multimodal = score_multimodal_clip(
-                video_path=video_path,
-                transcript=clip["transcript"],
-                creator=clip["creator"],
-                game=clip.get("game") or "",
-                stream_title=clip["title"],
-                viewer_count=clip["viewer_count"],
-                duration=clip.get("duration", 0),
-            )
-            clip["viral_score"] = multimodal["score"]
-            clip["score"] = multimodal["score"]
-            clip["score_reason"] = multimodal["reason"]
-            clip["score_hook"] = multimodal["hook"]
-            clip["visual_score"] = multimodal["visual_score"]
-            clip["transcript_score"] = multimodal["transcript_score"]
-            clip["context_score"] = multimodal["context_score"]
-            clip["score_confidence"] = multimodal["confidence"]
-            clip["decision"] = multimodal["decision"]
+            try:
+                transcription = transcribe_video_with_segments(video_path)
+                clip["transcript"] = transcription.get("transcript", "")
+                clip["segments"] = transcription.get("segments", [])
+                multimodal = score_multimodal_clip(
+                    video_path=video_path,
+                    transcript=clip["transcript"],
+                    creator=clip["creator"],
+                    game=clip.get("game") or "",
+                    stream_title=clip["title"],
+                    viewer_count=clip["viewer_count"],
+                    duration=clip.get("duration", 0),
+                )
+                clip["viral_score"] = multimodal["score"]
+                clip["score"] = multimodal["score"]
+                clip["score_reason"] = multimodal["reason"]
+                clip["score_hook"] = multimodal["hook"]
+                clip["visual_score"] = multimodal["visual_score"]
+                clip["transcript_score"] = multimodal["transcript_score"]
+                clip["context_score"] = multimodal["context_score"]
+                clip["score_confidence"] = multimodal["confidence"]
+                clip["decision"] = multimodal["decision"]
+            finally:
+                release_whisper_model()
 
             candidates.append(clip)
 

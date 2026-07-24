@@ -3,6 +3,7 @@ from openai import OpenAI
 from faster_whisper import WhisperModel
 import base64
 import cv2
+import gc
 import json
 import os
 import re
@@ -20,6 +21,12 @@ def _get_whisper_model() -> WhisperModel:
     if _WHISPER_MODEL is None:
         _WHISPER_MODEL = WhisperModel("tiny", device="cpu", compute_type="int8")
     return _WHISPER_MODEL
+
+
+def release_whisper_model() -> None:
+    global _WHISPER_MODEL
+    _WHISPER_MODEL = None
+    gc.collect()
 
 
 def _transcribe_video_data(video_path: str) -> tuple[str, list[dict[str, object]]]:
