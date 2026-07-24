@@ -1,24 +1,27 @@
+import argparse
 from dotenv import load_dotenv
 from openai import OpenAI
-from faster_whisper import WhisperModel
 import base64
 import cv2
 import gc
 import json
 import os
 import re
+import tempfile
 from typing import Optional
 
 load_dotenv()
 AUTO_CLIP_MIN_SCORE = int(os.getenv("AUTO_CLIP_MIN_SCORE", "45"))
 
 client = OpenAI()
-_WHISPER_MODEL: Optional[WhisperModel] = None
+_WHISPER_MODEL: Optional[object] = None
 
 
-def _get_whisper_model() -> WhisperModel:
+def _get_whisper_model() -> object:
     global _WHISPER_MODEL
     if _WHISPER_MODEL is None:
+        from faster_whisper import WhisperModel
+
         _WHISPER_MODEL = WhisperModel("tiny", device="cpu", compute_type="int8")
     return _WHISPER_MODEL
 
@@ -106,6 +109,46 @@ def transcribe_video_with_segments(video_path: str) -> dict[str, object]:
         "transcript": transcript,
         "segments": segments,
     }
+
+
+def run_transcription_worker(video_path: str, output_json_path: str) -> int:
+    payload = transcribe_video_with_segments(video_path)
+
+    output_path = os.path.abspath(output_json_path)
+    output_dir = os.path.dirname(output_path) or "."
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".json",
+        prefix="transcription_",
+        dir=output_dir,
+        delete=False,
+    ) as temp_file:
+        json.dump(payload, temp_file)
+        temp_file.flush()
+        os.fsync(temp_file.fileno())
+        temporary_output_path = temp_file.name
+
+    os.replace(temporary_output_path, output_path)
+    return 0
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--transcribe-worker", action="store_true")
+    parser.add_argument("--video-path")
+    parser.add_argument("--output-json")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+    if not args.transcribe_worker:
+        return 0
+    if not args.video_path or not args.output_json:
+        raise ValueError("--video-path and --output-json are required.")
+    return run_transcription_worker(args.video_path, args.output_json)
 
 def analyze_video_frames(video_path: str) -> int:
     capture = cv2.VideoCapture(video_path)
@@ -375,3 +418,11 @@ def score_multimodal_clip(
     print("CONFIDENCE:", result["confidence"])
 
     return result
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(f"Transcription worker failed: {error}", file=os.sys.stderr)
+        raise SystemExit(1)

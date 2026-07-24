@@ -4,6 +4,7 @@ import json
 import os
 import secrets
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 import uuid
@@ -30,8 +31,6 @@ from ai import (
     generate_ai_title,
     generate_ai_description,
     release_whisper_model,
-    transcribe_video,
-    transcribe_video_with_segments,
     score_multimodal_clip,
 )
 from video_editing import create_tiktok_edited_video
@@ -63,6 +62,79 @@ def _log_memory_check(stage: str, candidate_number: int, total_candidates: int) 
         f"MEMORY CHECK | stage={stage} | candidate={candidate_number}/{total_candidates} | "
         f"rss_mb={rss_mb:.1f} | ts={timestamp}"
     )
+
+
+def _transcribe_video_with_segments_subprocess(video_path: str) -> dict[str, object]:
+    file_descriptor, output_json_path = tempfile.mkstemp(suffix=".json")
+    os.close(file_descriptor)
+    if os.path.exists(output_json_path):
+        os.remove(output_json_path)
+
+    command = [
+        sys.executable,
+        str(BASE_DIR / "ai.py"),
+        "--transcribe-worker",
+        "--video-path",
+        video_path,
+        "--output-json",
+        output_json_path,
+    ]
+
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            timeout=180,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if not os.path.exists(output_json_path):
+            raise RuntimeError("Transcription worker did not create an output JSON file.")
+
+        with open(output_json_path, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+
+        transcript = payload.get("transcript")
+        segments = payload.get("segments")
+
+        if not isinstance(transcript, str):
+            raise RuntimeError("Transcription worker returned an invalid transcript.")
+        if not isinstance(segments, list):
+            raise RuntimeError("Transcription worker returned invalid segments.")
+
+        normalized_segments = []
+        for segment in segments:
+            if not isinstance(segment, dict):
+                raise RuntimeError("Transcription worker returned an invalid segment entry.")
+            if not all(key in segment for key in ("start", "end", "text")):
+                raise RuntimeError("Transcription worker returned a segment with missing fields.")
+            normalized_segments.append(
+                {
+                    "start": float(segment["start"]),
+                    "end": float(segment["end"]),
+                    "text": str(segment["text"]),
+                }
+            )
+
+        return {
+            "transcript": transcript,
+            "segments": normalized_segments,
+        }
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"Transcription worker timed out after {error.timeout} seconds."
+        ) from error
+    except subprocess.CalledProcessError as error:
+        stderr = (error.stderr or "").strip()
+        raise RuntimeError(
+            f"Transcription worker failed: {stderr or 'no stderr output'}"
+        ) from error
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as error:
+        raise RuntimeError(f"Transcription worker returned invalid JSON: {error}") from error
+    finally:
+        if os.path.exists(output_json_path):
+            os.remove(output_json_path)
 
 
 def _generate_pkce_pair() -> tuple[str, str]:
@@ -1174,7 +1246,7 @@ async def _run_auto_generate_clip_pipeline():
                         candidate_number=candidate_index,
                         total_candidates=total_candidates,
                     )
-                    transcription = transcribe_video_with_segments(video_path)
+                    transcription = _transcribe_video_with_segments_subprocess(video_path)
                     _log_memory_check(
                         stage="after_whisper_transcription",
                         candidate_number=candidate_index,
