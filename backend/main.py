@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import tempfile
@@ -14,7 +15,7 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pathlib import Path
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from urllib.parse import urlencode
 import subprocess
 import traceback
@@ -245,6 +246,64 @@ async def _stop_auto_clip_task():
 
 BASE_DIR = Path(__file__).resolve().parent
 CREATORS_FILE = BASE_DIR / "creators.json"
+
+
+def _is_within_directory(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_allowed_video_path(video_path: str) -> Path:
+    if not isinstance(video_path, str) or not video_path.strip():
+        raise HTTPException(status_code=400, detail="Clip is missing video_path.")
+
+    raw_path = Path(video_path.strip())
+    candidate_paths = (
+        [raw_path]
+        if raw_path.is_absolute()
+        else [BASE_DIR.parent / raw_path, BASE_DIR / raw_path]
+    )
+
+    allowed_roots = [
+        (BASE_DIR.parent / "downloads").resolve(),
+        (BASE_DIR / "downloads").resolve(),
+    ]
+
+    allowed_candidate_exists = False
+
+    for candidate_path in candidate_paths:
+        resolved_candidate = candidate_path.resolve(strict=False)
+
+        if not any(
+            _is_within_directory(resolved_candidate, root)
+            for root in allowed_roots
+        ):
+            continue
+
+        allowed_candidate_exists = True
+        if resolved_candidate.is_file():
+            return resolved_candidate
+
+    if allowed_candidate_exists:
+        raise HTTPException(status_code=404, detail="Video file no longer exists.")
+
+    raise HTTPException(status_code=403, detail="Unsafe video path.")
+
+
+def _build_safe_download_filename(clip: dict, clip_id: str) -> str:
+    name_source = str(clip.get("ai_title") or clip.get("title") or clip_id)
+    safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", name_source).strip("._")
+
+    if not safe_stem:
+        safe_stem = f"clip_{clip_id}"
+
+    if not safe_stem.lower().endswith(".mp4"):
+        safe_stem = f"{safe_stem}.mp4"
+
+    return safe_stem
 
 DEFAULT_CREATORS = [
     {
@@ -967,6 +1026,37 @@ async def get_clips():
             return json.load(file)
     except (FileNotFoundError, json.JSONDecodeError):
         return []
+
+
+@app.get("/api/clips/{clip_id}/video")
+async def get_clip_video(clip_id: str, download: int = 0):
+    clips_file = BASE_DIR / "clips.json"
+
+    try:
+        with clips_file.open("r", encoding="utf-8") as file:
+            clips = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        clips = []
+
+    clip = next(
+        (item for item in clips if str(item.get("id", "")) == clip_id),
+        None,
+    )
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+
+    resolved_video_path = _resolve_allowed_video_path(clip.get("video_path", ""))
+
+    if download == 1:
+        return FileResponse(
+            path=str(resolved_video_path),
+            media_type="video/mp4",
+            filename=_build_safe_download_filename(clip, clip_id),
+        )
+
+    return FileResponse(path=str(resolved_video_path), media_type="video/mp4")
+
+
 @app.post("/api/publish")
 async def publish_clip(clip: dict):
     video_path = clip.get("video_path")

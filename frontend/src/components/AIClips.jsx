@@ -1,5 +1,44 @@
+import { useState } from "react";
+
 const API_BASE_URL = import.meta.env.VITE_API_URL;
 function AIClips({ styles, clips, setClips }) {
+  const [previewClipId, setPreviewClipId] = useState(null);
+  const [previewErrors, setPreviewErrors] = useState({});
+
+  const getClipVideoUrl = (clipId, download = false) =>
+    `${API_BASE_URL}/api/clips/${encodeURIComponent(clipId)}/video${
+      download ? "?download=1" : ""
+    }`;
+
+  const togglePreview = (clipId) => {
+    if (!clipId) {
+      return;
+    }
+
+    setPreviewClipId((currentClipId) =>
+      currentClipId === clipId ? null : clipId
+    );
+
+    setPreviewErrors((currentErrors) => {
+      if (!currentErrors[clipId]) {
+        return currentErrors;
+      }
+
+      return {
+        ...currentErrors,
+        [clipId]: "",
+      };
+    });
+  };
+
+  const handlePreviewError = (clipId) => {
+    setPreviewErrors((currentErrors) => ({
+      ...currentErrors,
+      [clipId]:
+        "Video preview is unavailable. The file may have been removed from Render storage.",
+    }));
+  };
+
   const generateClip = async () => {
     try {
       const response = await fetch(
@@ -114,7 +153,21 @@ return (
   style={styles.clipCard}
 >
                 <div style={styles.clipPreview}>
-  {clip.thumbnail_url ? (
+  {previewClipId === clip.id && clip.id ? (
+    <video
+      src={getClipVideoUrl(clip.id)}
+      controls
+      preload="metadata"
+      onError={() => handlePreviewError(clip.id)}
+      style={{
+        width: "100%",
+        height: "100%",
+        objectFit: "cover",
+        display: "block",
+        backgroundColor: "#000",
+      }}
+    />
+  ) : clip.thumbnail_url ? (
     <img
       src={clip.thumbnail_url}
       alt={clip.title}
@@ -129,6 +182,11 @@ return (
     <span style={styles.playButton}>▶</span>
   )}
 </div>
+                {clip.id && previewErrors[clip.id] && (
+  <div style={{ color: "#fca5a5", fontSize: 12, margin: "8px 12px 0" }}>
+    {previewErrors[clip.id]}
+  </div>
+)}
 
                 <div style={styles.clipContent}>
                   <div style={styles.clipTitle}>{clip.ai_title || clip.title}</div>
@@ -151,6 +209,34 @@ return (
 >
   {clip.status === "Published" ? "✅ Published" : "Publish"}
 </button>
+
+<button
+  onClick={() => togglePreview(clip.id)}
+  disabled={!clip.id}
+  style={{
+    ...styles.secondaryButton,
+    opacity: clip.id ? 1 : 0.6,
+    cursor: clip.id ? "pointer" : "not-allowed",
+  }}
+>
+  {previewClipId === clip.id ? "Hide Preview" : "Preview"}
+</button>
+
+{clip.id ? (
+  <a
+    href={getClipVideoUrl(clip.id, true)}
+    style={{ ...styles.secondaryButton, textDecoration: "none", display: "inline-block" }}
+  >
+    Download
+  </a>
+) : (
+  <button
+    disabled
+    style={{ ...styles.secondaryButton, opacity: 0.6, cursor: "not-allowed" }}
+  >
+    Download
+  </button>
+)}
 
 {clip.twitch_edit_url && (
   <a
