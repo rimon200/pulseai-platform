@@ -47,13 +47,13 @@ def _build_ass_subtitles_content(transcript_segments: List[Dict[str, object]]) -
     header = [
         "[Script Info]",
         "ScriptType: v4.00+",
-        "PlayResX: 1080",
-        "PlayResY: 1920",
+        "PlayResX: 720",
+        "PlayResY: 1280",
         "ScaledBorderAndShadow: yes",
         "",
         "[V4+ Styles]",
         "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
-        "Style: Caption,Arial,40,&H00FFFFFF,&H000000FF,&H00000000,&H70000000,1,0,0,0,100,100,0,0,1,2,0,2,72,72,520,1",
+        "Style: Caption,Arial,30,&H00FFFFFF,&H000000FF,&H00000000,&H70000000,1,0,0,0,100,100,0,0,1,2,0,2,48,48,350,1",
         "",
         "[Events]",
         "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
@@ -87,8 +87,8 @@ def _build_ass_subtitles_content(transcript_segments: List[Dict[str, object]]) -
 def _build_filter_chain(title_file_path: Path, subtitle_file_path: Path) -> str:
     filters = [
         "split=2[bgsrc][fgsrc]",
-        "[bgsrc]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:10[bg]",
-        "[fgsrc]scale=1080:1920:force_original_aspect_ratio=decrease[fg]",
+        "[bgsrc]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=20:10[bg]",
+        "[fgsrc]scale=720:1280:force_original_aspect_ratio=decrease[fg]",
         "[bg][fg]overlay=(W-w)/2:(H-h)/2[composed]",
         "[composed]copy[base]",
     ]
@@ -98,17 +98,17 @@ def _build_filter_chain(title_file_path: Path, subtitle_file_path: Path) -> str:
         filters.append(
             "[base]"
             "drawtext="
-            "fontcolor=white:fontsize=48:line_spacing=10:"
-            "box=1:boxcolor=black@0.45:boxborderw=24:"
+            "fontcolor=white:fontsize=36:line_spacing=8:"
+            "box=1:boxcolor=black@0.45:boxborderw=18:"
             f"textfile='{safe_title_file}':"
-            "x=(w-text_w)/2:y=170"
+            "x=(w-text_w)/2:y=120"
             "[title]"
         )
     else:
         filters.append("[base]copy[title]")
 
     safe_subtitle_file = _escape_filter_path(subtitle_file_path)
-    filters.append(f"[title]subtitles='{safe_subtitle_file}'")
+    filters.append(f"[title]subtitles=filename='{safe_subtitle_file}'")
 
     return ";".join(filters)
 
