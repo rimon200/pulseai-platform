@@ -42,6 +42,7 @@ load_dotenv()
 app = FastAPI(title="PulseAI Backend")
 AUTO_CLIP_INTERVAL_SECONDS = 300
 AUTO_CLIP_MIN_SCORE = int(os.getenv("AUTO_CLIP_MIN_SCORE", "45"))
+AUTO_CLIP_CANDIDATE_COUNT = 3
 app.state.tiktok_pkce_verifiers = {}
 
 
@@ -1272,7 +1273,7 @@ async def _run_auto_generate_clip_pipeline():
         attempted_clip_ids: set[str] = set()
         attempted_clip_urls: set[str] = set()
         candidates = []
-        target_candidate_count = 5
+        target_candidate_count = AUTO_CLIP_CANDIDATE_COUNT
 
         for batch_attempt in range(1, 3):
             ignored_ids = cached_clip_ids | attempted_clip_ids
@@ -1288,7 +1289,7 @@ async def _run_auto_generate_clip_pipeline():
                 broadcaster_id=broadcaster_id,
                 ignored_clip_ids=ignored_ids,
                 ignored_clip_urls=ignored_urls,
-                limit=5,
+                limit=AUTO_CLIP_CANDIDATE_COUNT,
             )
             _log_performance_timing(
                 stage="twitch_clip_fetch",
