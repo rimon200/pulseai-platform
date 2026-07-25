@@ -152,7 +152,15 @@ return (
   key={`${clip.title}-${clip.started_at || "clip"}-${index}`}
   style={styles.clipCard}
 >
-                <div style={styles.clipPreview}>
+                <div
+  style={{
+    ...styles.clipPreview,
+    aspectRatio: "9 / 16",
+    height: "auto",
+    backgroundColor: "#000",
+    overflow: "hidden",
+  }}
+>
   {previewClipId === clip.id && clip.id ? (
     <video
       src={getClipVideoUrl(clip.id)}
@@ -162,7 +170,7 @@ return (
       style={{
         width: "100%",
         height: "100%",
-        objectFit: "cover",
+        objectFit: "contain",
         display: "block",
         backgroundColor: "#000",
       }}
