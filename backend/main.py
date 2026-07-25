@@ -65,6 +65,24 @@ def _log_memory_check(stage: str, candidate_number: int, total_candidates: int) 
     )
 
 
+def _log_performance_timing(
+    stage: str,
+    elapsed_seconds: float,
+    candidate_number: int | None = None,
+    total_candidates: int | None = None,
+) -> None:
+    candidate_label = "-"
+    if candidate_number is not None and total_candidates is not None:
+        candidate_label = f"{candidate_number}/{total_candidates}"
+
+    print(
+        "PERFORMANCE TIMING | "
+        f"stage={stage} | "
+        f"candidate={candidate_label} | "
+        f"elapsed_seconds={elapsed_seconds:.3f}"
+    )
+
+
 def _transcribe_video_with_segments_subprocess(video_path: str) -> dict[str, object]:
     file_descriptor, output_json_path = tempfile.mkstemp(suffix=".json")
     os.close(file_descriptor)
@@ -1207,6 +1225,8 @@ async def auto_generate_clip():
 
 
 async def _run_auto_generate_clip_pipeline():
+    generation_started_at = time.perf_counter()
+    processed_candidates_count = 0
     creators = load_creators()
 
     for creator in creators:
@@ -1263,11 +1283,16 @@ async def _run_auto_generate_clip_pipeline():
                 candidate_number=0,
                 total_candidates=target_candidate_count,
             )
+            fetch_started_at = time.perf_counter()
             fresh_batch = await fetch_fresh_twitch_clips(
                 broadcaster_id=broadcaster_id,
                 ignored_clip_ids=ignored_ids,
                 ignored_clip_urls=ignored_urls,
                 limit=5,
+            )
+            _log_performance_timing(
+                stage="twitch_clip_fetch",
+                elapsed_seconds=time.perf_counter() - fetch_started_at,
             )
             _log_memory_check(
                 stage="after_twitch_clip_fetch",
@@ -1287,6 +1312,9 @@ async def _run_auto_generate_clip_pipeline():
                 twitch_clip_id = str(twitch_clip.get("id", "")).strip()
                 if not twitch_clip_id:
                     continue
+
+                processed_candidates_count += 1
+                candidate_started_at = time.perf_counter()
 
                 public_url = (
                     twitch_clip.get("url")
@@ -1315,9 +1343,16 @@ async def _run_auto_generate_clip_pipeline():
                     candidate_number=candidate_index,
                     total_candidates=total_candidates,
                 )
+                download_started_at = time.perf_counter()
                 video_path = download_twitch_clip(
                     clip["public_url"],
                     clip["twitch_clip_id"],
+                )
+                _log_performance_timing(
+                    stage="ytdlp_download",
+                    candidate_number=candidate_index,
+                    total_candidates=total_candidates,
+                    elapsed_seconds=time.perf_counter() - download_started_at,
                 )
                 _log_memory_check(
                     stage="after_ytdlp_download",
@@ -1326,6 +1361,12 @@ async def _run_auto_generate_clip_pipeline():
                 )
 
                 if not video_path:
+                    _log_performance_timing(
+                        stage="candidate_processing_total",
+                        candidate_number=candidate_index,
+                        total_candidates=total_candidates,
+                        elapsed_seconds=time.perf_counter() - candidate_started_at,
+                    )
                     print(f"Candidate {candidate_index} skipped: download failed.")
                     continue
 
@@ -1336,7 +1377,14 @@ async def _run_auto_generate_clip_pipeline():
                         candidate_number=candidate_index,
                         total_candidates=total_candidates,
                     )
+                    transcription_started_at = time.perf_counter()
                     transcription = _transcribe_video_with_segments_subprocess(video_path)
+                    _log_performance_timing(
+                        stage="whisper_transcription",
+                        candidate_number=candidate_index,
+                        total_candidates=total_candidates,
+                        elapsed_seconds=time.perf_counter() - transcription_started_at,
+                    )
                     _log_memory_check(
                         stage="after_whisper_transcription",
                         candidate_number=candidate_index,
@@ -1349,6 +1397,7 @@ async def _run_auto_generate_clip_pipeline():
                         candidate_number=candidate_index,
                         total_candidates=total_candidates,
                     )
+                    scoring_started_at = time.perf_counter()
                     multimodal = score_multimodal_clip(
                         video_path=video_path,
                         transcript=clip["transcript"],
@@ -1357,6 +1406,12 @@ async def _run_auto_generate_clip_pipeline():
                         stream_title=clip["title"],
                         viewer_count=clip["viewer_count"],
                         duration=clip.get("duration", 0),
+                    )
+                    _log_performance_timing(
+                        stage="multimodal_scoring",
+                        candidate_number=candidate_index,
+                        total_candidates=total_candidates,
+                        elapsed_seconds=time.perf_counter() - scoring_started_at,
                     )
                     _log_memory_check(
                         stage="after_multimodal_scoring",
@@ -1385,6 +1440,13 @@ async def _run_auto_generate_clip_pipeline():
                         total_candidates=total_candidates,
                     )
 
+                _log_performance_timing(
+                    stage="candidate_processing_total",
+                    candidate_number=candidate_index,
+                    total_candidates=total_candidates,
+                    elapsed_seconds=time.perf_counter() - candidate_started_at,
+                )
+
                 candidates.append(clip)
 
             if candidates:
@@ -1405,13 +1467,28 @@ async def _run_auto_generate_clip_pipeline():
         for candidate in candidates:
             print(f"Candidate {candidate['candidate_number']}: {candidate['score']}")
 
+        winner_selection_started_at = time.perf_counter()
         best_clip = max(candidates, key=lambda c: c["score"])
+        _log_performance_timing(
+            stage="winner_selection",
+            elapsed_seconds=time.perf_counter() - winner_selection_started_at,
+        )
         print("")
         print(f"Best Clip: #{best_clip['candidate_number']}")
         print(f"Final Score: {best_clip['score']}")
         print("------------------------")
 
         if best_clip["decision"] == "reject" or best_clip["score"] < AUTO_CLIP_MIN_SCORE:
+            total_elapsed = time.perf_counter() - generation_started_at
+            _log_performance_timing(
+                stage="generation_total",
+                elapsed_seconds=total_elapsed,
+            )
+            print(
+                "PERFORMANCE TIMING SUMMARY | "
+                f"total_elapsed_seconds={total_elapsed:.3f} | "
+                f"processed_candidates={processed_candidates_count}"
+            )
             return {
                 "message": "No viral clips found.",
                 "best_score": best_clip["score"],
@@ -1424,6 +1501,16 @@ async def _run_auto_generate_clip_pipeline():
         )
 
         if is_duplicate:
+            total_elapsed = time.perf_counter() - generation_started_at
+            _log_performance_timing(
+                stage="generation_total",
+                elapsed_seconds=total_elapsed,
+            )
+            print(
+                "PERFORMANCE TIMING SUMMARY | "
+                f"total_elapsed_seconds={total_elapsed:.3f} | "
+                f"processed_candidates={processed_candidates_count}"
+            )
             return {
                 "message": "No viral clips found.",
                 "best_score": best_clip["score"],
@@ -1445,11 +1532,18 @@ async def _run_auto_generate_clip_pipeline():
                     candidate_number=best_candidate_number,
                     total_candidates=total_candidates,
                 )
+                ffmpeg_started_at = time.perf_counter()
                 edited_video_path = await asyncio.to_thread(
                     create_tiktok_edited_video,
                     best_clip["raw_video_path"],
                     title_for_overlay,
                     caption_segments,
+                )
+                _log_performance_timing(
+                    stage="ffmpeg_editing",
+                    candidate_number=best_candidate_number,
+                    total_candidates=total_candidates,
+                    elapsed_seconds=time.perf_counter() - ffmpeg_started_at,
                 )
                 _log_memory_check(
                     stage="after_ffmpeg_video_editing",
@@ -1468,14 +1562,40 @@ async def _run_auto_generate_clip_pipeline():
             candidate_number=int(best_clip.get("candidate_number", 0) or 0),
             total_candidates=len(candidates),
         )
+        persistence_started_at = time.perf_counter()
         result = await create_clip(best_clip)
+        _log_performance_timing(
+            stage="persistence",
+            elapsed_seconds=time.perf_counter() - persistence_started_at,
+        )
         _log_memory_check(
             stage="after_clip_persistence",
             candidate_number=int(best_clip.get("candidate_number", 0) or 0),
             total_candidates=len(candidates),
         )
+
+        total_elapsed = time.perf_counter() - generation_started_at
+        _log_performance_timing(
+            stage="generation_total",
+            elapsed_seconds=total_elapsed,
+        )
+        print(
+            "PERFORMANCE TIMING SUMMARY | "
+            f"total_elapsed_seconds={total_elapsed:.3f} | "
+            f"processed_candidates={processed_candidates_count}"
+        )
         return result["clip"]
 
+    total_elapsed = time.perf_counter() - generation_started_at
+    _log_performance_timing(
+        stage="generation_total",
+        elapsed_seconds=total_elapsed,
+    )
+    print(
+        "PERFORMANCE TIMING SUMMARY | "
+        f"total_elapsed_seconds={total_elapsed:.3f} | "
+        f"processed_candidates={processed_candidates_count}"
+    )
     return {
         "message": "No monitored creators are currently live."
     }
