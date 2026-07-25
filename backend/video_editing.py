@@ -86,7 +86,7 @@ def _build_ass_subtitles_content(transcript_segments: List[Dict[str, object]]) -
 
 def _build_filter_chain(title_file_path: Path, subtitle_file_path: Path) -> str:
     filters = [
-        "split=2[bgsrc][fgsrc]",
+        "fps=24,split=2[bgsrc][fgsrc]",
         "[bgsrc]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=20:10[bg]",
         "[fgsrc]scale=720:1280:force_original_aspect_ratio=decrease[fg]",
         "[bg][fg]overlay=(W-w)/2:(H-h)/2[composed]",
