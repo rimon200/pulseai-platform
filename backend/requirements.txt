@@ -33,6 +33,7 @@ openai==2.46.0
 opencv-python==5.0.0.93
 packaging==26.2
 protobuf==6.33.6
+psycopg[binary]==3.2.9
 pycryptodomex==3.23.0
 pydantic==2.13.4
 pydantic_core==2.46.4

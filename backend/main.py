@@ -43,6 +43,7 @@ app = FastAPI(title="PulseAI Backend")
 AUTO_CLIP_INTERVAL_SECONDS = 300
 AUTO_CLIP_MIN_SCORE = int(os.getenv("AUTO_CLIP_MIN_SCORE", "45"))
 AUTO_CLIP_CANDIDATE_COUNT = 3
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 app.state.tiktok_pkce_verifiers = {}
 
 
@@ -247,6 +248,7 @@ async def _auto_clip_loop():
 
 @app.on_event("startup")
 async def _start_auto_clip_task():
+    _ensure_oauth_tokens_table()
     if app.state.auto_clip_task is None or app.state.auto_clip_task.done():
         app.state.auto_clip_task = asyncio.create_task(_auto_clip_loop())
 
@@ -266,6 +268,137 @@ async def _stop_auto_clip_task():
 BASE_DIR = Path(__file__).resolve().parent
 CREATORS_FILE = BASE_DIR / "creators.json"
 CREATOR_CURSOR_FILE = BASE_DIR / "creator_cursor.json"
+TWITCH_USER_TOKEN_FILE = BASE_DIR / "twitch_user_token.json"
+TIKTOK_USER_TOKEN_FILE = BASE_DIR / "tiktok_user_token.json"
+
+
+def _ensure_oauth_tokens_table() -> None:
+    if not DATABASE_URL:
+        return
+
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS oauth_tokens (
+                        provider TEXT PRIMARY KEY,
+                        token_data JSONB NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+            connection.commit()
+    except Exception as error:
+        print(f"OAUTH TOKEN STORAGE INIT FAILED: {error.__class__.__name__}")
+
+
+def _load_token_data_from_file(token_file: Path) -> dict[str, object] | None:
+    try:
+        with token_file.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _save_token_data_to_file(token_file: Path, token_data: dict[str, object]) -> None:
+    try:
+        with token_file.open("w", encoding="utf-8") as file:
+            json.dump(token_data, file, indent=2)
+    except OSError as error:
+        print(f"OAUTH TOKEN FILE SAVE FAILED: {error.__class__.__name__}")
+
+
+def _load_oauth_token_data(provider: str) -> dict[str, object] | None:
+    if not DATABASE_URL:
+        return None
+
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT token_data FROM oauth_tokens WHERE provider = %s",
+                    (provider,),
+                )
+                row = cursor.fetchone()
+    except Exception as error:
+        print(
+            f"OAUTH TOKEN DB LOAD FAILED: provider={provider} "
+            f"error={error.__class__.__name__}"
+        )
+        return None
+
+    if not row:
+        return None
+
+    token_data = row[0]
+    if isinstance(token_data, dict):
+        return token_data
+    return None
+
+
+def _save_oauth_token_data(provider: str, token_data: dict[str, object]) -> bool:
+    if not DATABASE_URL:
+        return False
+
+    try:
+        import psycopg
+        from psycopg.types.json import Jsonb
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO oauth_tokens (provider, token_data, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (provider)
+                    DO UPDATE SET
+                        token_data = EXCLUDED.token_data,
+                        updated_at = NOW()
+                    """,
+                    (provider, Jsonb(token_data)),
+                )
+            connection.commit()
+        return True
+    except Exception as error:
+        print(
+            f"OAUTH TOKEN DB SAVE FAILED: provider={provider} "
+            f"error={error.__class__.__name__}"
+        )
+        return False
+
+
+def _load_provider_token_data(
+    provider: str,
+    token_file: Path,
+) -> dict[str, object] | None:
+    token_data = _load_oauth_token_data(provider)
+    if token_data is not None:
+        return token_data
+
+    fallback_token_data = _load_token_data_from_file(token_file)
+    if fallback_token_data is None:
+        return None
+
+    _save_oauth_token_data(provider, fallback_token_data)
+    return fallback_token_data
+
+
+def _save_provider_token_data(
+    provider: str,
+    token_file: Path,
+    token_data: dict[str, object],
+) -> None:
+    _save_oauth_token_data(provider, token_data)
+    _save_token_data_to_file(token_file, token_data)
 
 
 def _is_within_directory(path: Path, directory: Path) -> bool:
@@ -459,16 +592,13 @@ def verify_twitch_credentials() -> None:
         )
 
 def get_twitch_user_access_token() -> str:
-    token_file = Path(__file__).resolve().parent / "twitch_user_token.json"
+    token_data = _load_provider_token_data("twitch", TWITCH_USER_TOKEN_FILE)
 
-    if not token_file.exists():
+    if token_data is None:
         raise HTTPException(
             status_code=401,
             detail="Twitch account is not connected. Visit /auth/twitch first.",
         )
-
-    with token_file.open("r", encoding="utf-8") as file:
-        token_data = json.load(file)
 
     access_token = token_data.get("access_token")
 
@@ -481,10 +611,12 @@ def get_twitch_user_access_token() -> str:
     return access_token
 
 def refresh_twitch_user_access_token() -> str:
-    token_file = Path(__file__).resolve().parent / "twitch_user_token.json"
-
-    with token_file.open("r", encoding="utf-8") as file:
-        token_data = json.load(file)
+    token_data = _load_provider_token_data("twitch", TWITCH_USER_TOKEN_FILE)
+    if token_data is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Twitch account is not connected. Visit /auth/twitch first.",
+        )
 
     refresh_token = token_data.get("refresh_token")
 
@@ -524,8 +656,7 @@ def refresh_twitch_user_access_token() -> str:
         token_data.get("scope", []),
     )
 
-    with token_file.open("w", encoding="utf-8") as file:
-        json.dump(token_data, file, indent=2)
+    _save_provider_token_data("twitch", TWITCH_USER_TOKEN_FILE, token_data)
 
     return token_data["access_token"]
 
@@ -854,22 +985,12 @@ def download_twitch_clip(clip_url: str, output_name: str) -> str:
 
 
 async def upload_tiktok_draft(video_path: str) -> dict:
-    token_file = Path(__file__).resolve().parent / "tiktok_user_token.json"
-
-    if not token_file.exists():
+    token_response = _load_provider_token_data("tiktok", TIKTOK_USER_TOKEN_FILE)
+    if token_response is None:
         raise HTTPException(
             status_code=401,
             detail="TikTok account is not connected.",
         )
-
-    try:
-        with token_file.open("r", encoding="utf-8") as file:
-            token_response = json.load(file)
-    except (OSError, json.JSONDecodeError) as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unable to read TikTok token storage: {error}",
-        ) from error
 
     access_token = token_response.get("data", {}).get("access_token")
     if not access_token:
@@ -1728,19 +1849,13 @@ async def twitch_callback(code: str):
 
     token_data = response.json()
 
-    token_file = Path(__file__).resolve().parent / "twitch_user_token.json"
-
-    with token_file.open("w", encoding="utf-8") as file:
-        json.dump(
-            {
-                "access_token": token_data.get("access_token"),
-                "refresh_token": token_data.get("refresh_token"),
-                "expires_in": token_data.get("expires_in"),
-                "scope": token_data.get("scope", []),
-            },
-            file,
-            indent=2,
-        )
+    normalized_token_data = {
+        "access_token": token_data.get("access_token"),
+        "refresh_token": token_data.get("refresh_token"),
+        "expires_in": token_data.get("expires_in"),
+        "scope": token_data.get("scope", []),
+    }
+    _save_provider_token_data("twitch", TWITCH_USER_TOKEN_FILE, normalized_token_data)
 
     return {
         "success": True,
@@ -1798,9 +1913,14 @@ async def tiktok_callback(code: str, state: str):
             detail=f"TikTok token exchange failed: {response.text}",
         )
 
-    token_file = Path(__file__).resolve().parent / "tiktok_user_token.json"
-    with token_file.open("w", encoding="utf-8") as file:
-        json.dump(response.json(), file, indent=2)
+    token_data = response.json()
+    if not isinstance(token_data, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="TikTok token exchange returned an invalid payload.",
+        )
+
+    _save_provider_token_data("tiktok", TIKTOK_USER_TOKEN_FILE, token_data)
 
     return {
         "success": True,
