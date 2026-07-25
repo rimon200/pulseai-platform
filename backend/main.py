@@ -265,6 +265,7 @@ async def _stop_auto_clip_task():
 
 BASE_DIR = Path(__file__).resolve().parent
 CREATORS_FILE = BASE_DIR / "creators.json"
+CREATOR_CURSOR_FILE = BASE_DIR / "creator_cursor.json"
 
 
 def _is_within_directory(path: Path, directory: Path) -> bool:
@@ -392,6 +393,48 @@ def save_creators(creators: list[dict[str, str]]) -> None:
             status_code=500,
             detail=f"Unable to save creators.json: {error}",
         ) from error
+
+
+def _normalize_cursor_index(raw_index: object, creator_count: int) -> int:
+    if creator_count <= 0:
+        return 0
+
+    try:
+        normalized = int(raw_index)
+    except (TypeError, ValueError):
+        return 0
+
+    return normalized % creator_count
+
+
+def _load_creator_cursor(creator_count: int) -> int:
+    if creator_count <= 0:
+        return 0
+
+    try:
+        with CREATOR_CURSOR_FILE.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return 0
+
+    if not isinstance(payload, dict):
+        return 0
+
+    return _normalize_cursor_index(payload.get("next_index", 0), creator_count)
+
+
+def _save_creator_cursor(next_index: int, creator_count: int) -> None:
+    if creator_count <= 0:
+        return
+
+    normalized_next_index = _normalize_cursor_index(next_index, creator_count)
+    payload = {"next_index": normalized_next_index}
+
+    try:
+        with CREATOR_CURSOR_FILE.open("w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2)
+    except OSError as error:
+        print(f"ROUND ROBIN | cursor_persist_failed={error}")
 
 
 PUBLISHED_FILE = "published_clips.json"
@@ -1229,12 +1272,17 @@ async def _run_auto_generate_clip_pipeline():
     generation_started_at = time.perf_counter()
     processed_candidates_count = 0
     creators = load_creators()
+    creator_count = len(creators)
+    start_index = _load_creator_cursor(creator_count)
+    selected_creator = None
+    selected_stream = None
+    selected_index = None
 
-    for creator in creators:
+    for offset in range(creator_count):
+        creator_index = (start_index + offset) % creator_count
+        creator = creators[creator_index]
         try:
             stream = await get_twitch_channel_data(creator["channel"])
-            broadcaster_id = stream.get("user_id")
-
         except Exception as error:
             print(
                 f"TWITCH CHECK FAILED for {creator['channel']}:",
@@ -1245,71 +1293,108 @@ async def _run_auto_generate_clip_pipeline():
         if not stream.get("is_live"):
             continue
 
-        viewer_count = stream.get("viewer_count", 0)
-        stream_title = (
-            stream.get("title")
-            or f"{creator['name']} Live Moment"
+        selected_creator = creator
+        selected_stream = stream
+        selected_index = creator_index
+        break
+
+    if selected_creator is None or selected_stream is None or selected_index is None:
+        print(
+            "ROUND ROBIN | selected_creator=none | selected_index=-1 | "
+            f"next_index={start_index} | reason=no_live_creators"
+        )
+        total_elapsed = time.perf_counter() - generation_started_at
+        _log_performance_timing(
+            stage="generation_total",
+            elapsed_seconds=total_elapsed,
+        )
+        print(
+            "PERFORMANCE TIMING SUMMARY | "
+            f"total_elapsed_seconds={total_elapsed:.3f} | "
+            f"processed_candidates={processed_candidates_count}"
+        )
+        return {
+            "message": "No monitored creators are currently live."
+        }
+
+    next_index = (selected_index + 1) % creator_count
+    _save_creator_cursor(next_index, creator_count)
+    print(
+        "ROUND ROBIN | "
+        f"selected_creator={selected_creator['name']} | "
+        f"selected_index={selected_index} | "
+        f"next_index={next_index}"
+    )
+
+    creator = selected_creator
+    stream = selected_stream
+    broadcaster_id = stream.get("user_id")
+
+    viewer_count = stream.get("viewer_count", 0)
+    stream_title = (
+        stream.get("title")
+        or f"{creator['name']} Live Moment"
+    )
+
+    clips_file = Path(__file__).resolve().parent / "clips.json"
+
+    try:
+        with clips_file.open("r", encoding="utf-8") as file:
+            existing_clips = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        existing_clips = []
+
+    cached_clip_ids = {
+        str(existing.get("twitch_clip_id", "")).strip()
+        for existing in existing_clips
+        if existing.get("twitch_clip_id")
+    }
+    cached_clip_urls = {
+        str(existing.get("public_url", "")).strip()
+        for existing in existing_clips
+        if existing.get("public_url")
+    }
+
+    attempted_clip_ids: set[str] = set()
+    attempted_clip_urls: set[str] = set()
+    candidates = []
+    target_candidate_count = AUTO_CLIP_CANDIDATE_COUNT
+
+    for batch_attempt in range(1, 3):
+        ignored_ids = cached_clip_ids | attempted_clip_ids
+        ignored_urls = cached_clip_urls | attempted_clip_urls
+
+        _log_memory_check(
+            stage="before_twitch_clip_fetch",
+            candidate_number=0,
+            total_candidates=target_candidate_count,
+        )
+        fetch_started_at = time.perf_counter()
+        fresh_batch = await fetch_fresh_twitch_clips(
+            broadcaster_id=broadcaster_id,
+            ignored_clip_ids=ignored_ids,
+            ignored_clip_urls=ignored_urls,
+            limit=AUTO_CLIP_CANDIDATE_COUNT,
+        )
+        _log_performance_timing(
+            stage="twitch_clip_fetch",
+            elapsed_seconds=time.perf_counter() - fetch_started_at,
+        )
+        _log_memory_check(
+            stage="after_twitch_clip_fetch",
+            candidate_number=0,
+            total_candidates=max(len(fresh_batch), target_candidate_count),
         )
 
-        clips_file = Path(__file__).resolve().parent / "clips.json"
-
-        try:
-            with clips_file.open("r", encoding="utf-8") as file:
-                existing_clips = json.load(file)
-        except (FileNotFoundError, json.JSONDecodeError):
-            existing_clips = []
-
-        cached_clip_ids = {
-            str(existing.get("twitch_clip_id", "")).strip()
-            for existing in existing_clips
-            if existing.get("twitch_clip_id")
-        }
-        cached_clip_urls = {
-            str(existing.get("public_url", "")).strip()
-            for existing in existing_clips
-            if existing.get("public_url")
-        }
-
-        attempted_clip_ids: set[str] = set()
-        attempted_clip_urls: set[str] = set()
-        candidates = []
-        target_candidate_count = AUTO_CLIP_CANDIDATE_COUNT
-
-        for batch_attempt in range(1, 3):
-            ignored_ids = cached_clip_ids | attempted_clip_ids
-            ignored_urls = cached_clip_urls | attempted_clip_urls
-
-            _log_memory_check(
-                stage="before_twitch_clip_fetch",
-                candidate_number=0,
-                total_candidates=target_candidate_count,
+        if not fresh_batch:
+            print(
+                f"No fresh Twitch clips available for {creator['channel']} "
+                f"(batch {batch_attempt}/2)."
             )
-            fetch_started_at = time.perf_counter()
-            fresh_batch = await fetch_fresh_twitch_clips(
-                broadcaster_id=broadcaster_id,
-                ignored_clip_ids=ignored_ids,
-                ignored_clip_urls=ignored_urls,
-                limit=AUTO_CLIP_CANDIDATE_COUNT,
-            )
-            _log_performance_timing(
-                stage="twitch_clip_fetch",
-                elapsed_seconds=time.perf_counter() - fetch_started_at,
-            )
-            _log_memory_check(
-                stage="after_twitch_clip_fetch",
-                candidate_number=0,
-                total_candidates=max(len(fresh_batch), target_candidate_count),
-            )
+            continue
 
-            if not fresh_batch:
-                print(
-                    f"No fresh Twitch clips available for {creator['channel']} "
-                    f"(batch {batch_attempt}/2)."
-                )
-                continue
-
-            total_candidates = len(fresh_batch)
-            for candidate_index, twitch_clip in enumerate(fresh_batch, start=1):
+        total_candidates = len(fresh_batch)
+        for candidate_index, twitch_clip in enumerate(fresh_batch, start=1):
                 twitch_clip_id = str(twitch_clip.get("id", "")).strip()
                 if not twitch_clip_id:
                     continue
@@ -1450,131 +1535,36 @@ async def _run_auto_generate_clip_pipeline():
 
                 candidates.append(clip)
 
-            if candidates:
-                break
+        if candidates:
+            break
 
-            print(
-                f"All clips in batch {batch_attempt} failed to download/score for "
-                f"{creator['channel']}."
-            )
-
-        if not candidates:
-            return {
-                "message": "No viral clips found.",
-                "best_score": 0,
-            }
-
-        print("------------------------")
-        for candidate in candidates:
-            print(f"Candidate {candidate['candidate_number']}: {candidate['score']}")
-
-        winner_selection_started_at = time.perf_counter()
-        best_clip = max(candidates, key=lambda c: c["score"])
-        _log_performance_timing(
-            stage="winner_selection",
-            elapsed_seconds=time.perf_counter() - winner_selection_started_at,
-        )
-        print("")
-        print(f"Best Clip: #{best_clip['candidate_number']}")
-        print(f"Final Score: {best_clip['score']}")
-        print("------------------------")
-
-        if best_clip["decision"] == "reject" or best_clip["score"] < AUTO_CLIP_MIN_SCORE:
-            total_elapsed = time.perf_counter() - generation_started_at
-            _log_performance_timing(
-                stage="generation_total",
-                elapsed_seconds=total_elapsed,
-            )
-            print(
-                "PERFORMANCE TIMING SUMMARY | "
-                f"total_elapsed_seconds={total_elapsed:.3f} | "
-                f"processed_candidates={processed_candidates_count}"
-            )
-            return {
-                "message": "No viral clips found.",
-                "best_score": best_clip["score"],
-            }
-
-        is_duplicate = any(
-            existing.get("twitch_clip_id") == best_clip["twitch_clip_id"]
-            or existing.get("public_url") == best_clip["public_url"]
-            for existing in existing_clips
+        print(
+            f"All clips in batch {batch_attempt} failed to download/score for "
+            f"{creator['channel']}."
         )
 
-        if is_duplicate:
-            total_elapsed = time.perf_counter() - generation_started_at
-            _log_performance_timing(
-                stage="generation_total",
-                elapsed_seconds=total_elapsed,
-            )
-            print(
-                "PERFORMANCE TIMING SUMMARY | "
-                f"total_elapsed_seconds={total_elapsed:.3f} | "
-                f"processed_candidates={processed_candidates_count}"
-            )
-            return {
-                "message": "No viral clips found.",
-                "best_score": best_clip["score"],
-            }
+    if not candidates:
+        return {
+            "message": "No viral clips found.",
+            "best_score": 0,
+        }
 
-        best_clip["ai_title"] = generate_ai_title(best_clip["transcript"])
-        best_clip["ai_description"] = generate_ai_description(best_clip["transcript"])
-        best_clip["raw_video_path"] = best_clip.get("video_path")
+    print("------------------------")
+    for candidate in candidates:
+        print(f"Candidate {candidate['candidate_number']}: {candidate['score']}")
 
-        try:
-            title_for_overlay = best_clip.get("ai_title") or best_clip.get("title", "")
-            caption_segments = best_clip.get("segments", [])
-            best_candidate_number = int(best_clip.get("candidate_number", 0) or 0)
-            total_candidates = len(candidates)
+    winner_selection_started_at = time.perf_counter()
+    best_clip = max(candidates, key=lambda c: c["score"])
+    _log_performance_timing(
+        stage="winner_selection",
+        elapsed_seconds=time.perf_counter() - winner_selection_started_at,
+    )
+    print("")
+    print(f"Best Clip: #{best_clip['candidate_number']}")
+    print(f"Final Score: {best_clip['score']}")
+    print("------------------------")
 
-            async with app.state.video_edit_lock:
-                _log_memory_check(
-                    stage="before_ffmpeg_video_editing",
-                    candidate_number=best_candidate_number,
-                    total_candidates=total_candidates,
-                )
-                ffmpeg_started_at = time.perf_counter()
-                edited_video_path = await asyncio.to_thread(
-                    create_tiktok_edited_video,
-                    best_clip["raw_video_path"],
-                    title_for_overlay,
-                    caption_segments,
-                )
-                _log_performance_timing(
-                    stage="ffmpeg_editing",
-                    candidate_number=best_candidate_number,
-                    total_candidates=total_candidates,
-                    elapsed_seconds=time.perf_counter() - ffmpeg_started_at,
-                )
-                _log_memory_check(
-                    stage="after_ffmpeg_video_editing",
-                    candidate_number=best_candidate_number,
-                    total_candidates=total_candidates,
-                )
-
-            best_clip["video_path"] = edited_video_path
-        except Exception as error:
-            print("TIKTOK VIDEO EDIT FAILED:", repr(error))
-            print(traceback.format_exc())
-            best_clip["video_path"] = best_clip.get("raw_video_path")
-
-        _log_memory_check(
-            stage="before_clip_persistence",
-            candidate_number=int(best_clip.get("candidate_number", 0) or 0),
-            total_candidates=len(candidates),
-        )
-        persistence_started_at = time.perf_counter()
-        result = await create_clip(best_clip)
-        _log_performance_timing(
-            stage="persistence",
-            elapsed_seconds=time.perf_counter() - persistence_started_at,
-        )
-        _log_memory_check(
-            stage="after_clip_persistence",
-            candidate_number=int(best_clip.get("candidate_number", 0) or 0),
-            total_candidates=len(candidates),
-        )
-
+    if best_clip["decision"] == "reject" or best_clip["score"] < AUTO_CLIP_MIN_SCORE:
         total_elapsed = time.perf_counter() - generation_started_at
         _log_performance_timing(
             stage="generation_total",
@@ -1585,7 +1575,90 @@ async def _run_auto_generate_clip_pipeline():
             f"total_elapsed_seconds={total_elapsed:.3f} | "
             f"processed_candidates={processed_candidates_count}"
         )
-        return result["clip"]
+        return {
+            "message": "No viral clips found.",
+            "best_score": best_clip["score"],
+        }
+
+    is_duplicate = any(
+        existing.get("twitch_clip_id") == best_clip["twitch_clip_id"]
+        or existing.get("public_url") == best_clip["public_url"]
+        for existing in existing_clips
+    )
+
+    if is_duplicate:
+        total_elapsed = time.perf_counter() - generation_started_at
+        _log_performance_timing(
+            stage="generation_total",
+            elapsed_seconds=total_elapsed,
+        )
+        print(
+            "PERFORMANCE TIMING SUMMARY | "
+            f"total_elapsed_seconds={total_elapsed:.3f} | "
+            f"processed_candidates={processed_candidates_count}"
+        )
+        return {
+            "message": "No viral clips found.",
+            "best_score": best_clip["score"],
+        }
+
+    best_clip["ai_title"] = generate_ai_title(best_clip["transcript"])
+    best_clip["ai_description"] = generate_ai_description(best_clip["transcript"])
+    best_clip["raw_video_path"] = best_clip.get("video_path")
+
+    try:
+        title_for_overlay = best_clip.get("ai_title") or best_clip.get("title", "")
+        caption_segments = best_clip.get("segments", [])
+        best_candidate_number = int(best_clip.get("candidate_number", 0) or 0)
+        total_candidates = len(candidates)
+
+        async with app.state.video_edit_lock:
+            _log_memory_check(
+                stage="before_ffmpeg_video_editing",
+                candidate_number=best_candidate_number,
+                total_candidates=total_candidates,
+            )
+            ffmpeg_started_at = time.perf_counter()
+            edited_video_path = await asyncio.to_thread(
+                create_tiktok_edited_video,
+                best_clip["raw_video_path"],
+                title_for_overlay,
+                caption_segments,
+            )
+            _log_performance_timing(
+                stage="ffmpeg_editing",
+                candidate_number=best_candidate_number,
+                total_candidates=total_candidates,
+                elapsed_seconds=time.perf_counter() - ffmpeg_started_at,
+            )
+            _log_memory_check(
+                stage="after_ffmpeg_video_editing",
+                candidate_number=best_candidate_number,
+                total_candidates=total_candidates,
+            )
+
+        best_clip["video_path"] = edited_video_path
+    except Exception as error:
+        print("TIKTOK VIDEO EDIT FAILED:", repr(error))
+        print(traceback.format_exc())
+        best_clip["video_path"] = best_clip.get("raw_video_path")
+
+    _log_memory_check(
+        stage="before_clip_persistence",
+        candidate_number=int(best_clip.get("candidate_number", 0) or 0),
+        total_candidates=len(candidates),
+    )
+    persistence_started_at = time.perf_counter()
+    result = await create_clip(best_clip)
+    _log_performance_timing(
+        stage="persistence",
+        elapsed_seconds=time.perf_counter() - persistence_started_at,
+    )
+    _log_memory_check(
+        stage="after_clip_persistence",
+        candidate_number=int(best_clip.get("candidate_number", 0) or 0),
+        total_candidates=len(candidates),
+    )
 
     total_elapsed = time.perf_counter() - generation_started_at
     _log_performance_timing(
@@ -1597,9 +1670,7 @@ async def _run_auto_generate_clip_pipeline():
         f"total_elapsed_seconds={total_elapsed:.3f} | "
         f"processed_candidates={processed_candidates_count}"
     )
-    return {
-        "message": "No monitored creators are currently live."
-    }
+    return result["clip"]
 
 @app.post("/api/clips/{clip_id}/publish")
 async def publish_clip(clip_id: str):
