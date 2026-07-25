@@ -53,7 +53,7 @@ def _build_ass_subtitles_content(transcript_segments: List[Dict[str, object]]) -
         "",
         "[V4+ Styles]",
         "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
-        "Style: Caption,Arial,30,&H00FFFFFF,&H000000FF,&H00000000,&H70000000,1,0,0,0,100,100,0,0,1,2,0,2,48,48,350,1",
+        "Style: Caption,Arial,30,&H00FFFFFF,&H000000FF,&H00000000,&H70000000,1,0,0,0,100,100,0,0,1,2,0,2,48,48,320,1",
         "",
         "[Events]",
         "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
@@ -86,29 +86,38 @@ def _build_ass_subtitles_content(transcript_segments: List[Dict[str, object]]) -
 
 def _build_filter_chain(title_file_path: Path, subtitle_file_path: Path) -> str:
     filters = [
-        "fps=24,split=2[bgsrc][fgsrc]",
-        "[bgsrc]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,boxblur=20:10[bg]",
-        "[fgsrc]scale=720:1280:force_original_aspect_ratio=decrease[fg]",
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2[composed]",
-        "[composed]copy[base]",
+        "fps=24,scale=720:840:force_original_aspect_ratio=decrease,pad=720:840:(ow-iw)/2:(oh-ih)/2:color=0xf2f2f2[vid]",
+        "color=c=white:s=720x1280[base]",
+        "[base]drawbox=x=0:y=300:w=720:h=840:color=0xf2f2f2:t=fill[canvas]",
+        "[canvas][vid]overlay=x=0:y=300:shortest=1[composed]",
     ]
 
     if title_file_path and title_file_path.is_file() and title_file_path.stat().st_size > 0:
         safe_title_file = _escape_filter_path(title_file_path)
         filters.append(
-            "[base]"
+            "[composed]"
             "drawtext="
-            "fontcolor=white:fontsize=36:line_spacing=8:"
-            "box=1:boxcolor=black@0.45:boxborderw=18:"
+            "fontcolor=black:fontsize=56:line_spacing=6:"
+            "font=Arial Bold:"
             f"textfile='{safe_title_file}':"
-            "x=(w-text_w)/2:y=120"
+            "x=max((w-text_w)/2\,48):"
+            "y=(300-text_h)/2"
             "[title]"
         )
     else:
-        filters.append("[base]copy[title]")
+        filters.append("[composed]copy[title]")
+
+    filters.append(
+        "[title]"
+        "drawtext="
+        "text='PulseAI Clips':"
+        "fontcolor=#5f6368:fontsize=24:"
+        "x=(w-text_w)/2:y=1200"
+        "[branded]"
+    )
 
     safe_subtitle_file = _escape_filter_path(subtitle_file_path)
-    filters.append(f"[title]subtitles=filename='{safe_subtitle_file}'")
+    filters.append(f"[branded]subtitles=filename='{safe_subtitle_file}'")
 
     return ";".join(filters)
 
