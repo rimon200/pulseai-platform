@@ -584,6 +584,85 @@ def load_published():
 def save_published(data):
     with open(PUBLISHED_FILE, "w") as file:
         json.dump(data, file, indent=2)
+
+
+def _normalize_clip_status_value(status_value: object) -> str:
+    status_text = str(status_value or "").strip().lower()
+    if status_text == "published":
+        return "Published"
+    if status_text == "ready to review":
+        return "Ready to review"
+    return ""
+
+
+def _is_clip_published(clip: dict[str, object]) -> bool:
+    return _normalize_clip_status_value(clip.get("status")) == "Published"
+
+
+def _get_stable_clip_identifiers(clip: dict[str, object]) -> dict[str, str]:
+    identifiers: dict[str, str] = {}
+    for key in ("id", "twitch_clip_id", "public_url"):
+        value = clip.get(key)
+        if value is None:
+            continue
+        normalized_value = str(value).strip()
+        if normalized_value:
+            identifiers[key] = normalized_value
+    return identifiers
+
+
+def _find_clip_index_by_stable_identifier(
+    clips: list[dict[str, object]],
+    target_clip: dict[str, object],
+) -> int | None:
+    target_identifiers = _get_stable_clip_identifiers(target_clip)
+    if not target_identifiers:
+        return None
+
+    clip_id = target_identifiers.get("id")
+    if clip_id:
+        for index, existing_clip in enumerate(clips):
+            if str(existing_clip.get("id", "")).strip() == clip_id:
+                return index
+
+    twitch_clip_id = target_identifiers.get("twitch_clip_id")
+    if twitch_clip_id:
+        for index, existing_clip in enumerate(clips):
+            if str(existing_clip.get("twitch_clip_id", "")).strip() == twitch_clip_id:
+                return index
+
+    public_url = target_identifiers.get("public_url")
+    if public_url:
+        for index, existing_clip in enumerate(clips):
+            if str(existing_clip.get("public_url", "")).strip() == public_url:
+                return index
+
+    return None
+
+
+def _contains_clip_with_same_identifier(
+    clip_collection: list[dict[str, object]],
+    target_clip: dict[str, object],
+) -> bool:
+    target_identifiers = _get_stable_clip_identifiers(target_clip)
+    if not target_identifiers:
+        return False
+
+    for existing_clip in clip_collection:
+        existing_identifiers = _get_stable_clip_identifiers(existing_clip)
+        if not existing_identifiers:
+            continue
+        for key in ("id", "twitch_clip_id", "public_url"):
+            if (
+                key in target_identifiers
+                and key in existing_identifiers
+                and target_identifiers[key] == existing_identifiers[key]
+            ):
+                return True
+
+    return False
+
+
 def verify_twitch_credentials() -> None:
     if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
         raise HTTPException(
@@ -1242,11 +1321,40 @@ async def get_clip_video(clip_id: str, download: int = 0):
 
 @app.post("/api/publish")
 async def publish_clip(clip: dict):
-    video_path = clip.get("video_path")
+    clips_file = Path(__file__).resolve().parent / "clips.json"
+
+    try:
+        with clips_file.open("r", encoding="utf-8") as file:
+            clips = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        clips = []
+
+    matching_clip_index = _find_clip_index_by_stable_identifier(clips, clip)
+    if matching_clip_index is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Clip not found in clips storage.",
+        )
+
+    matching_clip = clips[matching_clip_index]
+    if _is_clip_published(matching_clip):
+        raise HTTPException(
+            status_code=409,
+            detail="Clip has already been published.",
+        )
+
+    published = load_published()
+    if _contains_clip_with_same_identifier(published, matching_clip):
+        raise HTTPException(
+            status_code=409,
+            detail="Clip has already been published.",
+        )
+
+    video_path = matching_clip.get("video_path")
     if not video_path:
         raise HTTPException(
             status_code=400,
-            detail="Clip is missing video_path.",
+            detail="Stored clip is missing video_path.",
         )
 
     if not Path(video_path).is_file():
@@ -1256,16 +1364,21 @@ async def publish_clip(clip: dict):
         )
 
     tiktok_result = await upload_tiktok_draft(video_path)
-    published = load_published()
 
-    # Don't save duplicates
-    if not any(item["title"] == clip["title"] for item in published):
-        published.append(clip)
+    updated_clip_index = _find_clip_index_by_stable_identifier(clips, matching_clip)
+    if updated_clip_index is not None:
+        clips[updated_clip_index]["status"] = "Published"
+        with clips_file.open("w", encoding="utf-8") as file:
+            json.dump(clips, file, indent=2)
+        matching_clip = clips[updated_clip_index]
+
+    if not _contains_clip_with_same_identifier(published, matching_clip):
+        published.append(matching_clip)
         save_published(published)
 
     return {
         "success": True,
-        "message": f"Published '{clip['title']}' successfully!",
+        "message": f"Published '{matching_clip.get('title', 'clip')}' successfully!",
         "published_count": len(published),
         "publish_id": tiktok_result.get("publish_id"),
         "upload_result": tiktok_result.get("upload_result"),

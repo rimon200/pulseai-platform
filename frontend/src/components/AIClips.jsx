@@ -1,9 +1,60 @@
 import { useState } from "react";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL;
+
+const normalizeClipStatus = (status) => {
+  const value = String(status || "").trim().toLowerCase();
+  if (value === "published") {
+    return "Published";
+  }
+  if (value === "ready to review") {
+    return "Ready to review";
+  }
+  return "";
+};
+
+const isReviewableClip = (clip) => {
+  const normalized = normalizeClipStatus(clip?.status);
+  if (!normalized) {
+    return true;
+  }
+  return normalized === "Ready to review";
+};
+
+const clipsMatch = (left, right) => {
+  if (!left || !right) {
+    return false;
+  }
+
+  const leftId = String(left.id || "").trim();
+  const rightId = String(right.id || "").trim();
+  if (leftId && rightId && leftId === rightId) {
+    return true;
+  }
+
+  const leftTwitchClipId = String(left.twitch_clip_id || "").trim();
+  const rightTwitchClipId = String(right.twitch_clip_id || "").trim();
+  if (
+    leftTwitchClipId
+    && rightTwitchClipId
+    && leftTwitchClipId === rightTwitchClipId
+  ) {
+    return true;
+  }
+
+  const leftPublicUrl = String(left.public_url || "").trim();
+  const rightPublicUrl = String(right.public_url || "").trim();
+  if (leftPublicUrl && rightPublicUrl && leftPublicUrl === rightPublicUrl) {
+    return true;
+  }
+
+  return false;
+};
+
 function AIClips({ styles, clips, setClips }) {
   const [previewClipId, setPreviewClipId] = useState(null);
   const [previewErrors, setPreviewErrors] = useState({});
+  const reviewableClips = clips.filter(isReviewableClip);
 
   const getClipVideoUrl = (clipId, download = false) =>
     `${API_BASE_URL}/api/clips/${encodeURIComponent(clipId)}/video${
@@ -71,11 +122,6 @@ if (Array.isArray(updatedClips)) {
 
 const publishClip = async (clip) => {
   try {
-    if (!clip.id) {
-      alert("This older clip has no ID. Generate a newer clip first.");
-      return;
-    }
-
     if (!clip.video_path) {
       alert("This clip is missing its local video file path.");
       return;
@@ -105,11 +151,11 @@ const publishClip = async (clip) => {
     }
 
     setClips((currentClips) =>
-      currentClips.map((currentClip) =>
-        currentClip.id === clip.id
-          ? { ...currentClip, status: "Published" }
-          : currentClip
-      )
+      currentClips.filter((currentClip) => !clipsMatch(currentClip, clip))
+    );
+
+    setPreviewClipId((currentPreviewClipId) =>
+      currentPreviewClipId === clip.id ? null : currentPreviewClipId
     );
   } catch (error) {
     console.error(error);
@@ -146,8 +192,8 @@ return (
         </div>
 
         <div style={styles.clipGrid}>
-          {clips.length > 0 ? (
-            clips.map((clip, index) => (
+          {reviewableClips.length > 0 ? (
+            reviewableClips.map((clip, index) => (
               <div
   key={`${clip.title}-${clip.started_at || "clip"}-${index}`}
   style={styles.clipCard}
@@ -211,11 +257,11 @@ return (
   disabled={false}
   style={{
     ...styles.secondaryButton,
-    opacity: clip.status === "Published" ? 0.6 : 1,
-    cursor: clip.status === "Published" ? "default" : "pointer",
+    opacity: 1,
+    cursor: "pointer",
   }}
 >
-  {clip.status === "Published" ? "✅ Published" : "Publish"}
+  Publish
 </button>
 
 <button
