@@ -45,6 +45,9 @@ AUTO_CLIP_MIN_SCORE = int(os.getenv("AUTO_CLIP_MIN_SCORE", "45"))
 AUTO_CLIP_CANDIDATE_COUNT = 3
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 app.state.tiktok_pkce_verifiers = {}
+TIKTOK_RECONNECT_REQUIRED_MESSAGE = (
+    "TikTok authorization expired. Reconnect TikTok in Settings."
+)
 
 
 def _get_current_rss_mb() -> float:
@@ -670,6 +673,226 @@ def verify_twitch_credentials() -> None:
             detail="Twitch credentials are missing from backend/.env",
         )
 
+
+def _coerce_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return int(float(stripped))
+        except ValueError:
+            return None
+    return None
+
+
+def _extract_tiktok_token_fields(token_data: dict[str, object]) -> dict[str, object]:
+    data_payload = token_data.get("data")
+    data = data_payload if isinstance(data_payload, dict) else {}
+
+    def pick_field(field_name: str) -> object:
+        value = data.get(field_name)
+        if value is not None:
+            return value
+        return token_data.get(field_name)
+
+    return {
+        "access_token": pick_field("access_token"),
+        "refresh_token": pick_field("refresh_token"),
+        "expires_in": pick_field("expires_in"),
+        "refresh_expires_in": pick_field("refresh_expires_in"),
+        "open_id": pick_field("open_id"),
+        "scope": pick_field("scope"),
+        "expires_at": pick_field("expires_at"),
+        "issued_at": pick_field("issued_at"),
+    }
+
+
+def _normalize_tiktok_token_data(
+    token_data: dict[str, object],
+    existing_token_data: dict[str, object] | None = None,
+) -> dict[str, object]:
+    merged_token_data: dict[str, object] = {}
+    if isinstance(existing_token_data, dict):
+        merged_token_data.update(existing_token_data)
+    merged_token_data.update(token_data)
+
+    existing_fields = (
+        _extract_tiktok_token_fields(existing_token_data)
+        if isinstance(existing_token_data, dict)
+        else {}
+    )
+    fields = _extract_tiktok_token_fields(merged_token_data)
+
+    access_token = fields.get("access_token")
+    if not access_token and existing_fields:
+        access_token = existing_fields.get("access_token")
+
+    refresh_token = fields.get("refresh_token")
+    if not refresh_token and existing_fields:
+        refresh_token = existing_fields.get("refresh_token")
+
+    expires_in = _coerce_int(fields.get("expires_in"))
+    if expires_in is None and existing_fields:
+        expires_in = _coerce_int(existing_fields.get("expires_in"))
+
+    refresh_expires_in = _coerce_int(fields.get("refresh_expires_in"))
+    if refresh_expires_in is None and existing_fields:
+        refresh_expires_in = _coerce_int(existing_fields.get("refresh_expires_in"))
+
+    open_id = fields.get("open_id")
+    if open_id is None and existing_fields:
+        open_id = existing_fields.get("open_id")
+
+    scope = fields.get("scope")
+    if scope is None and existing_fields:
+        scope = existing_fields.get("scope")
+
+    now = int(time.time())
+    merged_token_data["issued_at"] = now
+    if access_token:
+        merged_token_data["access_token"] = access_token
+    if refresh_token:
+        merged_token_data["refresh_token"] = refresh_token
+    if expires_in is not None:
+        merged_token_data["expires_in"] = expires_in
+    if refresh_expires_in is not None:
+        merged_token_data["refresh_expires_in"] = refresh_expires_in
+    if open_id is not None:
+        merged_token_data["open_id"] = open_id
+    if scope is not None:
+        merged_token_data["scope"] = scope
+
+    if expires_in is not None and access_token:
+        merged_token_data["expires_at"] = now + expires_in
+
+    data_payload = merged_token_data.get("data")
+    data = dict(data_payload) if isinstance(data_payload, dict) else {}
+    if access_token:
+        data["access_token"] = access_token
+    if refresh_token:
+        data["refresh_token"] = refresh_token
+    if expires_in is not None:
+        data["expires_in"] = expires_in
+    if refresh_expires_in is not None:
+        data["refresh_expires_in"] = refresh_expires_in
+    if open_id is not None:
+        data["open_id"] = open_id
+    if scope is not None:
+        data["scope"] = scope
+    data["issued_at"] = merged_token_data["issued_at"]
+    if "expires_at" in merged_token_data:
+        data["expires_at"] = merged_token_data["expires_at"]
+    merged_token_data["data"] = data
+
+    return merged_token_data
+
+
+def _is_tiktok_access_token_expiring(token_data: dict[str, object], skew_seconds: int) -> bool:
+    fields = _extract_tiktok_token_fields(token_data)
+    expires_at = _coerce_int(fields.get("expires_at"))
+    if expires_at is None:
+        return False
+    return expires_at <= int(time.time()) + skew_seconds
+
+
+def _reconnect_tiktok_exception() -> HTTPException:
+    return HTTPException(
+        status_code=401,
+        detail=TIKTOK_RECONNECT_REQUIRED_MESSAGE,
+    )
+
+
+def _refresh_tiktok_user_access_token(
+    current_token_data: dict[str, object] | None = None,
+) -> dict[str, object]:
+    token_data = current_token_data
+    if token_data is None:
+        token_data = _load_provider_token_data("tiktok", TIKTOK_USER_TOKEN_FILE)
+
+    if token_data is None:
+        raise _reconnect_tiktok_exception()
+
+    fields = _extract_tiktok_token_fields(token_data)
+    refresh_token = fields.get("refresh_token")
+    if not refresh_token:
+        raise _reconnect_tiktok_exception()
+
+    client_key = os.getenv("TIKTOK_CLIENT_KEY")
+    client_secret = os.getenv("TIKTOK_CLIENT_SECRET")
+    if not client_key or not client_secret:
+        raise HTTPException(
+            status_code=500,
+            detail="TikTok OAuth configuration is incomplete.",
+        )
+
+    response = httpx.post(
+        "https://open.tiktokapis.com/v2/oauth/token/",
+        data={
+            "client_key": client_key,
+            "client_secret": client_secret,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        },
+        timeout=15.0,
+    )
+
+    if response.status_code != 200:
+        raise _reconnect_tiktok_exception()
+
+    refreshed_payload = response.json()
+    if not isinstance(refreshed_payload, dict):
+        raise _reconnect_tiktok_exception()
+
+    refreshed_token_data = _normalize_tiktok_token_data(
+        refreshed_payload,
+        existing_token_data=token_data,
+    )
+    refreshed_fields = _extract_tiktok_token_fields(refreshed_token_data)
+    if not refreshed_fields.get("access_token"):
+        raise _reconnect_tiktok_exception()
+
+    _save_provider_token_data("tiktok", TIKTOK_USER_TOKEN_FILE, refreshed_token_data)
+    return refreshed_token_data
+
+
+def _response_contains_access_token_invalid(response: httpx.Response) -> bool:
+    if response.status_code == 401:
+        return True
+
+    response_text = (response.text or "").lower()
+    if "access_token_invalid" in response_text:
+        return True
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+
+    if isinstance(payload, dict):
+        token_error_value = payload.get("error")
+        if isinstance(token_error_value, str) and "access_token_invalid" in token_error_value.lower():
+            return True
+
+        if isinstance(token_error_value, dict):
+            for key in ("code", "message"):
+                value = token_error_value.get(key)
+                if isinstance(value, str) and "access_token_invalid" in value.lower():
+                    return True
+
+        for key in ("code", "message", "error_description"):
+            value = payload.get(key)
+            if isinstance(value, str) and "access_token_invalid" in value.lower():
+                return True
+
+    return False
+
 def get_twitch_user_access_token() -> str:
     token_data = _load_provider_token_data("twitch", TWITCH_USER_TOKEN_FILE)
 
@@ -1071,15 +1294,15 @@ async def upload_tiktok_draft(video_path: str) -> dict:
             detail="TikTok account is not connected.",
         )
 
-    access_token = token_response.get("data", {}).get("access_token")
-    if not access_token:
-        access_token = token_response.get("access_token")
+    token_fields = _extract_tiktok_token_fields(token_response)
+    access_token = token_fields.get("access_token")
+    if not access_token or _is_tiktok_access_token_expiring(token_response, skew_seconds=300):
+        token_response = _refresh_tiktok_user_access_token(token_response)
+        token_fields = _extract_tiktok_token_fields(token_response)
+        access_token = token_fields.get("access_token")
 
     if not access_token:
-        raise HTTPException(
-            status_code=401,
-            detail="TikTok access token is missing.",
-        )
+        raise _reconnect_tiktok_exception()
 
     video_file = Path(video_path)
     if not video_file.is_file():
@@ -1120,13 +1343,42 @@ async def upload_tiktok_draft(video_path: str) -> dict:
             json=init_payload,
         )
 
+        if _response_contains_access_token_invalid(init_response):
+            token_response = _refresh_tiktok_user_access_token(token_response)
+            refreshed_access_token = _extract_tiktok_token_fields(token_response).get("access_token")
+            if not refreshed_access_token:
+                raise _reconnect_tiktok_exception()
+
+            headers["Authorization"] = f"Bearer {refreshed_access_token}"
+            init_response = await client.post(
+                "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
+                headers=headers,
+                json=init_payload,
+            )
+
+            if _response_contains_access_token_invalid(init_response):
+                raise _reconnect_tiktok_exception()
+
         if init_response.status_code != 200:
             raise HTTPException(
                 status_code=502,
-                detail=f"TikTok draft upload initialization failed: {init_response.text}",
+                detail="TikTok draft upload initialization failed.",
             )
 
-        init_result = init_response.json()
+        try:
+            init_result = init_response.json()
+        except ValueError as error:
+            raise HTTPException(
+                status_code=502,
+                detail="TikTok draft upload initialization returned an invalid response.",
+            ) from error
+
+        if not isinstance(init_result, dict):
+            raise HTTPException(
+                status_code=502,
+                detail="TikTok draft upload initialization returned an invalid payload.",
+            )
+
         upload_data = init_result.get("data", {})
         upload_url = upload_data.get("upload_url")
         publish_id = upload_data.get("publish_id")
@@ -1150,7 +1402,7 @@ async def upload_tiktok_draft(video_path: str) -> dict:
     if upload_response.status_code not in {200, 201, 202, 204}:
         raise HTTPException(
             status_code=502,
-            detail=f"TikTok draft video upload failed: {upload_response.text}",
+            detail="TikTok draft video upload failed.",
         )
 
     return {
@@ -2023,7 +2275,7 @@ async def tiktok_callback(code: str, state: str):
     if response.status_code != 200:
         raise HTTPException(
             status_code=502,
-            detail=f"TikTok token exchange failed: {response.text}",
+            detail="TikTok token exchange failed.",
         )
 
     token_data = response.json()
@@ -2033,7 +2285,14 @@ async def tiktok_callback(code: str, state: str):
             detail="TikTok token exchange returned an invalid payload.",
         )
 
-    _save_provider_token_data("tiktok", TIKTOK_USER_TOKEN_FILE, token_data)
+    normalized_token_data = _normalize_tiktok_token_data(token_data)
+    if not _extract_tiktok_token_fields(normalized_token_data).get("access_token"):
+        raise HTTPException(
+            status_code=502,
+            detail="TikTok token exchange returned an access token error.",
+        )
+
+    _save_provider_token_data("tiktok", TIKTOK_USER_TOKEN_FILE, normalized_token_data)
 
     return {
         "success": True,

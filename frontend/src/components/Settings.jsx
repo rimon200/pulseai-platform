@@ -1,5 +1,7 @@
 import { useState } from "react";
 
+const API_BASE_URL = import.meta.env.VITE_API_URL;
+
 function Settings() {
   const [settings, setSettings] = useState({
     autoPublish: false,
@@ -16,6 +18,10 @@ function Settings() {
     }));
 
     setSaved(false);
+  };
+
+  const reconnectTikTok = () => {
+    window.location.assign(`${API_BASE_URL}/api/tiktok/login`);
   };
 
   return (
@@ -70,6 +76,22 @@ function Settings() {
           }}
         >
           Save Settings
+        </button>
+
+        <button
+          onClick={reconnectTikTok}
+          style={{
+            marginLeft: "12px",
+            padding: "10px 18px",
+            border: "1px solid #3d4d7a",
+            borderRadius: "8px",
+            cursor: "pointer",
+            fontWeight: "bold",
+            background: "#243357",
+            color: "#ffffff",
+          }}
+        >
+          Connect / Reconnect TikTok
         </button>
 
         {saved && (

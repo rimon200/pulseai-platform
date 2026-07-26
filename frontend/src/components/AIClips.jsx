@@ -1,6 +1,7 @@
 import { useState } from "react";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL;
+const TIKTOK_RECONNECT_REQUIRED_MESSAGE = "TikTok authorization expired. Reconnect TikTok in Settings.";
 
 const normalizeClipStatus = (status) => {
   const value = String(status || "").trim().toLowerCase();
@@ -140,14 +141,31 @@ const publishClip = async (clip) => {
       }
     );
 
-    const result = await response.json();
+    let result = {};
+    try {
+      result = await response.json();
+    } catch {
+      result = {};
+    }
 
     console.log("Publish request URL:", requestUrl);
     console.log("Publish response status:", response.status);
     console.log("Publish response JSON:", result);
 
     if (!response.ok) {
-      throw new Error(result.detail || "Publish failed");
+      const detailMessage = typeof result.detail === "string"
+        ? result.detail
+        : "Publish failed";
+
+      if (
+        response.status === 401
+        && detailMessage === TIKTOK_RECONNECT_REQUIRED_MESSAGE
+      ) {
+        alert(detailMessage);
+        return;
+      }
+
+      throw new Error(detailMessage);
     }
 
     setClips((currentClips) =>
