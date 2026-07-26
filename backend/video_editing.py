@@ -249,8 +249,8 @@ def _build_filter_chain(
         "fps=24,"
         f"scale={scaled_width}:{scaled_height}:force_original_aspect_ratio=increase,"
         f"crop=w='{crop_w_expr}':h='{crop_h_expr}':"
-        "x='(in_w-w)/2 + ((in_w-w)/8)*sin(t*0.45)':"
-        "y='(in_h-h)/2',"
+        "x='(in_w-out_w)/2 + ((in_w-out_w)/8)*sin(t*0.45)':"
+        "y='(in_h-out_h)/2',"
         f"scale={CANVAS_WIDTH}:{VIDEO_REGION_HEIGHT}"
         "[video_region]",
         f"color=c=white:s={CANVAS_WIDTH}x{CANVAS_HEIGHT}[base]",
