@@ -666,6 +666,121 @@ def _contains_clip_with_same_identifier(
     return False
 
 
+def _derive_emphasis_moments(
+    transcript_segments: list[dict[str, object]],
+    duration_seconds: float,
+) -> list[dict[str, float]]:
+    safe_duration = max(0.0, float(duration_seconds or 0.0))
+    opening_end = 2.0
+    if safe_duration > 0.0:
+        opening_end = min(2.2, max(1.5, safe_duration * 0.08))
+
+    moments: list[dict[str, float]] = [
+        {
+            "start": 0.0,
+            "end": opening_end,
+            "zoom": 1.10,
+        }
+    ]
+
+    if not isinstance(transcript_segments, list) or not transcript_segments:
+        if safe_duration > 10.0:
+            midpoint_start = max(2.5, (safe_duration * 0.5) - 0.8)
+            moments.append(
+                {
+                    "start": midpoint_start,
+                    "end": min(midpoint_start + 1.4, safe_duration),
+                    "zoom": 1.06,
+                }
+            )
+        return moments
+
+    emphasis_keywords = {
+        "wow",
+        "no way",
+        "what",
+        "wait",
+        "clutch",
+        "insane",
+        "crazy",
+        "scream",
+        "screamed",
+        "laugh",
+        "lmao",
+        "lol",
+        "omg",
+        "bro",
+        "lets go",
+        "let's go",
+        "1v",
+        "ace",
+    }
+
+    scored_candidates: list[tuple[float, float]] = []
+    for segment in transcript_segments[:80]:
+        if not isinstance(segment, dict):
+            continue
+
+        text = str(segment.get("text", "") or "").strip()
+        if not text:
+            continue
+
+        try:
+            start = float(segment.get("start", 0.0) or 0.0)
+            end = float(segment.get("end", start) or start)
+        except (TypeError, ValueError):
+            continue
+
+        segment_duration = max(0.6, end - start)
+        segment_center = start + (segment_duration * 0.45)
+
+        lowered_text = text.lower()
+        score = 0.0
+        for keyword in emphasis_keywords:
+            if keyword in lowered_text:
+                score += 1.0
+        if "!" in text:
+            score += 0.6
+        if text.isupper() and len(text) > 5:
+            score += 0.6
+        if len(text.split()) <= 4:
+            score += 0.2
+
+        if score <= 0:
+            continue
+        scored_candidates.append((score, max(0.0, segment_center)))
+
+    scored_candidates.sort(key=lambda item: item[0], reverse=True)
+
+    chosen_centers: list[float] = []
+    for score, center in scored_candidates:
+        if len(chosen_centers) >= 3:
+            break
+        if center < opening_end + 0.6:
+            continue
+        if any(abs(center - existing) < 2.5 for existing in chosen_centers):
+            continue
+        chosen_centers.append(center)
+
+    chosen_centers.sort()
+    for center in chosen_centers:
+        start = max(opening_end + 0.3, center - 0.7)
+        end = start + 1.4
+        if safe_duration > 0.0:
+            if start >= safe_duration:
+                continue
+            end = min(end, safe_duration)
+        moments.append(
+            {
+                "start": start,
+                "end": end,
+                "zoom": 1.06,
+            }
+        )
+
+    return moments[:4]
+
+
 def verify_twitch_credentials() -> None:
     if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
         raise HTTPException(
@@ -2088,13 +2203,26 @@ async def _run_auto_generate_clip_pipeline():
             "best_score": best_clip["score"],
         }
 
-    best_clip["ai_title"] = generate_ai_title(best_clip["transcript"])
+    title_context = {
+        "visual_score": best_clip.get("visual_score", 0),
+        "transcript_score": best_clip.get("transcript_score", 0),
+        "context_score": best_clip.get("context_score", 0),
+        "score_hook": best_clip.get("score_hook", ""),
+        "score_reason": best_clip.get("score_reason", ""),
+        "stream_title": best_clip.get("title", ""),
+        "game": best_clip.get("game", ""),
+    }
+    best_clip["ai_title"] = generate_ai_title(best_clip["transcript"], context=title_context)
     best_clip["ai_description"] = generate_ai_description(best_clip["transcript"])
     best_clip["raw_video_path"] = best_clip.get("video_path")
 
     try:
         title_for_overlay = best_clip.get("ai_title") or best_clip.get("title", "")
         caption_segments = best_clip.get("segments", [])
+        emphasis_moments = _derive_emphasis_moments(
+            transcript_segments=caption_segments,
+            duration_seconds=float(best_clip.get("duration", 0) or 0),
+        )
         best_candidate_number = int(best_clip.get("candidate_number", 0) or 0)
         total_candidates = len(candidates)
 
@@ -2110,6 +2238,7 @@ async def _run_auto_generate_clip_pipeline():
                 best_clip["raw_video_path"],
                 title_for_overlay,
                 caption_segments,
+                emphasis_moments=emphasis_moments,
             )
             _log_performance_timing(
                 stage="ffmpeg_editing",

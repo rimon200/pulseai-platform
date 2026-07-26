@@ -8,6 +8,7 @@ import json
 import os
 import re
 import tempfile
+import textwrap
 from typing import Optional
 
 load_dotenv()
@@ -15,6 +16,118 @@ AUTO_CLIP_MIN_SCORE = int(os.getenv("AUTO_CLIP_MIN_SCORE", "45"))
 
 client = OpenAI()
 _WHISPER_MODEL: Optional[object] = None
+_TITLE_EMOJI_PATTERN = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]")
+_TITLE_BANNED_PHRASES = {
+    "this got crazy",
+    "out of pocket chaos",
+    "you won't believe this",
+    "you won’t believe this",
+    "this moment went viral",
+    "yesterday's clip",
+    "yesterday’s clip",
+}
+_TITLE_MAX_BODY_CHARS = 70
+_TITLE_MAX_LINE_WIDTH = 30
+_TITLE_MAX_LINES = 2
+_TITLE_ALLOWED_EMOJIS = ["😂", "😭", "💀", "😱", "😳", "🔥"]
+
+
+def _collapse_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def _remove_quotes(value: str) -> str:
+    return (
+        value.replace('"', "")
+        .replace("'", "")
+        .replace("“", "")
+        .replace("”", "")
+        .replace("‘", "")
+        .replace("’", "")
+    )
+
+
+def _strip_emojis(value: str) -> str:
+    return _TITLE_EMOJI_PATTERN.sub("", value or "")
+
+
+def _pick_relevant_emoji(source_text: str) -> str:
+    text = (source_text or "").lower()
+    if any(word in text for word in ("laugh", "lol", "lmao", "funny", "joke")):
+        return "😂"
+    if any(word in text for word in ("cry", "sad", "regret", "sorry", "pain")):
+        return "😭"
+    if any(word in text for word in ("dead", "clipped", "obliterated", "destroyed", "cooked")):
+        return "💀"
+    if any(word in text for word in ("what", "no way", "wtf", "insane", "shock", "unexpected")):
+        return "😱"
+    if any(word in text for word in ("clutch", "win", "comeback", "ace", "crazy")):
+        return "🔥"
+    return "😳"
+
+
+def _limit_title_lines(title_body: str) -> str:
+    wrapped = textwrap.wrap(
+        title_body,
+        width=_TITLE_MAX_LINE_WIDTH,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    if len(wrapped) <= _TITLE_MAX_LINES:
+        return " ".join(wrapped)
+
+    kept = wrapped[:_TITLE_MAX_LINES]
+    merged = " ".join(kept)
+    if len(merged) > _TITLE_MAX_BODY_CHARS:
+        merged = merged[:_TITLE_MAX_BODY_CHARS].rstrip()
+    return merged
+
+
+def _build_transcript_fallback_title(transcript: str) -> str:
+    cleaned = _collapse_whitespace(_strip_emojis(_remove_quotes(transcript)))
+    cleaned = re.sub(r"#[^\s]+", "", cleaned)
+    words = cleaned.split()
+    if not words:
+        return "Unexpected Moment Caught On Stream 😳"
+
+    snippet_words = words[:8]
+    snippet = " ".join(snippet_words)
+    snippet = snippet[0].upper() + snippet[1:] if snippet else ""
+    snippet = snippet.rstrip(".,;:!?")
+    if not snippet:
+        return "Unexpected Moment Caught On Stream 😳"
+    if len(snippet) > _TITLE_MAX_BODY_CHARS:
+        snippet = snippet[:_TITLE_MAX_BODY_CHARS].rstrip()
+    snippet = _limit_title_lines(snippet)
+    return f"{snippet} {_pick_relevant_emoji(transcript)}"
+
+
+def _sanitize_generated_title(raw_title: str, transcript: str) -> str:
+    candidate = _collapse_whitespace(raw_title)
+    candidate = _remove_quotes(candidate)
+    candidate = re.sub(r"#[^\s]+", "", candidate)
+    candidate = _collapse_whitespace(candidate)
+
+    if not candidate:
+        return _build_transcript_fallback_title(transcript)
+
+    lower_candidate = candidate.lower()
+    if any(phrase in lower_candidate for phrase in _TITLE_BANNED_PHRASES):
+        return _build_transcript_fallback_title(transcript)
+
+    body = _strip_emojis(candidate)
+    body = _collapse_whitespace(body)
+    if len(body) > _TITLE_MAX_BODY_CHARS:
+        body = body[:_TITLE_MAX_BODY_CHARS].rstrip()
+    body = _limit_title_lines(body)
+    body = body.rstrip(".,;:!? ")
+
+    if len(body) < 12:
+        return _build_transcript_fallback_title(transcript)
+
+    emoji_source = f"{raw_title} {transcript}"
+    trailing_emoji = _pick_relevant_emoji(emoji_source)
+    return f"{body} {trailing_emoji}"
 
 
 def _get_whisper_model() -> object:
@@ -61,23 +174,46 @@ def _transcribe_video_data(video_path: str) -> tuple[str, list[dict[str, object]
     return transcript, transcript_segments
 
 
-def generate_ai_title(transcript: str) -> str:
-        if not transcript.strip():
-             return ""
+def generate_ai_title(
+    transcript: str,
+    context: Optional[dict[str, object]] = None,
+) -> str:
+    if not transcript.strip():
+        return _build_transcript_fallback_title(transcript)
 
-        response = client.responses.create(
-            model="gpt-5-nano",
-            input=f"""
-    Create ONE short, catchy, viral title for this gaming clip.
+    context = context or {}
+    context_lines = [
+        f"visual_score: {context.get('visual_score', '')}",
+        f"transcript_score: {context.get('transcript_score', '')}",
+        f"context_score: {context.get('context_score', '')}",
+        f"score_hook: {context.get('score_hook', '')}",
+        f"score_reason: {context.get('score_reason', '')}",
+        f"stream_title: {context.get('stream_title', '')}",
+        f"game: {context.get('game', '')}",
+    ]
+    context_text = "\n".join(context_lines)
 
-    Transcript:
-{transcript}
-
-Return only the title.
-"""
+    response = client.responses.create(
+        model="gpt-5-nano",
+        input=(
+            "Create exactly one curiosity-driven title for this short-form gaming clip.\n"
+            "Rules:\n"
+            "- Truthful to the clip and transcript\n"
+            "- Concrete language, not generic hype\n"
+            "- 5 to 10 words preferred\n"
+            "- No hashtags\n"
+            "- No creator name unless absolutely necessary\n"
+            "- End with exactly one relevant emoji\n"
+            "- Avoid these exact phrases: This got crazy; Out of pocket chaos; You won't believe this; This moment went viral; Yesterday's clip\n"
+            "Return only the title and nothing else.\n\n"
+            "Clip transcript:\n"
+            f"{transcript}\n\n"
+            "Visual and scoring context:\n"
+            f"{context_text}"
+        ),
     )
 
-        return response.output_text.strip()
+    return _sanitize_generated_title(response.output_text.strip(), transcript)
 
 def generate_ai_description(transcript: str) -> str:
     if not transcript.strip():
