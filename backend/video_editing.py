@@ -1,11 +1,14 @@
 from functools import lru_cache
 from pathlib import Path
+import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
 from typing import Dict, List, Optional
 
 
@@ -193,6 +196,72 @@ def _build_zoom_expression(emphasis_moments: List[Dict[str, float]]) -> str:
     return expression
 
 
+def _fraction_to_float(value: str) -> float:
+    text = (value or "").strip()
+    if not text or text == "0/0":
+        return 0.0
+    if "/" in text:
+        numerator, denominator = text.split("/", 1)
+        try:
+            denominator_value = float(denominator)
+            if denominator_value == 0:
+                return 0.0
+            return float(numerator) / denominator_value
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _probe_media_metadata(ffprobe_path: str, media_path: Path) -> dict[str, object]:
+    command = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,avg_frame_rate,r_frame_rate",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(media_path),
+    ]
+
+    result = subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    payload = json.loads(result.stdout)
+    streams = payload.get("streams") or []
+    format_data = payload.get("format") or {}
+    stream = streams[0] if streams else {}
+
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    avg_frame_rate = _fraction_to_float(str(stream.get("avg_frame_rate") or "0"))
+    r_frame_rate = _fraction_to_float(str(stream.get("r_frame_rate") or "0"))
+    duration = _fraction_to_float(str(format_data.get("duration") or "0"))
+
+    return {
+        "width": width,
+        "height": height,
+        "avg_frame_rate": avg_frame_rate,
+        "r_frame_rate": r_frame_rate,
+        "duration": duration,
+    }
+
+
+def _format_ffmpeg_command(command: List[str]) -> str:
+    return shlex.join(command)
+
+
 @lru_cache(maxsize=1)
 def _ensure_subtitles_filter_available(ffmpeg_path: str) -> None:
     try:
@@ -333,13 +402,23 @@ def create_tiktok_edited_video(
     emphasis_moments: Optional[List[Dict[str, object]]] = None,
 ) -> str:
     ffmpeg_path = shutil.which("ffmpeg")
+    ffprobe_path = shutil.which("ffprobe")
     if not ffmpeg_path:
         raise RuntimeError("ffmpeg is not installed or not available in PATH.")
+    if not ffprobe_path:
+        raise RuntimeError("ffprobe is not installed or not available in PATH.")
     _ensure_subtitles_filter_available(ffmpeg_path)
 
     raw_path = Path(raw_video_path)
     if not raw_path.is_file():
         raise RuntimeError(f"Raw video file not found: {raw_video_path}")
+
+    input_metadata = _probe_media_metadata(ffprobe_path, raw_path)
+    input_duration_seconds = float(input_metadata["duration"] or 0.0)
+    input_width = int(input_metadata["width"] or 0)
+    input_height = int(input_metadata["height"] or 0)
+    input_fps = float(input_metadata["avg_frame_rate"] or input_metadata["r_frame_rate"] or 0.0)
+    input_was_already_24_fps = abs(input_fps - 24.0) < 0.01
 
     if output_path:
         edited_path = Path(output_path)
@@ -400,6 +479,17 @@ def create_tiktok_edited_video(
             str(edited_path),
         ]
 
+        print(
+            "FFMPEG EDIT START | "
+            f"input_duration_seconds={input_duration_seconds:.3f} | "
+            f"input_resolution={input_width}x{input_height} | "
+            f"input_fps={input_fps:.3f} | "
+            f"input_was_already_24_fps={input_was_already_24_fps} | "
+            f"ffmpeg_command={_format_ffmpeg_command(command)}"
+        )
+
+        ffmpeg_started_at = time.perf_counter()
+
         try:
             subprocess.run(
                 command,
@@ -411,6 +501,33 @@ def create_tiktok_edited_video(
         except subprocess.CalledProcessError as error:
             stderr = (error.stderr or "").strip()
             raise RuntimeError(f"ffmpeg editing failed: {stderr}") from error
+
+        ffmpeg_elapsed_seconds = time.perf_counter() - ffmpeg_started_at
+
+        output_metadata = _probe_media_metadata(ffprobe_path, edited_path)
+        output_duration_seconds = float(output_metadata["duration"] or 0.0)
+        output_width = int(output_metadata["width"] or 0)
+        output_height = int(output_metadata["height"] or 0)
+        output_fps = float(output_metadata["avg_frame_rate"] or output_metadata["r_frame_rate"] or 0.0)
+        render_ratio = (
+            ffmpeg_elapsed_seconds / input_duration_seconds
+            if input_duration_seconds > 0
+            else 0.0
+        )
+
+        print(
+            "FFMPEG EDIT METRICS | "
+            f"input_duration_seconds={input_duration_seconds:.3f} | "
+            f"output_duration_seconds={output_duration_seconds:.3f} | "
+            f"ffmpeg_elapsed_seconds={ffmpeg_elapsed_seconds:.3f} | "
+            f"render_ratio={render_ratio:.3f} | "
+            f"input_resolution={input_width}x{input_height} | "
+            f"input_fps={input_fps:.3f} | "
+            f"output_resolution={output_width}x{output_height} | "
+            f"output_fps={output_fps:.3f} | "
+            f"input_was_already_24_fps={input_was_already_24_fps} | "
+            f"frame_rate_conversion_required={not input_was_already_24_fps}"
+        )
 
         if not edited_path.is_file() or edited_path.stat().st_size == 0:
             raise RuntimeError(f"Edited video was not created: {edited_path}")
