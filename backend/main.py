@@ -106,7 +106,8 @@ def _transcribe_video_with_segments_subprocess(video_path: str) -> dict[str, obj
     ]
 
     try:
-        subprocess.run(
+        worker_started_at = time.perf_counter()
+        completed = subprocess.run(
             command,
             check=True,
             timeout=180,
@@ -114,6 +115,14 @@ def _transcribe_video_with_segments_subprocess(video_path: str) -> dict[str, obj
             stderr=subprocess.PIPE,
             text=True,
         )
+        _log_performance_timing(
+            stage="whisper_worker_total",
+            elapsed_seconds=time.perf_counter() - worker_started_at,
+        )
+        if completed.stderr:
+            worker_output = completed.stderr.strip()
+            if worker_output:
+                print(worker_output)
         if not os.path.exists(output_json_path):
             raise RuntimeError("Transcription worker did not create an output JSON file.")
 
@@ -2199,8 +2208,18 @@ async def _run_auto_generate_clip_pipeline():
         "stream_title": best_clip.get("title", ""),
         "game": best_clip.get("game", ""),
     }
+    title_generation_started_at = time.perf_counter()
     best_clip["ai_title"] = generate_ai_title(best_clip["transcript"], context=title_context)
+    _log_performance_timing(
+        stage="title_generation",
+        elapsed_seconds=time.perf_counter() - title_generation_started_at,
+    )
+    description_generation_started_at = time.perf_counter()
     best_clip["ai_description"] = generate_ai_description(best_clip["transcript"])
+    _log_performance_timing(
+        stage="description_generation",
+        elapsed_seconds=time.perf_counter() - description_generation_started_at,
+    )
     best_clip["raw_video_path"] = best_clip.get("video_path")
 
     try:

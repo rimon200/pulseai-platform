@@ -1,4 +1,6 @@
 import argparse
+import sys
+import time
 from dotenv import load_dotenv
 from openai import OpenAI
 import base64
@@ -30,6 +32,15 @@ _TITLE_MAX_BODY_CHARS = 70
 _TITLE_MAX_LINE_WIDTH = 30
 _TITLE_MAX_LINES = 2
 _TITLE_ALLOWED_EMOJIS = ["😂", "😭", "💀", "😱", "😳", "🔥"]
+
+
+def _log_timing(stage: str, elapsed_seconds: float) -> None:
+    print(
+        "PERFORMANCE TIMING | "
+        f"stage={stage} | "
+        f"elapsed_seconds={elapsed_seconds:.3f}",
+        file=sys.stderr,
+    )
 
 
 def _collapse_whitespace(value: str) -> str:
@@ -135,7 +146,12 @@ def _get_whisper_model() -> object:
     if _WHISPER_MODEL is None:
         from faster_whisper import WhisperModel
 
+        startup_started_at = time.perf_counter()
         _WHISPER_MODEL = WhisperModel("tiny", device="cpu", compute_type="int8")
+        _log_timing(
+            stage="whisper_startup",
+            elapsed_seconds=time.perf_counter() - startup_started_at,
+        )
     return _WHISPER_MODEL
 
 
@@ -147,6 +163,7 @@ def release_whisper_model() -> None:
 
 def _transcribe_video_data(video_path: str) -> tuple[str, list[dict[str, object]]]:
     model = _get_whisper_model()
+    transcription_started_at = time.perf_counter()
     segments, _ = model.transcribe(video_path, language="en")
 
     transcript_parts = []
@@ -171,6 +188,10 @@ def _transcribe_video_data(video_path: str) -> tuple[str, list[dict[str, object]
         )
 
     transcript = " ".join(transcript_parts)
+    _log_timing(
+        stage="audio_extraction_and_transcription",
+        elapsed_seconds=time.perf_counter() - transcription_started_at,
+    )
     return transcript, transcript_segments
 
 

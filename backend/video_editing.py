@@ -1,3 +1,4 @@
+from functools import lru_cache
 from pathlib import Path
 import os
 import re
@@ -89,16 +90,21 @@ def _remove_all_emojis(value: str) -> str:
     return TITLE_EMOJI_PATTERN.sub("", value or "")
 
 
-def _build_ass_subtitles_content(transcript_segments: List[Dict[str, object]]) -> str:
+def _build_overlay_ass_content(
+    title_text: str,
+    title_font_size: int,
+    transcript_segments: List[Dict[str, object]],
+) -> str:
     header = [
         "[Script Info]",
         "ScriptType: v4.00+",
-        "PlayResX: 720",
-        "PlayResY: 1280",
+        f"PlayResX: {CANVAS_WIDTH}",
+        f"PlayResY: {CANVAS_HEIGHT}",
         "ScaledBorderAndShadow: yes",
         "",
         "[V4+ Styles]",
         "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
+        f"Style: TopTitle,Arial,{title_font_size},&H00000000,&H00000000,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,0,0,8,{TITLE_HORIZONTAL_PADDING},{TITLE_HORIZONTAL_PADDING},84,1",
         "Style: Caption,Arial,40,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,1,0,0,0,100,100,0,0,3,2.8,0,2,52,52,210,1",
         "",
         "[Events]",
@@ -106,6 +112,15 @@ def _build_ass_subtitles_content(transcript_segments: List[Dict[str, object]]) -
     ]
 
     events = []
+
+    cleaned_title = _escape_ass_text(title_text)
+    if cleaned_title:
+        events.append(
+            "Dialogue: "
+            "0,0:00:00.00,9:59:59.00,TopTitle,,0,0,0,,"
+            f"{{\\q2}}{cleaned_title}"
+        )
+
     for segment in transcript_segments[:120]:
         text = str(segment.get("text", "")).strip()
         if not text:
@@ -131,34 +146,6 @@ def _build_ass_subtitles_content(transcript_segments: List[Dict[str, object]]) -
         )
 
     return "\n".join(header + events) + "\n"
-
-
-def _build_title_ass_content(title_text: str, title_font_size: int) -> str:
-    header = [
-        "[Script Info]",
-        "ScriptType: v4.00+",
-        f"PlayResX: {CANVAS_WIDTH}",
-        f"PlayResY: {CANVAS_HEIGHT}",
-        "ScaledBorderAndShadow: yes",
-        "",
-        "[V4+ Styles]",
-        "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
-        f"Style: TopTitle,Arial,{title_font_size},&H00000000,&H00000000,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,0,0,8,{TITLE_HORIZONTAL_PADDING},{TITLE_HORIZONTAL_PADDING},84,1",
-        "",
-        "[Events]",
-        "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
-    ]
-
-    cleaned_title = _escape_ass_text(title_text)
-    if cleaned_title:
-        event = (
-            "Dialogue: "
-            "0,0:00:00.00,9:59:59.00,TopTitle,,0,0,0,,"
-            f"{{\\q2}}{cleaned_title}"
-        )
-        return "\n".join(header + [event]) + "\n"
-
-    return "\n".join(header) + "\n"
 
 
 def _normalize_emphasis_moments(
@@ -206,6 +193,7 @@ def _build_zoom_expression(emphasis_moments: List[Dict[str, float]]) -> str:
     return expression
 
 
+@lru_cache(maxsize=1)
 def _ensure_subtitles_filter_available(ffmpeg_path: str) -> None:
     try:
         result = subprocess.run(
@@ -230,9 +218,7 @@ def _ensure_subtitles_filter_available(ffmpeg_path: str) -> None:
 
 
 def _build_filter_chain(
-    title_ass_file_path: Path,
-    subtitle_file_path: Path,
-    title_font_size: int,
+    overlay_ass_file_path: Path,
     emphasis_moments: Optional[List[Dict[str, object]]] = None,
 ) -> str:
     normalized_moments = _normalize_emphasis_moments(emphasis_moments)
@@ -257,11 +243,8 @@ def _build_filter_chain(
         f"[base][video_region]overlay=x=0:y={VIDEO_REGION_TOP}:shortest=1:eof_action=endall[composed]",
     ]
 
-    safe_title_ass_file = _escape_filter_path(title_ass_file_path)
-    filters.append(f"[composed]subtitles=filename='{safe_title_ass_file}'[titled]")
-
-    safe_subtitle_file = _escape_filter_path(subtitle_file_path)
-    filters.append(f"[titled]subtitles=filename='{safe_subtitle_file}'")
+    safe_overlay_ass_file = _escape_filter_path(overlay_ass_file_path)
+    filters.append(f"[composed]subtitles=filename='{safe_overlay_ass_file}'")
 
     return ";".join(filters)
 
@@ -365,38 +348,29 @@ def create_tiktok_edited_video(
         edited_dir.mkdir(parents=True, exist_ok=True)
         edited_path = edited_dir / f"{raw_path.stem}_tiktok.mp4"
 
-    title_temp_path = None
-    subtitle_temp_path = None
+    overlay_temp_path = None
 
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
             suffix=".ass",
-            prefix="title_overlay_",
+            prefix="overlay_",
             dir=str(edited_path.parent),
             delete=False,
-        ) as title_temp:
-            prepared_title, title_font_size, title_line_spacing = _prepare_title_text(title)
-            title_temp.write(_build_title_ass_content(prepared_title, title_font_size))
-            title_temp_path = Path(title_temp.name)
-
-        subtitles_content = _build_ass_subtitles_content(transcript_segments)
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            suffix=".ass",
-            prefix="captions_",
-            dir=str(edited_path.parent),
-            delete=False,
-        ) as subtitle_temp:
-            subtitle_temp.write(subtitles_content)
-            subtitle_temp_path = Path(subtitle_temp.name)
+        ) as overlay_temp:
+            prepared_title, title_font_size, _ = _prepare_title_text(title)
+            overlay_temp.write(
+                _build_overlay_ass_content(
+                    prepared_title,
+                    title_font_size,
+                    transcript_segments,
+                )
+            )
+            overlay_temp_path = Path(overlay_temp.name)
 
         filter_chain = _build_filter_chain(
-            title_ass_file_path=title_temp_path,
-            subtitle_file_path=subtitle_temp_path,
-            title_font_size=title_font_size,
+            overlay_ass_file_path=overlay_temp_path,
             emphasis_moments=emphasis_moments,
         )
 
@@ -409,8 +383,6 @@ def create_tiktok_edited_video(
             str(raw_path),
             "-vf",
             filter_chain,
-            "-r",
-            "24",
             "-c:v",
             "libx264",
             "-preset",
@@ -445,9 +417,8 @@ def create_tiktok_edited_video(
 
         return str(edited_path)
     finally:
-        for temporary_path in (title_temp_path, subtitle_temp_path):
-            if temporary_path and temporary_path.exists():
-                try:
-                    os.remove(temporary_path)
-                except OSError:
-                    pass
+        if overlay_temp_path and overlay_temp_path.exists():
+            try:
+                os.remove(overlay_temp_path)
+            except OSError:
+                pass
