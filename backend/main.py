@@ -1,11 +1,13 @@
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 import uuid
@@ -89,6 +91,165 @@ def _log_performance_timing(
     )
 
 
+def _get_full_evaluation_count() -> int:
+    raw_value = os.getenv("AUTO_CLIP_FULL_EVALUATION_COUNT", "2")
+    try:
+        configured_count = int(raw_value)
+    except (TypeError, ValueError):
+        configured_count = 2
+    return max(1, min(configured_count, AUTO_CLIP_CANDIDATE_COUNT))
+
+
+def _parse_twitch_created_at(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _nonnegative_int(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fast_prerank_candidates(
+    twitch_clips: list[dict[str, Any]],
+    existing_clip_ids: set[str],
+    existing_clip_urls: set[str],
+) -> tuple[list[dict[str, object]], bool]:
+    now = datetime.now(timezone.utc)
+    maximum_log_views = max(
+        (
+            math.log1p(_nonnegative_int(clip.get("view_count")))
+            for clip in twitch_clips
+        ),
+        default=0.0,
+    )
+    title_token_counts: dict[str, int] = {}
+    candidate_title_tokens: list[set[str]] = []
+    for twitch_clip in twitch_clips:
+        title_tokens = {
+            token
+            for token in re.findall(
+                r"[a-z0-9']+",
+                str(twitch_clip.get("title") or "").lower(),
+            )
+            if len(token) >= 4
+        }
+        candidate_title_tokens.append(title_tokens)
+        for token in title_tokens:
+            title_token_counts[token] = title_token_counts.get(token, 0) + 1
+
+    ranked: list[dict[str, object]] = []
+    sufficient_metadata = True
+    signal_words = {
+        "clutch",
+        "crazy",
+        "fail",
+        "funny",
+        "insane",
+        "reaction",
+        "rage",
+        "record",
+        "surprise",
+        "unexpected",
+        "win",
+    }
+
+    for candidate_index, twitch_clip in enumerate(twitch_clips, start=1):
+        clip_id = str(twitch_clip.get("id") or "").strip()
+        public_url = str(
+            twitch_clip.get("url") or f"https://clips.twitch.tv/{clip_id}"
+        ).strip()
+        title = str(twitch_clip.get("title") or "").strip()
+        created_at = _parse_twitch_created_at(twitch_clip.get("created_at"))
+        view_count = _nonnegative_int(twitch_clip.get("view_count"))
+        try:
+            duration = max(0.0, float(twitch_clip.get("duration") or 0.0))
+        except (TypeError, ValueError):
+            duration = 0.0
+
+        available_signals = sum(
+            (
+                "view_count" in twitch_clip,
+                created_at is not None,
+                duration > 0,
+                bool(title),
+                bool(twitch_clip.get("creator_name") or twitch_clip.get("game_id")),
+            )
+        )
+        if available_signals < 3:
+            sufficient_metadata = False
+
+        view_score = (
+            35.0 * math.log1p(view_count) / maximum_log_views
+            if maximum_log_views > 0
+            else 0.0
+        )
+        age_hours = (
+            max(0.0, (now - created_at).total_seconds() / 3600.0)
+            if created_at is not None
+            else 168.0
+        )
+        freshness_score = 25.0 * max(0.0, 1.0 - (age_hours / 168.0))
+
+        if 15.0 <= duration <= 45.0:
+            duration_score = 20.0
+        elif 5.0 <= duration < 15.0:
+            duration_score = 20.0 * ((duration - 5.0) / 10.0)
+        elif 45.0 < duration <= 60.0:
+            duration_score = 20.0 * ((60.0 - duration) / 15.0)
+        else:
+            duration_score = 0.0
+
+        title_tokens = candidate_title_tokens[candidate_index - 1]
+        signal_word_score = min(9.0, 3.0 * len(title_tokens & signal_words))
+        unique_token_count = sum(
+            1 for token in title_tokens if title_token_counts.get(token) == 1
+        )
+        title_score = signal_word_score + min(6.0, 2.0 * unique_token_count)
+        metadata_score = min(5.0, float(available_signals))
+        already_processed = clip_id in existing_clip_ids or public_url in existing_clip_urls
+        total_score = (
+            view_score
+            + freshness_score
+            + duration_score
+            + title_score
+            + metadata_score
+        )
+        ranked.append(
+            {
+                "candidate_index": candidate_index,
+                "score": total_score,
+                "title_score": title_score,
+                "reasons": (
+                    f"views={view_score:.2f}/35(view_count={view_count}); "
+                    f"freshness={freshness_score:.2f}/25(age_hours={age_hours:.1f}); "
+                    f"duration={duration_score:.2f}/20(seconds={duration:.1f}); "
+                    f"title={title_score:.2f}/15("
+                    f"signal_words={len(title_tokens & signal_words)},"
+                    f"unique_tokens={unique_token_count}); "
+                    f"metadata={metadata_score:.2f}/5; "
+                    f"already_processed={str(already_processed).lower()}"
+                ),
+            }
+        )
+
+    ranked.sort(
+        key=lambda item: (
+            float(item["score"]),
+            -int(item["candidate_index"]),
+        ),
+        reverse=True,
+    )
+    return ranked, sufficient_metadata
+
+
 def _transcribe_video_with_segments_subprocess(video_path: str) -> dict[str, object]:
     file_descriptor, output_json_path = tempfile.mkstemp(suffix=".json")
     os.close(file_descriptor)
@@ -169,6 +330,259 @@ def _transcribe_video_with_segments_subprocess(video_path: str) -> dict[str, obj
     finally:
         if os.path.exists(output_json_path):
             os.remove(output_json_path)
+
+
+def _cleanup_candidate_video(
+    video_path: object,
+    candidate_number: int,
+    persisted_clips: list[dict[str, object]],
+) -> None:
+    path_text = str(video_path or "").strip()
+    if not path_text:
+        print(
+            "CANDIDATE VIDEO CLEANUP REJECTED | "
+            f"candidate={candidate_number} | reason=empty_path"
+        )
+        return
+
+    downloads_root = (BASE_DIR / "downloads").resolve()
+    candidate_path = Path(path_text)
+    try:
+        if candidate_path.is_symlink():
+            print(
+                "CANDIDATE VIDEO CLEANUP REJECTED | "
+                f"candidate={candidate_number} | "
+                f"path={candidate_path} | reason=symlink"
+            )
+            return
+
+        resolved_candidate = candidate_path.resolve(strict=False)
+        if (
+            resolved_candidate.parent != downloads_root
+            or resolved_candidate == downloads_root
+        ):
+            print(
+                "CANDIDATE VIDEO CLEANUP REJECTED | "
+                f"candidate={candidate_number} | "
+                f"path={resolved_candidate} | reason=outside_or_nested"
+            )
+            return
+        if not resolved_candidate.is_file():
+            print(
+                "CANDIDATE VIDEO CLEANUP REJECTED | "
+                f"candidate={candidate_number} | "
+                f"path={resolved_candidate} | reason=not_a_file"
+            )
+            return
+
+        protected_paths: set[Path] = set()
+        for persisted_clip in persisted_clips:
+            for key in ("raw_video_path", "video_path"):
+                persisted_path_text = str(persisted_clip.get(key) or "").strip()
+                if persisted_path_text:
+                    protected_paths.add(Path(persisted_path_text).resolve(strict=False))
+        if resolved_candidate in protected_paths:
+            print(
+                "CANDIDATE VIDEO CLEANUP REJECTED | "
+                f"candidate={candidate_number} | "
+                f"path={resolved_candidate} | reason=persisted_media"
+            )
+            return
+
+        resolved_candidate.unlink()
+        print(
+            "CANDIDATE VIDEO CLEANUP | "
+            f"candidate={candidate_number} | path={resolved_candidate}"
+        )
+    except Exception as error:
+        print(
+            "CANDIDATE VIDEO CLEANUP FAILED | "
+            f"candidate={candidate_number} | "
+            f"path={candidate_path} | error={error!r}"
+        )
+
+
+def _fully_evaluate_candidate(
+    twitch_clip: dict[str, Any],
+    candidate_number: int,
+    total_candidates: int,
+    creator: dict[str, Any],
+    stream: dict[str, Any],
+    stream_title: str,
+    viewer_count: int,
+    persisted_clips: list[dict[str, object]],
+) -> dict[str, object]:
+    candidate_started_at = time.perf_counter()
+    video_path = ""
+    failure_stage = "candidate_construction"
+
+    try:
+        twitch_clip_id = str(twitch_clip.get("id", "")).strip()
+        public_url = str(
+            twitch_clip.get("url")
+            or f"https://clips.twitch.tv/{twitch_clip_id}"
+        )
+        clip: dict[str, object] = {
+            "title": stream_title,
+            "creator": creator["name"],
+            "status": "Ready to review",
+            "viewer_count": viewer_count,
+            "game": stream.get("game_name"),
+            "started_at": stream.get("started_at"),
+            "thumbnail_url": stream.get("thumbnail_url"),
+            "twitch_clip_id": twitch_clip_id,
+            "twitch_edit_url": twitch_clip.get("edit_url"),
+            "public_url": public_url,
+            "candidate_number": candidate_number,
+        }
+
+        failure_stage = "download"
+        _log_memory_check(
+            stage="before_ytdlp_download",
+            candidate_number=candidate_number,
+            total_candidates=total_candidates,
+        )
+        download_started_at = time.perf_counter()
+        video_path = download_twitch_clip(public_url, twitch_clip_id)
+        _log_performance_timing(
+            stage="ytdlp_download",
+            candidate_number=candidate_number,
+            total_candidates=total_candidates,
+            elapsed_seconds=time.perf_counter() - download_started_at,
+        )
+        _log_memory_check(
+            stage="after_ytdlp_download",
+            candidate_number=candidate_number,
+            total_candidates=total_candidates,
+        )
+        if not video_path:
+            return {
+                "success": False,
+                "clip": None,
+                "video_path": "",
+                "failure_stage": "download",
+                "error": "download failed",
+            }
+
+        clip["video_path"] = video_path
+        processing_error: Exception | None = None
+        release_error: Exception | None = None
+        try:
+            failure_stage = "whisper"
+            _log_memory_check(
+                stage="before_whisper_transcription",
+                candidate_number=candidate_number,
+                total_candidates=total_candidates,
+            )
+            transcription_started_at = time.perf_counter()
+            transcription = _transcribe_video_with_segments_subprocess(video_path)
+            _log_performance_timing(
+                stage="whisper_transcription",
+                candidate_number=candidate_number,
+                total_candidates=total_candidates,
+                elapsed_seconds=time.perf_counter() - transcription_started_at,
+            )
+            _log_memory_check(
+                stage="after_whisper_transcription",
+                candidate_number=candidate_number,
+                total_candidates=total_candidates,
+            )
+            clip["transcript"] = transcription.get("transcript", "")
+            clip["segments"] = transcription.get("segments", [])
+
+            failure_stage = "multimodal_scoring"
+            _log_memory_check(
+                stage="before_multimodal_scoring",
+                candidate_number=candidate_number,
+                total_candidates=total_candidates,
+            )
+            scoring_started_at = time.perf_counter()
+            multimodal = score_multimodal_clip(
+                video_path=video_path,
+                transcript=str(clip["transcript"]),
+                creator=str(clip["creator"]),
+                game=str(clip.get("game") or ""),
+                stream_title=str(clip["title"]),
+                viewer_count=clip["viewer_count"],
+                duration=clip.get("duration", 0),
+            )
+            _log_performance_timing(
+                stage="multimodal_scoring",
+                candidate_number=candidate_number,
+                total_candidates=total_candidates,
+                elapsed_seconds=time.perf_counter() - scoring_started_at,
+            )
+            _log_memory_check(
+                stage="after_multimodal_scoring",
+                candidate_number=candidate_number,
+                total_candidates=total_candidates,
+            )
+            clip["viral_score"] = multimodal["score"]
+            clip["score"] = multimodal["score"]
+            clip["score_reason"] = multimodal["reason"]
+            clip["score_hook"] = multimodal["hook"]
+            clip["visual_score"] = multimodal["visual_score"]
+            clip["transcript_score"] = multimodal["transcript_score"]
+            clip["context_score"] = multimodal["context_score"]
+            clip["score_confidence"] = multimodal["confidence"]
+            clip["decision"] = multimodal["decision"]
+        except Exception as error:
+            processing_error = error
+        finally:
+            try:
+                _log_memory_check(
+                    stage="before_whisper_release",
+                    candidate_number=candidate_number,
+                    total_candidates=total_candidates,
+                )
+                release_whisper_model()
+                _log_memory_check(
+                    stage="after_whisper_release",
+                    candidate_number=candidate_number,
+                    total_candidates=total_candidates,
+                )
+            except Exception as error:
+                release_error = error
+                print(
+                    "WHISPER MODEL RELEASE FAILED | "
+                    f"candidate={candidate_number}/{total_candidates} | "
+                    f"error={error!r}"
+                )
+
+        if processing_error is not None:
+            raise processing_error
+        if release_error is not None:
+            failure_stage = "model_release"
+            raise release_error
+
+        return {
+            "success": True,
+            "clip": clip,
+            "video_path": video_path,
+            "failure_stage": None,
+            "error": None,
+        }
+    except Exception as error:
+        if video_path:
+            _cleanup_candidate_video(
+                video_path,
+                candidate_number,
+                persisted_clips,
+            )
+        return {
+            "success": False,
+            "clip": None,
+            "video_path": video_path,
+            "failure_stage": failure_stage,
+            "error": repr(error),
+        }
+    finally:
+        _log_performance_timing(
+            stage="candidate_processing_total",
+            candidate_number=candidate_number,
+            total_candidates=total_candidates,
+            elapsed_seconds=time.perf_counter() - candidate_started_at,
+        )
 
 
 def _generate_pkce_pair() -> tuple[str, str]:
@@ -1868,6 +2282,7 @@ async def auto_generate_clip():
 async def _run_auto_generate_clip_pipeline():
     generation_started_at = time.perf_counter()
     processed_candidates_count = 0
+    fully_evaluated_candidates_count = 0
     creators = load_creators()
     creator_count = len(creators)
     start_index = _load_creator_cursor(creator_count)
@@ -1908,7 +2323,8 @@ async def _run_auto_generate_clip_pipeline():
         print(
             "PERFORMANCE TIMING SUMMARY | "
             f"total_elapsed_seconds={total_elapsed:.3f} | "
-            f"processed_candidates={processed_candidates_count}"
+            f"processed_candidates={processed_candidates_count} | "
+            f"fully_evaluated_candidates={fully_evaluated_candidates_count}"
         )
         return {
             "message": "No monitored creators are currently live."
@@ -1991,146 +2407,179 @@ async def _run_auto_generate_clip_pipeline():
             continue
 
         total_candidates = len(fresh_batch)
-        for candidate_index, twitch_clip in enumerate(fresh_batch, start=1):
+        stage_one_started_at = time.perf_counter()
+        preranked_candidates, has_sufficient_prerank_metadata = _fast_prerank_candidates(
+            fresh_batch,
+            cached_clip_ids,
+            cached_clip_urls,
+        )
+        full_evaluation_count = min(_get_full_evaluation_count(), total_candidates)
+        if has_sufficient_prerank_metadata:
+            advanced_candidates = preranked_candidates[:1]
+            if full_evaluation_count > 1:
+                remaining_candidates = preranked_candidates[1:]
+                diversity_candidate = max(
+                    remaining_candidates,
+                    key=lambda candidate: (
+                        float(candidate["title_score"]),
+                        float(candidate["score"]),
+                    ),
+                )
+                advanced_candidates.append(diversity_candidate)
+                if full_evaluation_count > len(advanced_candidates):
+                    advanced_ids = {
+                        int(candidate["candidate_index"])
+                        for candidate in advanced_candidates
+                    }
+                    advanced_candidates.extend(
+                        candidate
+                        for candidate in remaining_candidates
+                        if int(candidate["candidate_index"]) not in advanced_ids
+                    )
+                    advanced_candidates = advanced_candidates[:full_evaluation_count]
+        else:
+            advanced_candidates = preranked_candidates
+            print(
+                "FAST PRE-RANK FALLBACK | "
+                "reason=insufficient_metadata | "
+                "action=sequential_full_evaluation"
+            )
+
+        advanced_candidate_numbers = [
+            int(candidate["candidate_index"])
+            for candidate in advanced_candidates
+        ]
+        advanced_candidate_set = set(advanced_candidate_numbers)
+        rescue_candidate_numbers = [
+            int(candidate["candidate_index"])
+            for candidate in preranked_candidates
+            if int(candidate["candidate_index"]) not in advanced_candidate_set
+        ]
+
+        for preranked_candidate in sorted(
+            preranked_candidates,
+            key=lambda item: int(item["candidate_index"]),
+        ):
+            print(
+                "FAST PRE-RANK | "
+                f"candidate={preranked_candidate['candidate_index']}/{total_candidates} | "
+                f"score={float(preranked_candidate['score']):.2f} | "
+                f"reasons={preranked_candidate['reasons']}"
+            )
+        print(
+            "FAST PRE-RANK ADVANCED | "
+            f"candidates={advanced_candidate_numbers} | "
+            f"configured_full_evaluation_count={_get_full_evaluation_count()} | "
+            f"fallback={not has_sufficient_prerank_metadata}"
+        )
+        for candidate_number in rescue_candidate_numbers:
+            print(
+                "FAST PRE-RANK SKIPPED | "
+                f"candidate={candidate_number}/{total_candidates} | "
+                "reason=reserved_for_rescue"
+            )
+        _log_performance_timing(
+            stage="candidate_prerank_stage_1",
+            elapsed_seconds=time.perf_counter() - stage_one_started_at,
+        )
+
+        batch_candidates: list[dict[str, object]] = []
+        batch_full_evaluated_candidates = 0
+        stage_two_started_at = time.perf_counter()
+        evaluation_phases = [
+            ("initial", advanced_candidate_numbers),
+            ("rescue", rescue_candidate_numbers),
+        ]
+        for phase, candidate_numbers in evaluation_phases:
+            if phase == "rescue":
+                if batch_candidates or not candidate_numbers:
+                    break
+                print(
+                    "FAST PRE-RANK RESCUE START | "
+                    f"batch={batch_attempt}/2 | "
+                    f"candidates={candidate_numbers}"
+                )
+
+            for candidate_index in candidate_numbers:
+                twitch_clip = fresh_batch[candidate_index - 1]
                 twitch_clip_id = str(twitch_clip.get("id", "")).strip()
                 if not twitch_clip_id:
                     continue
-
-                processed_candidates_count += 1
-                candidate_started_at = time.perf_counter()
-
                 public_url = (
                     twitch_clip.get("url")
                     or f"https://clips.twitch.tv/{twitch_clip_id}"
                 )
+                attempted_clip_ids.add(twitch_clip_id)
+                attempted_clip_urls.add(public_url)
+                processed_candidates_count += 1
 
+                if phase == "rescue":
+                    print(
+                        "FAST PRE-RANK RESCUE CANDIDATE | "
+                        f"candidate={candidate_index}/{total_candidates}"
+                    )
+
+                evaluation_result = _fully_evaluate_candidate(
+                    twitch_clip=twitch_clip,
+                    candidate_number=candidate_index,
+                    total_candidates=total_candidates,
+                    creator=creator,
+                    stream=stream,
+                    stream_title=stream_title,
+                    viewer_count=viewer_count,
+                    persisted_clips=existing_clips,
+                )
+                if not evaluation_result["success"]:
+                    print(
+                        f"Candidate {candidate_index} full evaluation failed:",
+                        evaluation_result["error"],
+                    )
+                    continue
+
+                clip = evaluation_result["clip"]
+                if not isinstance(clip, dict):
+                    continue
+                candidates.append(clip)
+                batch_candidates.append(clip)
+                batch_full_evaluated_candidates += 1
+                fully_evaluated_candidates_count += 1
+                if phase == "rescue":
+                    print(
+                        "FAST PRE-RANK RESCUE SUCCESS | "
+                        f"candidate={candidate_index}/{total_candidates}"
+                    )
+                    break
+
+            if phase == "rescue" and not batch_candidates:
+                print(
+                    "FAST PRE-RANK RESCUE EXHAUSTED | "
+                    f"batch={batch_attempt}/2"
+                )
+
+        if batch_candidates:
+            for candidate_index, twitch_clip in enumerate(fresh_batch, start=1):
+                if candidate_index in advanced_candidate_set:
+                    continue
+                twitch_clip_id = str(twitch_clip.get("id", "")).strip()
+                if not twitch_clip_id:
+                    continue
+                public_url = (
+                    twitch_clip.get("url")
+                    or f"https://clips.twitch.tv/{twitch_clip_id}"
+                )
                 attempted_clip_ids.add(twitch_clip_id)
                 attempted_clip_urls.add(public_url)
 
-                clip = {
-                    "title": stream_title,
-                    "creator": creator["name"],
-                    "status": "Ready to review",
-                    "viewer_count": viewer_count,
-                    "game": stream.get("game_name"),
-                    "started_at": stream.get("started_at"),
-                    "thumbnail_url": stream.get("thumbnail_url"),
-                    "twitch_clip_id": twitch_clip_id,
-                    "twitch_edit_url": twitch_clip.get("edit_url"),
-                    "public_url": public_url,
-                    "candidate_number": candidate_index,
-                }
-
-                _log_memory_check(
-                    stage="before_ytdlp_download",
-                    candidate_number=candidate_index,
-                    total_candidates=total_candidates,
-                )
-                download_started_at = time.perf_counter()
-                video_path = download_twitch_clip(
-                    clip["public_url"],
-                    clip["twitch_clip_id"],
-                )
-                _log_performance_timing(
-                    stage="ytdlp_download",
-                    candidate_number=candidate_index,
-                    total_candidates=total_candidates,
-                    elapsed_seconds=time.perf_counter() - download_started_at,
-                )
-                _log_memory_check(
-                    stage="after_ytdlp_download",
-                    candidate_number=candidate_index,
-                    total_candidates=total_candidates,
-                )
-
-                if not video_path:
-                    _log_performance_timing(
-                        stage="candidate_processing_total",
-                        candidate_number=candidate_index,
-                        total_candidates=total_candidates,
-                        elapsed_seconds=time.perf_counter() - candidate_started_at,
-                    )
-                    print(f"Candidate {candidate_index} skipped: download failed.")
-                    continue
-
-                clip["video_path"] = video_path
-                try:
-                    _log_memory_check(
-                        stage="before_whisper_transcription",
-                        candidate_number=candidate_index,
-                        total_candidates=total_candidates,
-                    )
-                    transcription_started_at = time.perf_counter()
-                    transcription = _transcribe_video_with_segments_subprocess(video_path)
-                    _log_performance_timing(
-                        stage="whisper_transcription",
-                        candidate_number=candidate_index,
-                        total_candidates=total_candidates,
-                        elapsed_seconds=time.perf_counter() - transcription_started_at,
-                    )
-                    _log_memory_check(
-                        stage="after_whisper_transcription",
-                        candidate_number=candidate_index,
-                        total_candidates=total_candidates,
-                    )
-                    clip["transcript"] = transcription.get("transcript", "")
-                    clip["segments"] = transcription.get("segments", [])
-                    _log_memory_check(
-                        stage="before_multimodal_scoring",
-                        candidate_number=candidate_index,
-                        total_candidates=total_candidates,
-                    )
-                    scoring_started_at = time.perf_counter()
-                    multimodal = score_multimodal_clip(
-                        video_path=video_path,
-                        transcript=clip["transcript"],
-                        creator=clip["creator"],
-                        game=clip.get("game") or "",
-                        stream_title=clip["title"],
-                        viewer_count=clip["viewer_count"],
-                        duration=clip.get("duration", 0),
-                    )
-                    _log_performance_timing(
-                        stage="multimodal_scoring",
-                        candidate_number=candidate_index,
-                        total_candidates=total_candidates,
-                        elapsed_seconds=time.perf_counter() - scoring_started_at,
-                    )
-                    _log_memory_check(
-                        stage="after_multimodal_scoring",
-                        candidate_number=candidate_index,
-                        total_candidates=total_candidates,
-                    )
-                    clip["viral_score"] = multimodal["score"]
-                    clip["score"] = multimodal["score"]
-                    clip["score_reason"] = multimodal["reason"]
-                    clip["score_hook"] = multimodal["hook"]
-                    clip["visual_score"] = multimodal["visual_score"]
-                    clip["transcript_score"] = multimodal["transcript_score"]
-                    clip["context_score"] = multimodal["context_score"]
-                    clip["score_confidence"] = multimodal["confidence"]
-                    clip["decision"] = multimodal["decision"]
-                finally:
-                    _log_memory_check(
-                        stage="before_whisper_release",
-                        candidate_number=candidate_index,
-                        total_candidates=total_candidates,
-                    )
-                    release_whisper_model()
-                    _log_memory_check(
-                        stage="after_whisper_release",
-                        candidate_number=candidate_index,
-                        total_candidates=total_candidates,
-                    )
-
-                _log_performance_timing(
-                    stage="candidate_processing_total",
-                    candidate_number=candidate_index,
-                    total_candidates=total_candidates,
-                    elapsed_seconds=time.perf_counter() - candidate_started_at,
-                )
-
-                candidates.append(clip)
+        _log_performance_timing(
+            stage="candidate_full_evaluation_stage_2",
+            elapsed_seconds=time.perf_counter() - stage_two_started_at,
+        )
+        print(
+            "FULL EVALUATION SUMMARY | "
+            f"batch={batch_attempt}/2 | "
+            f"batch_full_evaluated_candidates={batch_full_evaluated_candidates} | "
+            f"total_fully_evaluated_candidates={fully_evaluated_candidates_count}"
+        )
 
         if candidates:
             break
@@ -2156,12 +2605,25 @@ async def _run_auto_generate_clip_pipeline():
         stage="winner_selection",
         elapsed_seconds=time.perf_counter() - winner_selection_started_at,
     )
+    for candidate in candidates:
+        if candidate is best_clip:
+            continue
+        _cleanup_candidate_video(
+            candidate.get("video_path"),
+            int(candidate.get("candidate_number", 0) or 0),
+            existing_clips,
+        )
     print("")
     print(f"Best Clip: #{best_clip['candidate_number']}")
     print(f"Final Score: {best_clip['score']}")
     print("------------------------")
 
     if best_clip["decision"] == "reject" or best_clip["score"] < AUTO_CLIP_MIN_SCORE:
+        _cleanup_candidate_video(
+            best_clip.get("video_path"),
+            int(best_clip.get("candidate_number", 0) or 0),
+            existing_clips,
+        )
         total_elapsed = time.perf_counter() - generation_started_at
         _log_performance_timing(
             stage="generation_total",
@@ -2170,7 +2632,8 @@ async def _run_auto_generate_clip_pipeline():
         print(
             "PERFORMANCE TIMING SUMMARY | "
             f"total_elapsed_seconds={total_elapsed:.3f} | "
-            f"processed_candidates={processed_candidates_count}"
+            f"processed_candidates={processed_candidates_count} | "
+            f"fully_evaluated_candidates={fully_evaluated_candidates_count}"
         )
         return {
             "message": "No viral clips found.",
@@ -2184,6 +2647,11 @@ async def _run_auto_generate_clip_pipeline():
     )
 
     if is_duplicate:
+        _cleanup_candidate_video(
+            best_clip.get("video_path"),
+            int(best_clip.get("candidate_number", 0) or 0),
+            existing_clips,
+        )
         total_elapsed = time.perf_counter() - generation_started_at
         _log_performance_timing(
             stage="generation_total",
@@ -2192,7 +2660,8 @@ async def _run_auto_generate_clip_pipeline():
         print(
             "PERFORMANCE TIMING SUMMARY | "
             f"total_elapsed_seconds={total_elapsed:.3f} | "
-            f"processed_candidates={processed_candidates_count}"
+            f"processed_candidates={processed_candidates_count} | "
+            f"fully_evaluated_candidates={fully_evaluated_candidates_count}"
         )
         return {
             "message": "No viral clips found.",
@@ -2270,7 +2739,15 @@ async def _run_auto_generate_clip_pipeline():
         total_candidates=len(candidates),
     )
     persistence_started_at = time.perf_counter()
-    result = await create_clip(best_clip)
+    try:
+        result = await create_clip(best_clip)
+    except Exception:
+        print(
+            "CLIP PERSISTENCE FAILED - MEDIA RETAINED FOR RECOVERY | "
+            f"raw_video_path={best_clip.get('raw_video_path')} | "
+            f"video_path={best_clip.get('video_path')}"
+        )
+        raise
     _log_performance_timing(
         stage="persistence",
         elapsed_seconds=time.perf_counter() - persistence_started_at,
@@ -2289,7 +2766,8 @@ async def _run_auto_generate_clip_pipeline():
     print(
         "PERFORMANCE TIMING SUMMARY | "
         f"total_elapsed_seconds={total_elapsed:.3f} | "
-        f"processed_candidates={processed_candidates_count}"
+        f"processed_candidates={processed_candidates_count} | "
+        f"fully_evaluated_candidates={fully_evaluated_candidates_count}"
     )
     return result["clip"]
 

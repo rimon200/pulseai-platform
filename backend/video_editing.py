@@ -427,6 +427,20 @@ def create_tiktok_edited_video(
         edited_dir.mkdir(parents=True, exist_ok=True)
         edited_path = edited_dir / f"{raw_path.stem}_tiktok.mp4"
 
+    edited_output_existed_before = False
+    edited_output_before_signature = None
+    try:
+        if edited_path.is_file():
+            edited_output_existed_before = True
+            existing_stat = edited_path.stat()
+            edited_output_before_signature = (
+                existing_stat.st_ino,
+                existing_stat.st_size,
+                existing_stat.st_mtime_ns,
+            )
+    except OSError:
+        edited_output_before_signature = None
+
     overlay_temp_path = None
 
     try:
@@ -498,8 +512,41 @@ def create_tiktok_edited_video(
                 stderr=subprocess.PIPE,
                 text=True,
             )
-        except subprocess.CalledProcessError as error:
-            stderr = (error.stderr or "").strip()
+        except (subprocess.CalledProcessError, OSError) as error:
+            stderr = (
+                (error.stderr or "").strip()
+                if isinstance(error, subprocess.CalledProcessError)
+                else repr(error)
+            )
+            try:
+                if (
+                    edited_path.resolve(strict=False)
+                    != raw_path.resolve(strict=False)
+                    and edited_path.is_file()
+                ):
+                    failed_stat = edited_path.stat()
+                    failed_signature = (
+                        failed_stat.st_ino,
+                        failed_stat.st_size,
+                        failed_stat.st_mtime_ns,
+                    )
+                    if (
+                        not edited_output_existed_before
+                        or (
+                            edited_output_before_signature is not None
+                            and failed_signature != edited_output_before_signature
+                        )
+                    ):
+                        edited_path.unlink()
+                        print(
+                            "FFMPEG PARTIAL OUTPUT CLEANUP | "
+                            f"path={edited_path}"
+                        )
+            except Exception as cleanup_error:
+                print(
+                    "FFMPEG PARTIAL OUTPUT CLEANUP FAILED | "
+                    f"path={edited_path} | error={cleanup_error!r}"
+                )
             raise RuntimeError(f"ffmpeg editing failed: {stderr}") from error
 
         ffmpeg_elapsed_seconds = time.perf_counter() - ffmpeg_started_at
