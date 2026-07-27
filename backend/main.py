@@ -40,6 +40,7 @@ load_dotenv()
 
 
 app = FastAPI(title="PulseAI Backend")
+download_service = DownloadService()
 AUTO_CLIP_INTERVAL_SECONDS = 300
 AUTO_CLIP_MIN_SCORE = int(os.getenv("AUTO_CLIP_MIN_SCORE", "45"))
 AUTO_CLIP_CANDIDATE_COUNT = 3
@@ -1383,22 +1384,8 @@ async def fetch_fresh_twitch_clips(
     return fresh_clips
 
 def download_twitch_clip(clip_url: str, output_name: str) -> str:
-    output_path = f"downloads/{output_name}.mp4"
-
-    try:
-        subprocess.run(
-            [
-                "yt-dlp",
-                "-o",
-                output_path,
-                clip_url,
-            ],
-            check=True,
-        )
-        return output_path
-    except subprocess.CalledProcessError as error:
-        print(f"TWITCH CLIP DOWNLOAD FAILED for {clip_url}:", repr(error))
-        return None
+    output_path = download_service.download_with_ytdlp(clip_url, output_name)
+    return output_path or None
 
 
 async def upload_tiktok_draft(video_path: str) -> dict:
