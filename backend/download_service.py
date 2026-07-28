@@ -1,5 +1,6 @@
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+import gc
 import re
 import subprocess
 
@@ -8,6 +9,8 @@ DOWNLOADS_DIR = Path(__file__).resolve().parent / "downloads"
 DOWNLOADS_DIR.mkdir(exist_ok=True)
 
 _YTDLP_VERSION_LOGGED = False
+_YTDLP_MAX_LOG_LINES = 200
+_YTDLP_MAX_LOG_LINE_CHARS = 2000
 
 
 def _log_ytdlp_version_once() -> None:
@@ -77,14 +80,14 @@ class DownloadService:
             return str(output_path)
 
         try:
-            subprocess.run(
+            self._run_ytdlp_process(
                 [
                     "yt-dlp",
+                    "--no-progress",
                     "-o",
                     str(output_path),
                     clip_url,
-                ],
-                check=True,
+                ]
             )
             return str(output_path)
 
@@ -122,3 +125,49 @@ class DownloadService:
                         f"path={artifact_path} | error={cleanup_error!r}"
                     )
             return ""
+
+    def _run_ytdlp_process(self, command: list[str]) -> None:
+        process = None
+        log_lines_emitted = 0
+        truncation_logged = False
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            if process.stdout is not None:
+                for output_line in process.stdout:
+                    clean_line = output_line.rstrip()
+                    if not clean_line:
+                        continue
+                    if log_lines_emitted < _YTDLP_MAX_LOG_LINES:
+                        print(
+                            "YT-DLP | "
+                            f"{clean_line[:_YTDLP_MAX_LOG_LINE_CHARS]}"
+                        )
+                        log_lines_emitted += 1
+                    elif not truncation_logged:
+                        print(
+                            "YT-DLP | additional output suppressed "
+                            f"after {_YTDLP_MAX_LOG_LINES} lines"
+                        )
+                        truncation_logged = True
+            return_code = process.wait()
+            if return_code != 0:
+                raise subprocess.CalledProcessError(return_code, command)
+        finally:
+            if process is not None:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                if process.stdout is not None:
+                    process.stdout.close()
+                del process
+            gc.collect()

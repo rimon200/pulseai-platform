@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import gc
 import hashlib
 import json
 import math
@@ -143,6 +144,26 @@ def _apply_visual_layout_memory_fallback(
         "sample_count": int(visual_layout.get("sample_count") or 0),
         "regions": [],
     }
+
+
+def _whisper_memory_admitted(
+    available_memory_mb: float | None = None,
+) -> tuple[bool, float | None, float]:
+    try:
+        required_memory_mb = max(
+            0.0,
+            float(os.getenv("WHISPER_MEMORY_FALLBACK_MB", "180")),
+        )
+    except ValueError:
+        required_memory_mb = 180.0
+    if available_memory_mb is None:
+        available_memory_mb = _get_available_memory_mb()
+    admitted = (
+        available_memory_mb >= required_memory_mb
+        if available_memory_mb is not None
+        else not bool(DATABASE_URL)
+    )
+    return admitted, available_memory_mb, required_memory_mb
 
 
 def _log_performance_timing(
@@ -677,6 +698,7 @@ def _fully_evaluate_candidate(
         )
         download_started_at = time.perf_counter()
         video_path = download_twitch_clip(public_url, twitch_clip_id)
+        gc.collect()
         _log_performance_timing(
             stage="ytdlp_download",
             candidate_number=candidate_number,
@@ -684,7 +706,7 @@ def _fully_evaluate_candidate(
             elapsed_seconds=time.perf_counter() - download_started_at,
         )
         _log_memory_check(
-            stage="after_ytdlp_download",
+            stage="after_yt_dlp_process_cleanup",
             candidate_number=candidate_number,
             total_candidates=total_candidates,
         )
@@ -698,6 +720,44 @@ def _fully_evaluate_candidate(
             }
 
         clip["video_path"] = video_path
+        _log_memory_check(
+            stage="before_whisper_admission",
+            candidate_number=candidate_number,
+            total_candidates=total_candidates,
+        )
+        admitted, available_memory_mb, required_memory_mb = (
+            _whisper_memory_admitted()
+        )
+        if not admitted:
+            failure_stage = "whisper_admission"
+            available_label = (
+                f"{available_memory_mb:.1f}"
+                if available_memory_mb is not None
+                else "unknown"
+            )
+            print(
+                "WHISPER ADMISSION REJECTED | "
+                f"candidate={candidate_number}/{total_candidates} | "
+                f"available_mb={available_label} | "
+                f"required_mb={required_memory_mb:.1f}"
+            )
+            _cleanup_candidate_video(
+                video_path,
+                candidate_number,
+                persisted_clips,
+            )
+            video_path = ""
+            return {
+                "success": False,
+                "clip": None,
+                "video_path": "",
+                "failure_stage": failure_stage,
+                "error": (
+                    "insufficient memory before Whisper: "
+                    f"available={available_label} MB, "
+                    f"required={required_memory_mb:.1f} MB"
+                ),
+            }
         processing_error: Exception | None = None
         release_error: Exception | None = None
         try:
@@ -869,20 +929,74 @@ TWITCH_REDIRECT_URI = os.getenv(
 app.state.auto_clip_task = None
 app.state.clip_generation_admission_lock = asyncio.Lock()
 app.state.clip_generation_busy = False
+app.state.clip_generation_db_lease = None
 app.state.video_edit_lock = asyncio.Lock()
+
+CLIP_GENERATION_ADVISORY_LOCK_ID = 22616960936427850
+
+
+def _try_acquire_generation_db_lease() -> object | None:
+    if not DATABASE_URL:
+        return True
+    try:
+        import psycopg
+
+        connection = psycopg.connect(DATABASE_URL, autocommit=True)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_try_advisory_lock(%s)",
+                (CLIP_GENERATION_ADVISORY_LOCK_ID,),
+            )
+            acquired = bool(cursor.fetchone()[0])
+        if not acquired:
+            connection.close()
+            return None
+        print("CLIP GENERATION LEASE ACQUIRED")
+        return connection
+    except Exception as error:
+        print(f"CLIP GENERATION LEASE FAILED | error={error!r}")
+        return None
+
+
+def _release_generation_db_lease(lease: object) -> None:
+    if lease is True or lease is None:
+        return
+    try:
+        with lease.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_unlock(%s)",
+                (CLIP_GENERATION_ADVISORY_LOCK_ID,),
+            )
+    except Exception as error:
+        print(f"CLIP GENERATION LEASE RELEASE FAILED | error={error!r}")
+    finally:
+        try:
+            lease.close()
+        except Exception as error:
+            print(
+                "CLIP GENERATION LEASE CONNECTION CLOSE FAILED | "
+                f"error={error!r}"
+            )
 
 
 async def try_begin_clip_generation() -> bool:
     async with app.state.clip_generation_admission_lock:
         if app.state.clip_generation_busy:
             return False
+        database_lease = _try_acquire_generation_db_lease()
+        if database_lease is None:
+            return False
         app.state.clip_generation_busy = True
+        app.state.clip_generation_db_lease = database_lease
         return True
 
 
 async def end_clip_generation() -> None:
     async with app.state.clip_generation_admission_lock:
+        database_lease = app.state.clip_generation_db_lease
+        app.state.clip_generation_db_lease = None
         app.state.clip_generation_busy = False
+        _release_generation_db_lease(database_lease)
 
 
 async def _auto_clip_loop():
