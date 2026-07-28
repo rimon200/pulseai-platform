@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import hashlib
 import json
@@ -13,7 +15,7 @@ from typing import Any
 import uuid
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pathlib import Path
@@ -33,10 +35,12 @@ from ai import (
     client,
     generate_ai_title,
     generate_ai_description,
+    generate_tiktok_caption_package,
     release_whisper_model,
     score_multimodal_clip,
 )
 from video_editing import create_tiktok_edited_video
+from storage_service import object_storage_enabled, upload_video
 
 load_dotenv()
 
@@ -132,6 +136,14 @@ def _publish_lease_minutes() -> int:
     )
 
 
+def _published_media_retention_days() -> int:
+    return _bounded_environment_int(
+        "PUBLISHED_MEDIA_RETENTION_DAYS",
+        default=7,
+        minimum=0,
+    )
+
+
 def _twitch_max_pages() -> int:
     return _bounded_environment_int(
         "AUTO_CLIP_TWITCH_MAX_PAGES",
@@ -139,6 +151,67 @@ def _twitch_max_pages() -> int:
         minimum=1,
         maximum=20,
     )
+
+
+def _select_duration_profile(clip: dict[str, object]) -> dict[str, object]:
+    source_duration = max(0.0, float(clip.get("duration") or 0))
+    long_enabled = os.getenv("AUTO_CLIP_LONGFORM_ENABLED", "true").lower() == "true"
+    target_percent = _bounded_environment_int(
+        "AUTO_CLIP_LONGFORM_TARGET_PERCENT", 30, 0, 100
+    )
+    long_min = float(os.getenv("AUTO_CLIP_LONG_MIN_SECONDS", "60"))
+    long_target = float(os.getenv("AUTO_CLIP_LONG_TARGET_SECONDS", "75"))
+    long_max = float(os.getenv("AUTO_CLIP_LONG_MAX_SECONDS", "90"))
+    short_min = float(os.getenv("AUTO_CLIP_SHORT_MIN_SECONDS", "18"))
+    short_max = float(os.getenv("AUTO_CLIP_SHORT_MAX_SECONDS", "40"))
+    stable_key = str(clip.get("twitch_clip_id") or clip.get("id") or "")
+    bucket = int(hashlib.sha256(stable_key.encode()).hexdigest()[:8], 16) % 100
+    coherent_context = (
+        source_duration >= long_min
+        and len(str(clip.get("transcript") or "").split()) >= 80
+        and len(clip.get("segments") or []) >= 6
+    )
+    wants_long = long_enabled and bucket < target_percent
+    if wants_long and coherent_context:
+        requested = min(long_target, long_max, source_duration)
+        print(
+            "LONGFORM CLIP ELIGIBLE | "
+            f"duration={source_duration:.1f} | requested={requested:.1f}"
+        )
+        print(f"LONGFORM BOUNDARIES | start=0.0 | end={requested:.1f}")
+        profile = "long"
+        eligible_reason = "source_has_duration_transcript_and_scene_continuity"
+        rejection_reason = ""
+    else:
+        requested = min(
+            max(short_min, min(source_duration, short_max)),
+            source_duration,
+        )
+        profile = "short"
+        eligible_reason = ""
+        rejection_reason = (
+            "longform_not_selected"
+            if not wants_long
+            else "insufficient_coherent_context_without_padding"
+        )
+        if wants_long:
+            print(
+                "LONGFORM CLIP SKIPPED | "
+                f"reason={rejection_reason} | duration={source_duration:.1f}"
+            )
+    print(
+        "CLIP DURATION PROFILE SELECTED | "
+        f"profile={profile} | requested={requested:.1f} | actual={requested:.1f}"
+    )
+    if profile == "long":
+        print(f"LONGFORM ACTUAL DURATION | seconds={requested:.1f}")
+    return {
+        "duration_profile": profile,
+        "requested_duration": requested,
+        "actual_duration": requested,
+        "longform_eligible_reason": eligible_reason,
+        "longform_rejection_reason": rejection_reason,
+    }
 
 
 def _canonical_twitch_clip_id(value: object) -> str:
@@ -527,6 +600,7 @@ def _fully_evaluate_candidate(
             "public_url": public_url,
             "candidate_number": candidate_number,
             "_search_tier": int(twitch_clip.get("_search_tier", 1)),
+            "duration": float(twitch_clip.get("duration") or 0),
         }
 
         failure_stage = "download"
@@ -762,8 +836,67 @@ async def _auto_clip_loop():
                 print("AUTO ERROR:", repr(error))
             finally:
                 await end_clip_generation()
+        try:
+            await _run_auto_publish_once()
+        except Exception as error:
+            print(f"AUTO PUBLISH SKIPPED | reason={error!r}")
+        try:
+            await _poll_one_tiktok_post_status()
+        except Exception as error:
+            print(f"TIKTOK POST STATUS | error={error!r}")
         print("AUTO CYCLE COMPLETE")
         await asyncio.sleep(AUTO_CLIP_INTERVAL_SECONDS)
+
+
+async def _run_auto_publish_once() -> None:
+    if not DATABASE_URL or not getattr(app.state, "clip_history_ready", False):
+        return
+    import psycopg
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT auto_publish_enabled, auto_publish_approved,
+                       daily_limit, min_gap_minutes
+                FROM pulseai_settings WHERE singleton = TRUE
+                """
+            )
+            settings = cursor.fetchone()
+            if not settings or not settings[0] or not settings[1]:
+                print("AUTO PUBLISH SKIPPED | reason=disabled_or_unapproved")
+                return
+            cursor.execute(
+                """
+                SELECT COUNT(*), MAX(publish_attempted_at)
+                FROM twitch_clip_history
+                WHERE publish_attempted_at >= date_trunc('day', NOW())
+                """
+            )
+            attempts_today, last_attempt = cursor.fetchone()
+            if attempts_today >= settings[2]:
+                print("AUTO PUBLISH SKIPPED | reason=daily_limit")
+                return
+            if (
+                last_attempt
+                and last_attempt
+                > datetime.now(timezone.utc) - timedelta(minutes=settings[3])
+            ):
+                print("AUTO PUBLISH SKIPPED | reason=minimum_gap")
+                return
+            cursor.execute(
+                """
+                SELECT generated_clip_id FROM twitch_clip_history
+                WHERE status = 'scheduled' AND scheduled_for <= NOW()
+                ORDER BY scheduled_for LIMIT 1
+                """
+            )
+            row = cursor.fetchone()
+    if not row:
+        print("AUTO PUBLISH SKIPPED | reason=no_due_clip")
+        return
+    print(f"AUTO PUBLISH CLAIMED | clip_id={row[0]}")
+    await publish_clip_to_tiktok({"id": row[0]})
 
 
 @app.on_event("startup")
@@ -803,6 +936,7 @@ def _ensure_clip_history_table() -> bool:
         return True
     try:
         import psycopg
+        from psycopg import sql
 
         with psycopg.connect(DATABASE_URL) as connection:
             with connection.cursor() as cursor:
@@ -844,6 +978,74 @@ def _ensure_clip_history_table() -> bool:
                     ADD COLUMN IF NOT EXISTS provider_publish_id TEXT
                     """
                 )
+                additive_columns = {
+                    "generated_clip_id": "TEXT",
+                    "display_title": "TEXT",
+                    "category": "TEXT",
+                    "local_video_path": "TEXT",
+                    "raw_video_path": "TEXT",
+                    "object_key": "TEXT",
+                    "durable_url": "TEXT",
+                    "ai_post_caption": "TEXT",
+                    "ai_hashtags": "JSONB",
+                    "ai_tiktok_description": "TEXT",
+                    "caption_generation_version": "TEXT",
+                    "transcript": "TEXT",
+                    "duration_profile": "TEXT",
+                    "requested_duration": "DOUBLE PRECISION",
+                    "actual_duration": "DOUBLE PRECISION",
+                    "longform_eligible_reason": "TEXT",
+                    "longform_rejection_reason": "TEXT",
+                    "scheduled_for": "TIMESTAMPTZ",
+                    "approved_at": "TIMESTAMPTZ",
+                    "archived_at": "TIMESTAMPTZ",
+                    "tiktok_publish_mode": "TEXT",
+                    "tiktok_post_status": "TEXT",
+                    "tiktok_failure_reason": "TEXT",
+                    "tiktok_last_status_check": "TIMESTAMPTZ",
+                    "tiktok_published_at": "TIMESTAMPTZ",
+                    "poll_claimed_at": "TIMESTAMPTZ",
+                    "poll_check_count": "INTEGER NOT NULL DEFAULT 0",
+                    "generated_at": "TIMESTAMPTZ",
+                    "title_version": "TEXT",
+                    "views": "BIGINT",
+                    "likes": "BIGINT",
+                    "comments": "BIGINT",
+                    "shares": "BIGINT",
+                    "last_metrics_sync": "TIMESTAMPTZ",
+                    "source_creator_id": "TEXT",
+                    "source_platform": "TEXT",
+                    "rights_status": "TEXT",
+                    "authorization_reference": "TEXT",
+                    "authorization_notes": "TEXT",
+                }
+                for column_name, column_type in additive_columns.items():
+                    cursor.execute(
+                        sql.SQL(
+                            "ALTER TABLE twitch_clip_history "
+                            "ADD COLUMN IF NOT EXISTS {} "
+                        ).format(sql.Identifier(column_name))
+                        + sql.SQL(column_type)
+                    )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pulseai_settings (
+                        singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+                        post_mode TEXT NOT NULL DEFAULT 'draft',
+                        auto_publish_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                        auto_publish_approved BOOLEAN NOT NULL DEFAULT FALSE,
+                        daily_limit INTEGER NOT NULL DEFAULT 2,
+                        min_gap_minutes INTEGER NOT NULL DEFAULT 180,
+                        timezone TEXT NOT NULL DEFAULT 'UTC',
+                        privacy_level TEXT,
+                        allow_comments BOOLEAN NOT NULL DEFAULT TRUE,
+                        allow_duet BOOLEAN NOT NULL DEFAULT TRUE,
+                        allow_stitch BOOLEAN NOT NULL DEFAULT TRUE,
+                        longform_target_percent INTEGER NOT NULL DEFAULT 30,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
                 cursor.execute(
                     """
                     CREATE INDEX IF NOT EXISTS twitch_clip_history_status_idx
@@ -869,13 +1071,20 @@ def _ensure_clip_history_table() -> bool:
                 )
                 history_rows = cursor.fetchall()
                 status_precedence = {
-                    "published": 9,
-                    "generated": 8,
-                    "publishing": 7,
-                    "rejected_low_score": 6,
-                    "fully_evaluated": 5,
-                    "processing": 4,
-                    "failed": 3,
+                    "published": 15,
+                    "archived": 14,
+                    "rejected": 13,
+                    "generated": 12,
+                    "uploaded_to_inbox": 11,
+                    "publishing": 10,
+                    "scheduled": 9,
+                    "approved": 8,
+                    "ready_for_review": 7,
+                    "publish_failed": 6,
+                    "rejected_low_score": 5,
+                    "fully_evaluated": 4,
+                    "processing": 3,
+                    "failed": 2,
                     "intentionally_skipped": 2,
                     "discovered": 1,
                 }
@@ -954,6 +1163,38 @@ def _ensure_clip_history_table() -> bool:
                             (canonical_id, reconciled_row[2], original_ids[0]),
                         )
                         continue
+                    metadata_columns = tuple(additive_columns)
+                    cursor.execute(
+                        sql.SQL("SELECT clip_id, {} FROM twitch_clip_history "
+                                "WHERE provider = 'twitch' AND clip_id = ANY(%s)")
+                        .format(
+                            sql.SQL(", ").join(
+                                sql.Identifier(name) for name in metadata_columns
+                            )
+                        ),
+                        (original_ids,),
+                    )
+                    metadata_rows = cursor.fetchall()
+                    status_by_id = {
+                        str(row[1]): str(row[8]) for row in history_rows
+                    }
+                    metadata_rows.sort(
+                        key=lambda row: status_precedence.get(
+                            status_by_id.get(str(row[0]), ""), 0
+                        ),
+                        reverse=True,
+                    )
+                    reconciled_metadata = [
+                        next(
+                            (
+                                row[index]
+                                for row in metadata_rows
+                                if row[index] is not None
+                            ),
+                            None,
+                        )
+                        for index in range(1, len(metadata_columns) + 1)
+                    ]
                     cursor.execute(
                         """
                         DELETE FROM twitch_clip_history
@@ -974,6 +1215,17 @@ def _ensure_clip_history_table() -> bool:
                         )
                         """,
                         reconciled_row,
+                    )
+                    cursor.execute(
+                        sql.SQL("UPDATE twitch_clip_history SET {} "
+                                "WHERE provider = 'twitch' AND clip_id = %s")
+                        .format(
+                            sql.SQL(", ").join(
+                                sql.SQL("{} = %s").format(sql.Identifier(name))
+                                for name in metadata_columns
+                            )
+                        ),
+                        [*reconciled_metadata, canonical_id],
                     )
                 for canonical_id, count in duplicate_counts.items():
                     if count > 1:
@@ -1197,7 +1449,10 @@ def _claim_clip_for_publishing(clip: dict[str, object]) -> bool:
                     WHERE provider = 'twitch'
                       AND clip_id = %s
                       AND (
-                          status = 'generated'
+                          status IN (
+                              'generated', 'ready_for_review', 'approved',
+                              'scheduled', 'publish_failed'
+                          )
                           OR (
                               status = 'publishing'
                               AND (
@@ -1238,7 +1493,7 @@ def _restore_clip_after_publish_failure(clip: dict[str, object]) -> bool:
                 cursor.execute(
                     """
                     UPDATE twitch_clip_history
-                    SET status = 'generated',
+                    SET status = 'publish_failed',
                         publish_attempted_at = NULL,
                         failure_stage = 'tiktok_publish'
                     WHERE provider = 'twitch'
@@ -1294,6 +1549,44 @@ def _mark_clip_published(
         print(
             "CLIP HISTORY DB ERROR | "
             f"operation=publish_complete | clip_id={clip_id} | error={error!r}"
+        )
+        return False
+
+
+def _mark_clip_uploaded_to_inbox(
+    clip: dict[str, object],
+    publish_id: str,
+) -> bool:
+    clip_id, _ = _normalized_twitch_identifiers(clip)
+    if not DATABASE_URL:
+        return True
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE twitch_clip_history SET
+                        status = 'uploaded_to_inbox',
+                        provider_publish_id = %s,
+                        tiktok_publish_mode = 'draft',
+                        tiktok_post_status = 'PROCESSING_UPLOAD',
+                        tiktok_last_status_check = NULL,
+                        failure_stage = NULL
+                    WHERE provider = 'twitch' AND clip_id = %s
+                      AND status = 'publishing'
+                    RETURNING clip_id
+                    """,
+                    (publish_id, clip_id),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        return row is not None
+    except Exception as error:
+        print(
+            "CLIP HISTORY DB ERROR | operation=draft_complete | "
+            f"clip_id={clip_id} | error={error!r}"
         )
         return False
 
@@ -1383,6 +1676,11 @@ def _backfill_clip_history(cursor: object) -> bool:
                             twitch_clip_history.failure_stage, EXCLUDED.failure_stage
                         ),
                         status = CASE
+                            WHEN twitch_clip_history.status IN (
+                                'ready_for_review', 'approved', 'scheduled',
+                                'publishing', 'uploaded_to_inbox', 'published',
+                                'publish_failed', 'rejected', 'archived'
+                            ) THEN twitch_clip_history.status
                             WHEN CASE twitch_clip_history.status
                                 WHEN 'published' THEN 9 WHEN 'generated' THEN 8
                                 WHEN 'publishing' THEN 7
@@ -1460,7 +1758,9 @@ def _load_clip_history_exclusions() -> tuple[set[str], set[str], bool]:
                         status IN (
                             'fully_evaluated', 'rejected_low_score',
                             'generated', 'publishing', 'published',
-                            'intentionally_skipped'
+                            'intentionally_skipped', 'ready_for_review',
+                            'approved', 'scheduled', 'uploaded_to_inbox',
+                            'publish_failed', 'rejected', 'archived'
                         )
                         OR (
                             status = 'processing'
@@ -2853,6 +3153,125 @@ async def upload_tiktok_draft(video_path: str) -> dict:
     }
 
 
+async def _get_tiktok_creator_info() -> dict[str, object]:
+    token_data = _load_provider_token_data("tiktok", TIKTOK_USER_TOKEN_FILE)
+    access_token = _extract_tiktok_token_fields(token_data or {}).get("access_token")
+    if not access_token:
+        raise _reconnect_tiktok_exception()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            "https://open.tiktokapis.com/v2/post/publish/creator_info/query/",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json; charset=UTF-8",
+            },
+            json={},
+        )
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail="TikTok creator publishing capabilities are unavailable.",
+        )
+    data = response.json().get("data", {})
+    print(
+        "TIKTOK CREATOR INFO | "
+        f"max_duration={data.get('max_video_post_duration_sec', 'unknown')}"
+    )
+    return data
+
+
+async def _poll_one_tiktok_post_status() -> None:
+    if not DATABASE_URL:
+        return
+    interval_seconds = _bounded_environment_int(
+        "TIKTOK_STATUS_POLL_INTERVAL_SECONDS", 30, 10
+    )
+    max_checks = _bounded_environment_int("TIKTOK_STATUS_MAX_CHECKS", 20, 1)
+    import psycopg
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE twitch_clip_history SET poll_claimed_at = NOW()
+                WHERE (provider, clip_id) = (
+                    SELECT provider, clip_id FROM twitch_clip_history
+                    WHERE status IN ('uploaded_to_inbox', 'publishing')
+                      AND provider_publish_id IS NOT NULL
+                      AND poll_check_count < %s
+                      AND (
+                          poll_claimed_at IS NULL
+                          OR poll_claimed_at < NOW() - INTERVAL '2 minutes'
+                      )
+                      AND (
+                          tiktok_last_status_check IS NULL
+                          OR tiktok_last_status_check
+                             < NOW() - (%s * INTERVAL '1 second')
+                      )
+                    ORDER BY publish_attempted_at LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING clip_id, provider_publish_id
+                """,
+                (max_checks, interval_seconds),
+            )
+            claimed = cursor.fetchone()
+        connection.commit()
+    if not claimed:
+        return
+    clip_id, publish_id = claimed
+    token_data = _load_provider_token_data("tiktok", TIKTOK_USER_TOKEN_FILE)
+    access_token = _extract_tiktok_token_fields(token_data or {}).get("access_token")
+    if not access_token:
+        return
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            "https://open.tiktokapis.com/v2/post/publish/status/fetch/",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json; charset=UTF-8",
+            },
+            json={"publish_id": publish_id},
+        )
+    if response.status_code != 200:
+        print(f"TIKTOK POST STATUS | clip_id={clip_id} | http={response.status_code}")
+        return
+    data = response.json().get("data", {})
+    post_status = str(data.get("status") or "UNKNOWN")
+    failure_reason = str(data.get("fail_reason") or "")
+    print(f"TIKTOK POST STATUS | clip_id={clip_id} | status={post_status}")
+    completed = post_status == "PUBLISH_COMPLETE"
+    failed = post_status in {"FAILED", "PUBLISH_FAILED"}
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE twitch_clip_history SET
+                    status = CASE WHEN %s THEN 'published'
+                                  WHEN %s THEN 'publish_failed'
+                                  ELSE status END,
+                    tiktok_post_status = %s,
+                    tiktok_failure_reason = NULLIF(%s, ''),
+                    tiktok_last_status_check = NOW(),
+                    poll_check_count = poll_check_count + 1,
+                    tiktok_published_at = CASE WHEN %s THEN NOW()
+                                              ELSE tiktok_published_at END,
+                    published_at = CASE WHEN %s THEN NOW() ELSE published_at END,
+                    poll_claimed_at = NULL
+                WHERE provider = 'twitch' AND clip_id = %s
+                """,
+                (
+                    completed, failed, post_status, failure_reason,
+                    completed, completed, clip_id,
+                ),
+            )
+        connection.commit()
+    if completed:
+        print(f"TIKTOK POST COMPLETE | clip_id={clip_id}")
+    elif failed:
+        print(f"TIKTOK POST FAILED | clip_id={clip_id} | reason={failure_reason}")
+
+
 @app.get("/auth/twitch/validate")
 async def validate_twitch_token():
     access_token = get_twitch_user_access_token()
@@ -2971,19 +3390,475 @@ def delete_creator(channel_name: str):
     return {
         "message": f"{clean_channel} was removed from monitoring.",
     }
-@app.get("/api/clips")
-async def get_clips():
-    clips_file = Path(__file__).resolve().parent / "clips.json"
+def _queue_row_to_dict(row: tuple[object, ...]) -> dict[str, object]:
+    keys = (
+        "id", "twitch_clip_id", "public_url", "creator", "title", "game",
+        "score", "status", "video_path", "raw_video_path", "object_key",
+        "durable_url", "ai_post_caption", "ai_hashtags",
+        "ai_tiktok_description", "caption_generation_version",
+        "duration_profile", "requested_duration", "actual_duration",
+        "scheduled_for", "generated_at", "tiktok_publish_id",
+        "tiktok_publish_mode", "tiktok_post_status", "tiktok_failure_reason",
+        "rights_status",
+    )
+    return dict(zip(keys, row))
 
+
+def _paginate_items(
+    items: list[dict[str, object]],
+    page: int,
+    limit: int,
+) -> dict[str, object]:
+    start = (page - 1) * limit
+    return {
+        "items": items[start:start + limit],
+        "total": len(items),
+        "page": page,
+        "limit": limit,
+        "has_more": start + limit < len(items),
+    }
+
+
+def _persist_generated_clip_record(clip: dict[str, object]) -> bool:
+    if not DATABASE_URL:
+        return True
+    clip_id, clip_url = _normalized_twitch_identifiers(clip)
+    if not clip_id:
+        return False
     try:
-        with clips_file.open("r", encoding="utf-8") as file:
-            return json.load(file)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE twitch_clip_history SET
+                        generated_clip_id = %s,
+                        display_title = %s,
+                        creator_name = COALESCE(creator_name, %s),
+                        category = %s,
+                        viral_score = %s,
+                        status = 'ready_for_review',
+                        local_video_path = %s,
+                        raw_video_path = %s,
+                        object_key = %s,
+                        durable_url = %s,
+                        ai_post_caption = %s,
+                        ai_hashtags = %s::jsonb,
+                        ai_tiktok_description = %s,
+                        caption_generation_version = %s,
+                        transcript = %s,
+                        duration_profile = %s,
+                        requested_duration = %s,
+                        actual_duration = %s,
+                        longform_eligible_reason = %s,
+                        longform_rejection_reason = %s,
+                        generated_at = COALESCE(generated_at, NOW()),
+                        title_version = COALESCE(title_version, 'title-v2'),
+                        source_creator_id = COALESCE(source_creator_id, creator_id),
+                        source_platform = COALESCE(source_platform, 'twitch'),
+                        rights_status = COALESCE(rights_status, 'unknown')
+                    WHERE provider = 'twitch' AND clip_id = %s
+                    RETURNING clip_id
+                    """,
+                    (
+                        clip.get("id"), clip.get("ai_title") or clip.get("title"),
+                        clip.get("creator"), clip.get("game"), clip.get("score"),
+                        clip.get("video_path"), clip.get("raw_video_path"),
+                        clip.get("object_key"), clip.get("durable_url"),
+                        clip.get("ai_post_caption"),
+                        json.dumps(clip.get("ai_hashtags") or []),
+                        clip.get("ai_tiktok_description"),
+                        clip.get("caption_generation_version"),
+                        clip.get("transcript"),
+                        clip.get("duration_profile"), clip.get("requested_duration"),
+                        clip.get("actual_duration"),
+                        clip.get("longform_eligible_reason"),
+                        clip.get("longform_rejection_reason"), clip_id,
+                    ),
+                )
+                saved = cursor.fetchone()
+            connection.commit()
+        return saved is not None
+    except Exception as error:
+        print(
+            "CLIP HISTORY DB ERROR | operation=generated_metadata | "
+            f"clip_id={clip_id} | error={error!r}"
+        )
+        return False
+
+
+@app.get("/api/clips")
+async def get_clips(
+    limit: int = Query(10, ge=1, le=100),
+    page: int = Query(1, ge=1),
+    status_filter: str = Query("", alias="status"),
+    creator: str = Query(""),
+):
+    if not DATABASE_URL:
+        clips_file = BASE_DIR / "clips.json"
+        try:
+            clips = json.loads(clips_file.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            clips = []
+        filtered = [
+            clip for clip in clips
+            if (not status_filter or str(clip.get("status", "")).lower() == status_filter.lower())
+            and (not creator or str(clip.get("creator", "")).lower() == creator.lower())
+        ]
+        filtered.reverse()
+        return _paginate_items(filtered, page, limit)
+    if not getattr(app.state, "clip_history_ready", False):
+        raise HTTPException(status_code=503, detail="Clip history is unavailable.")
+    clauses = ["provider = 'twitch'", "generated_clip_id IS NOT NULL"]
+    parameters: list[object] = []
+    if status_filter:
+        statuses = [item.strip() for item in status_filter.split(",") if item.strip()]
+        clauses.append("status = ANY(%s)")
+        parameters.append(statuses)
+    if creator:
+        clauses.append("LOWER(creator_name) = LOWER(%s)")
+        parameters.append(creator)
+    where_sql = " AND ".join(clauses)
+    try:
+        import psycopg
+        from psycopg import sql
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL("SELECT COUNT(*) FROM twitch_clip_history WHERE ")
+                    + sql.SQL(where_sql),
+                    parameters,
+                )
+                total = cursor.fetchone()[0]
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        SELECT generated_clip_id, clip_id, clip_url, creator_name,
+                               display_title, category, viral_score, status,
+                               local_video_path, raw_video_path, object_key, durable_url,
+                               ai_post_caption, ai_hashtags, ai_tiktok_description,
+                               caption_generation_version, duration_profile,
+                               requested_duration, actual_duration, scheduled_for,
+                               generated_at, provider_publish_id, tiktok_publish_mode,
+                               tiktok_post_status, tiktok_failure_reason, rights_status
+                        FROM twitch_clip_history WHERE
+                        """
+                    )
+                    + sql.SQL(where_sql)
+                    + sql.SQL(
+                        " ORDER BY generated_at DESC NULLS LAST, first_seen_at DESC "
+                        "LIMIT %s OFFSET %s"
+                    ),
+                    [*parameters, limit, (page - 1) * limit],
+                )
+                rows = cursor.fetchall()
+        return {
+            "items": [_queue_row_to_dict(row) for row in rows],
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "has_more": page * limit < total,
+        }
+    except Exception as error:
+        print(f"CLIP QUEUE LOAD FAILED | error={error!r}")
+        raise HTTPException(status_code=503, detail="Clip queue is unavailable.")
+
+
+@app.patch("/api/clips/{clip_id}")
+async def update_clip_queue_item(clip_id: str, payload: dict):
+    allowed_statuses = {
+        "ready_for_review", "approved", "scheduled", "rejected", "archived",
+        "publish_failed",
+    }
+    requested_status = str(payload.get("status") or "").strip().lower()
+    if requested_status and requested_status not in allowed_statuses:
+        raise HTTPException(status_code=400, detail="Unsupported clip status.")
+    hashtags = payload.get("ai_hashtags")
+    if hashtags is not None and not isinstance(hashtags, list):
+        raise HTTPException(status_code=400, detail="ai_hashtags must be a list.")
+    if not DATABASE_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="Durable queue actions require PostgreSQL.",
+        )
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE twitch_clip_history SET
+                        status = COALESCE(NULLIF(%s, ''), status),
+                        ai_post_caption = COALESCE(%s, ai_post_caption),
+                        ai_hashtags = COALESCE(%s::jsonb, ai_hashtags),
+                        ai_tiktok_description = COALESCE(
+                            %s, ai_tiktok_description
+                        ),
+                        scheduled_for = CASE
+                            WHEN %s = 'scheduled' THEN %s::timestamptz
+                            WHEN %s = 'ready_for_review' THEN NULL
+                            ELSE scheduled_for
+                        END,
+                        approved_at = CASE WHEN %s = 'approved' THEN NOW()
+                            ELSE approved_at END,
+                        archived_at = CASE WHEN %s = 'archived' THEN NOW()
+                            WHEN %s = 'ready_for_review' THEN NULL
+                            ELSE archived_at END
+                    WHERE generated_clip_id = %s
+                    RETURNING status
+                    """,
+                    (
+                        requested_status,
+                        payload.get("ai_post_caption"),
+                        json.dumps(hashtags) if hashtags is not None else None,
+                        payload.get("ai_tiktok_description"),
+                        requested_status, payload.get("scheduled_for"),
+                        requested_status, requested_status, requested_status,
+                        requested_status, clip_id,
+                    ),
+                )
+                row = cursor.fetchone()
+            connection.commit()
+        if not row:
+            raise HTTPException(status_code=404, detail="Clip not found.")
+        return {"success": True, "id": clip_id, "status": row[0]}
+    except HTTPException:
+        raise
+    except Exception as error:
+        print(f"CLIP QUEUE UPDATE FAILED | clip_id={clip_id} | error={error!r}")
+        raise HTTPException(status_code=503, detail="Clip update could not be saved.")
+
+
+@app.post("/api/clips/{clip_id}/caption/regenerate")
+async def regenerate_clip_caption(clip_id: str):
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="PostgreSQL is required.")
+    import psycopg
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT creator_name, category, generated_clip_id, transcript
+                FROM twitch_clip_history WHERE generated_clip_id = %s
+                """,
+                (clip_id,),
+            )
+            row = cursor.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Clip not found.")
+    transcript = str(row[3] or "")
+    started_at = time.perf_counter()
+    package = generate_tiktok_caption_package(transcript, str(row[0] or ""), str(row[1] or ""))
+    _log_performance_timing(
+        stage="caption_hashtag_generation",
+        elapsed_seconds=time.perf_counter() - started_at,
+    )
+    package["ai_tiktok_description"] = package.get("ai_tiktok_description", "")
+    await update_clip_queue_item(clip_id, package)
+    return package
+
+
+@app.get("/api/analytics")
+async def get_clip_analytics():
+    if not DATABASE_URL:
+        return {
+            "generated_count": 0, "unpublished_count": 0,
+            "published_count": 0, "publish_failures": 0,
+            "short_count": 0, "long_count": 0,
+            "average_viral_score": 0, "top_creators": [],
+        }
+    import psycopg
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT COUNT(*) FILTER (WHERE generated_clip_id IS NOT NULL),
+                       COUNT(*) FILTER (WHERE status IN (
+                           'ready_for_review','approved','scheduled','publish_failed'
+                       )),
+                       COUNT(*) FILTER (WHERE status = 'published'),
+                       COUNT(*) FILTER (WHERE status = 'publish_failed'),
+                       COUNT(*) FILTER (WHERE duration_profile = 'short'),
+                       COUNT(*) FILTER (WHERE duration_profile = 'long'),
+                       COALESCE(AVG(viral_score) FILTER (
+                           WHERE generated_clip_id IS NOT NULL
+                       ), 0)
+                FROM twitch_clip_history WHERE provider = 'twitch'
+                """
+            )
+            counts = cursor.fetchone()
+            cursor.execute(
+                """
+                SELECT creator_name, COUNT(*) FROM twitch_clip_history
+                WHERE generated_clip_id IS NOT NULL
+                GROUP BY creator_name ORDER BY COUNT(*) DESC LIMIT 10
+                """
+            )
+            creators = cursor.fetchall()
+    return {
+        "generated_count": counts[0], "unpublished_count": counts[1],
+        "published_count": counts[2], "publish_failures": counts[3],
+        "short_count": counts[4], "long_count": counts[5],
+        "average_viral_score": float(counts[6]),
+        "top_creators": [{"creator": row[0], "count": row[1]} for row in creators],
+    }
+
+
+def _default_publish_settings() -> dict[str, object]:
+    configured_mode = os.getenv("TIKTOK_POST_MODE", "draft").lower()
+    return {
+        "post_mode": "draft" if configured_mode != "draft" else configured_mode,
+        "auto_publish_enabled": False,
+        "auto_publish_approved": False,
+        "daily_limit": _bounded_environment_int(
+            "AUTO_PUBLISH_DAILY_LIMIT", 2, 0
+        ),
+        "min_gap_minutes": _bounded_environment_int(
+            "AUTO_PUBLISH_MIN_GAP_MINUTES", 180, 0
+        ),
+        "timezone": os.getenv("AUTO_PUBLISH_TIMEZONE", "UTC"),
+        "privacy_level": "",
+        "allow_comments": True,
+        "allow_duet": True,
+        "allow_stitch": True,
+        "longform_target_percent": _bounded_environment_int(
+            "AUTO_CLIP_LONGFORM_TARGET_PERCENT", 30, 0, 100
+        ),
+        "direct_post_available": False,
+        "published_media_retention_days": _published_media_retention_days(),
+        "object_storage_enabled": object_storage_enabled(),
+    }
+
+
+@app.get("/api/settings/publishing")
+async def get_publish_settings():
+    defaults = _default_publish_settings()
+    if not DATABASE_URL:
+        return defaults
+    import psycopg
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT post_mode, auto_publish_enabled, auto_publish_approved,
+                       daily_limit, min_gap_minutes, timezone, privacy_level,
+                       allow_comments, allow_duet, allow_stitch,
+                       longform_target_percent
+                FROM pulseai_settings WHERE singleton = TRUE
+                """
+            )
+            row = cursor.fetchone()
+    if not row:
+        return defaults
+    keys = list(defaults)[:11]
+    return {
+        **defaults,
+        **dict(zip(keys, row)),
+        "direct_post_available": False,
+    }
+
+
+@app.put("/api/settings/publishing")
+async def save_publish_settings(payload: dict):
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="PostgreSQL is required.")
+    post_mode = str(payload.get("post_mode") or "draft").lower()
+    if post_mode not in {"draft", "direct"}:
+        raise HTTPException(status_code=400, detail="Invalid post mode.")
+    if post_mode == "direct":
+        raise HTTPException(
+            status_code=409,
+            detail="Direct Post is unavailable until video.publish is approved.",
+        )
+    auto_enabled = bool(payload.get("auto_publish_enabled", False))
+    auto_approved = bool(payload.get("auto_publish_approved", False))
+    if auto_enabled and not auto_approved:
+        raise HTTPException(
+            status_code=400,
+            detail="Explicit auto-publish approval is required.",
+        )
+    import psycopg
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO pulseai_settings (
+                    singleton, post_mode, auto_publish_enabled,
+                    auto_publish_approved, daily_limit, min_gap_minutes,
+                    timezone, privacy_level, allow_comments, allow_duet,
+                    allow_stitch, longform_target_percent
+                ) VALUES (
+                    TRUE, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                ON CONFLICT (singleton) DO UPDATE SET
+                    post_mode = EXCLUDED.post_mode,
+                    auto_publish_enabled = EXCLUDED.auto_publish_enabled,
+                    auto_publish_approved = EXCLUDED.auto_publish_approved,
+                    daily_limit = EXCLUDED.daily_limit,
+                    min_gap_minutes = EXCLUDED.min_gap_minutes,
+                    timezone = EXCLUDED.timezone,
+                    privacy_level = EXCLUDED.privacy_level,
+                    allow_comments = EXCLUDED.allow_comments,
+                    allow_duet = EXCLUDED.allow_duet,
+                    allow_stitch = EXCLUDED.allow_stitch,
+                    longform_target_percent = EXCLUDED.longform_target_percent,
+                    updated_at = NOW()
+                """,
+                (
+                    post_mode, auto_enabled, auto_approved,
+                    max(0, int(payload.get("daily_limit", 2))),
+                    max(0, int(payload.get("min_gap_minutes", 180))),
+                    str(payload.get("timezone") or "UTC"),
+                    payload.get("privacy_level"),
+                    bool(payload.get("allow_comments", True)),
+                    bool(payload.get("allow_duet", True)),
+                    bool(payload.get("allow_stitch", True)),
+                    max(0, min(100, int(payload.get("longform_target_percent", 30)))),
+                ),
+            )
+        connection.commit()
+    return await get_publish_settings()
 
 
 @app.get("/api/clips/{clip_id}/video")
 async def get_clip_video(clip_id: str, download: int = 0):
+    if DATABASE_URL:
+        try:
+            import psycopg
+
+            with psycopg.connect(DATABASE_URL) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT durable_url, local_video_path
+                        FROM twitch_clip_history
+                        WHERE generated_clip_id = %s
+                        """,
+                        (clip_id,),
+                    )
+                    media_row = cursor.fetchone()
+            if media_row:
+                durable_url, local_path = media_row
+                if durable_url:
+                    return RedirectResponse(str(durable_url))
+                if local_path:
+                    resolved_video_path = _resolve_allowed_video_path(local_path)
+                    return FileResponse(
+                        path=str(resolved_video_path),
+                        media_type="video/mp4",
+                        filename=f"{clip_id}.mp4" if download == 1 else None,
+                    )
+        except HTTPException:
+            raise
+        except Exception as error:
+            print(f"CLIP MEDIA LOOKUP FAILED | clip_id={clip_id} | error={error!r}")
     clips_file = BASE_DIR / "clips.json"
 
     try:
@@ -3023,12 +3898,38 @@ async def publish_clip_to_tiktok(clip: dict):
 
     matching_clip_index = _find_clip_index_by_stable_identifier(clips, clip)
     if matching_clip_index is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Clip not found in clips storage.",
-        )
+        matching_clip = None
+        if DATABASE_URL and clip.get("id"):
+            import psycopg
 
-    matching_clip = clips[matching_clip_index]
+            with psycopg.connect(DATABASE_URL) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT generated_clip_id, clip_id, clip_url, creator_name,
+                               display_title, local_video_path, durable_url,
+                               ai_tiktok_description, status, actual_duration
+                        FROM twitch_clip_history
+                        WHERE generated_clip_id = %s
+                        """,
+                        (clip.get("id"),),
+                    )
+                    row = cursor.fetchone()
+            if row:
+                matching_clip = {
+                    "id": row[0], "twitch_clip_id": row[1],
+                    "public_url": row[2], "creator": row[3],
+                    "title": row[4], "video_path": row[5],
+                    "durable_url": row[6], "ai_tiktok_description": row[7],
+                    "status": row[8], "actual_duration": row[9],
+                }
+        if matching_clip is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Clip not found in durable queue.",
+            )
+    else:
+        matching_clip = clips[matching_clip_index]
     if _is_clip_published(matching_clip):
         raise HTTPException(
             status_code=409,
@@ -3042,17 +3943,32 @@ async def publish_clip_to_tiktok(clip: dict):
             detail="Clip has already been published.",
         )
 
-    video_path = matching_clip.get("video_path")
-    if not video_path:
+    video_path = str(matching_clip.get("video_path") or "")
+    durable_url = str(matching_clip.get("durable_url") or "")
+    if not video_path and not durable_url:
         raise HTTPException(
             status_code=400,
-            detail="Stored clip is missing video_path.",
+            detail="Stored clip has no local or durable media.",
         )
 
-    if not Path(video_path).is_file():
+    if video_path and not Path(video_path).is_file() and not durable_url:
         raise HTTPException(
             status_code=404,
             detail=f"Video file not found: {video_path}",
+        )
+
+    creator_info = await _get_tiktok_creator_info()
+    allowed_duration = int(
+        creator_info.get("max_video_post_duration_sec") or 0
+    )
+    actual_duration = float(matching_clip.get("actual_duration") or 0)
+    if allowed_duration and actual_duration > allowed_duration:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"TikTok allows up to {allowed_duration} seconds, but this clip "
+                f"is {actual_duration:.1f} seconds."
+            ),
         )
 
     if not _claim_clip_for_publishing(matching_clip):
@@ -3061,7 +3977,28 @@ async def publish_clip_to_tiktok(clip: dict):
             detail="Clip publishing is already in progress or is not eligible.",
         )
 
+    print("TIKTOK DRAFT UPLOAD START | clip_id=" + str(matching_clip.get("id")))
+    temporary_publish_path: Path | None = None
     try:
+        if not video_path or not Path(video_path).is_file():
+            downloads_dir = (BASE_DIR / "downloads").resolve()
+            downloads_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                prefix="durable_publish_",
+                suffix=".mp4",
+                dir=downloads_dir,
+                delete=False,
+            ) as temporary_media:
+                temporary_publish_path = Path(temporary_media.name)
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream("GET", durable_url) as response:
+                    response.raise_for_status()
+                    with temporary_publish_path.open("wb") as media_file:
+                        async for chunk in response.aiter_bytes(1024 * 1024):
+                            media_file.write(chunk)
+            if temporary_publish_path.stat().st_size <= 0:
+                raise RuntimeError("Durable media download was empty.")
+            video_path = str(temporary_publish_path)
         tiktok_result = await upload_tiktok_draft(video_path)
     except Exception as error:
         restored = _restore_clip_after_publish_failure(matching_clip)
@@ -3071,6 +4008,15 @@ async def publish_clip_to_tiktok(clip: dict):
             f"history_restored={restored} | error={error!r}"
         )
         raise
+    finally:
+        if temporary_publish_path is not None:
+            try:
+                temporary_publish_path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                print(
+                    "DURABLE PUBLISH TEMP CLEANUP FAILED | "
+                    f"path={temporary_publish_path} | error={cleanup_error!r}"
+                )
 
     upload_result = tiktok_result.get("upload_result")
     provider_publish_id = str(
@@ -3082,7 +4028,7 @@ async def publish_clip_to_tiktok(clip: dict):
         )
         or f"confirmed:{datetime.now(timezone.utc).isoformat()}"
     )
-    if not _mark_clip_published(matching_clip, provider_publish_id):
+    if not _mark_clip_uploaded_to_inbox(matching_clip, provider_publish_id):
         print(
             "TIKTOK PUBLISH SUCCEEDED BUT LOCAL STATE FAILED | "
             f"clip_id={matching_clip.get('id')} | "
@@ -3090,7 +4036,7 @@ async def publish_clip_to_tiktok(clip: dict):
         )
         raise HTTPException(
             status_code=503,
-            detail="TikTok accepted the upload, but publishing state could not be saved.",
+            detail="TikTok accepted the draft, but upload state could not be saved.",
         )
 
     try:
@@ -3099,14 +4045,11 @@ async def publish_clip_to_tiktok(clip: dict):
             matching_clip,
         )
         if updated_clip_index is not None:
-            clips[updated_clip_index]["status"] = "Published"
+            clips[updated_clip_index]["status"] = "Uploaded to inbox"
             with clips_file.open("w", encoding="utf-8") as file:
                 json.dump(clips, file, indent=2)
             matching_clip = clips[updated_clip_index]
 
-        if not _contains_clip_with_same_identifier(published, matching_clip):
-            published.append(matching_clip)
-            save_published(published)
     except Exception as error:
         print(
             "TIKTOK PUBLISH SUCCEEDED BUT LOCAL STATE FAILED | "
@@ -3117,7 +4060,7 @@ async def publish_clip_to_tiktok(clip: dict):
 
     return {
         "success": True,
-        "message": f"Published '{matching_clip.get('title', 'clip')}' successfully!",
+        "message": f"Uploaded '{matching_clip.get('title', 'clip')}' to TikTok inbox.",
         "published_count": len(published),
         "publish_id": tiktok_result.get("publish_id"),
         "upload_result": tiktok_result.get("upload_result"),
@@ -3194,6 +4137,17 @@ async def create_clip(clip: dict):
     "transcript": clip.get("transcript", ""),
     "ai_title": clip.get("ai_title", ""),
     "ai_description": clip.get("ai_description", ""),
+    "ai_post_caption": clip.get("ai_post_caption", ""),
+    "ai_hashtags": clip.get("ai_hashtags", []),
+    "ai_tiktok_description": clip.get("ai_tiktok_description", ""),
+    "caption_generation_version": clip.get("caption_generation_version", ""),
+    "duration_profile": clip.get("duration_profile", "short"),
+    "requested_duration": clip.get("requested_duration"),
+    "actual_duration": clip.get("actual_duration", clip.get("duration")),
+    "longform_eligible_reason": clip.get("longform_eligible_reason", ""),
+    "longform_rejection_reason": clip.get("longform_rejection_reason", ""),
+    "object_key": clip.get("object_key", ""),
+    "durable_url": clip.get("durable_url", ""),
 }
 
     clips.append(new_clip)
@@ -3698,6 +4652,19 @@ async def _run_auto_generate_clip_pipeline():
         stage="description_generation",
         elapsed_seconds=time.perf_counter() - description_generation_started_at,
     )
+    caption_generation_started_at = time.perf_counter()
+    best_clip.update(
+        generate_tiktok_caption_package(
+            str(best_clip.get("transcript") or ""),
+            str(best_clip.get("creator") or ""),
+            str(best_clip.get("game") or ""),
+        )
+    )
+    _log_performance_timing(
+        stage="caption_hashtag_generation",
+        elapsed_seconds=time.perf_counter() - caption_generation_started_at,
+    )
+    best_clip.update(_select_duration_profile(best_clip))
     best_clip["raw_video_path"] = best_clip.get("video_path")
 
     try:
@@ -3723,6 +4690,9 @@ async def _run_auto_generate_clip_pipeline():
                 title_for_overlay,
                 caption_segments,
                 emphasis_moments=emphasis_moments,
+                selected_duration_seconds=float(
+                    best_clip.get("requested_duration") or 0
+                ),
             )
             _log_performance_timing(
                 stage="ffmpeg_editing",
@@ -3742,6 +4712,22 @@ async def _run_auto_generate_clip_pipeline():
         print(traceback.format_exc())
         best_clip["video_path"] = best_clip.get("raw_video_path")
 
+    if object_storage_enabled():
+        try:
+            storage_result = await asyncio.to_thread(
+                upload_video,
+                str(best_clip.get("video_path") or ""),
+                str(best_clip.get("twitch_clip_id") or uuid.uuid4()),
+            )
+            best_clip.update(storage_result)
+        except Exception:
+            # Keep local media and fail persistence closed when durable storage
+            # was explicitly enabled but could not confirm the upload.
+            raise HTTPException(
+                status_code=503,
+                detail="Rendered clip could not be uploaded to durable storage.",
+            )
+
     _log_memory_check(
         stage="before_clip_persistence",
         candidate_number=int(best_clip.get("candidate_number", 0) or 0),
@@ -3757,10 +4743,11 @@ async def _run_auto_generate_clip_pipeline():
             f"video_path={best_clip.get('video_path')}"
         )
         raise
-    if not _write_terminal_clip_history(best_clip, "generated"):
+    persisted_clip = result["clip"]
+    if not _persist_generated_clip_record(persisted_clip):
         raise HTTPException(
             status_code=503,
-            detail="Clip was persisted, but its history status could not be saved.",
+            detail="Clip was persisted, but its durable queue record could not be saved.",
         )
     _log_performance_timing(
         stage="persistence",

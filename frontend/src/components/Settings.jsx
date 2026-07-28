@@ -1,105 +1,101 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL;
 
 function Settings() {
-  const [settings, setSettings] = useState({
-    autoPublish: false,
-    clipDetection: true,
-    twitchNotifications: true,
-  });
+  const [settings, setSettings] = useState(null);
+  const [message, setMessage] = useState("");
 
-  const [saved, setSaved] = useState(false);
+  useEffect(() => {
+    fetch(`${API_BASE_URL}/api/settings/publishing`)
+      .then((response) => response.json())
+      .then(setSettings)
+      .catch(() => setMessage("Unable to load settings."));
+  }, []);
 
-  const updateSetting = (name) => {
-    setSettings((current) => ({
-      ...current,
-      [name]: !current[name],
-    }));
-
-    setSaved(false);
+  const update = (name, value) => {
+    setSettings((current) => ({ ...current, [name]: value }));
+    setMessage("");
   };
 
-  const reconnectTikTok = () => {
-    window.location.assign(`${API_BASE_URL}/api/tiktok/login`);
+  const save = async () => {
+    const response = await fetch(`${API_BASE_URL}/api/settings/publishing`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(settings),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setMessage(data.detail || "Unable to save settings.");
+      return;
+    }
+    setSettings(data);
+    setMessage("Settings saved.");
   };
+
+  if (!settings) return <p>Loading settings…</p>;
 
   return (
     <div>
       <h1>Settings</h1>
-      <p>Configure your PulseAI workspace.</p>
-
-      <div
-        style={{
-          marginTop: "24px",
-          padding: "24px",
-          border: "1px solid #3d4d7a",
-          borderRadius: "12px",
-          background: "#1a2342",
-        }}
-      >
-        <label style={{ display: "block", marginBottom: "20px" }}>
+      <p>Publishing remains in Draft Upload mode until Direct Post is approved.</p>
+      <p>Clips with unknown rights should be reviewed before automatic publishing.</p>
+      <section style={{ marginTop: 24, padding: 24, background: "#1a2342", borderRadius: 12 }}>
+        <label>Post mode{" "}
+          <select
+            value={settings.post_mode}
+            onChange={(event) => update("post_mode", event.target.value)}
+          >
+            <option value="draft">Draft Upload</option>
+            <option value="direct" disabled={!settings.direct_post_available}>
+              Direct Post (unavailable)
+            </option>
+          </select>
+        </label>
+        <label style={{ display: "block", marginTop: 16 }}>
           <input
             type="checkbox"
-            checked={settings.autoPublish}
-            onChange={() => updateSetting("autoPublish")}
-          />{" "}
-          Auto Publish Clips
+            checked={settings.auto_publish_approved}
+            onChange={(event) => update("auto_publish_approved", event.target.checked)}
+          /> Explicitly approve automatic publishing
         </label>
-
-        <label style={{ display: "block", marginBottom: "20px" }}>
+        <label style={{ display: "block", marginTop: 16 }}>
           <input
             type="checkbox"
-            checked={settings.clipDetection}
-            onChange={() => updateSetting("clipDetection")}
-          />{" "}
-          AI Clip Detection
+            checked={settings.auto_publish_enabled}
+            onChange={(event) => update("auto_publish_enabled", event.target.checked)}
+          /> Enable automatic publishing
         </label>
-
-        <label style={{ display: "block", marginBottom: "20px" }}>
+        {[
+          ["daily_limit", "Daily limit"],
+          ["min_gap_minutes", "Minimum gap (minutes)"],
+          ["longform_target_percent", "Long-form target (%)"],
+        ].map(([name, label]) => (
+          <label key={name} style={{ display: "block", marginTop: 16 }}>
+            {label}{" "}
+            <input
+              type="number"
+              value={settings[name]}
+              onChange={(event) => update(name, Number(event.target.value))}
+            />
+          </label>
+        ))}
+        <label style={{ display: "block", marginTop: 16 }}>
+          Timezone{" "}
           <input
-            type="checkbox"
-            checked={settings.twitchNotifications}
-            onChange={() => updateSetting("twitchNotifications")}
-          />{" "}
-          Twitch Notifications
+            value={settings.timezone}
+            onChange={(event) => update("timezone", event.target.value)}
+          />
         </label>
-
+        <button onClick={save} style={{ marginTop: 20 }}>Save Settings</button>
         <button
-          onClick={() => setSaved(true)}
-          style={{
-            padding: "10px 18px",
-            border: "none",
-            borderRadius: "8px",
-            cursor: "pointer",
-            fontWeight: "bold",
-          }}
-        >
-          Save Settings
-        </button>
-
-        <button
-          onClick={reconnectTikTok}
-          style={{
-            marginLeft: "12px",
-            padding: "10px 18px",
-            border: "1px solid #3d4d7a",
-            borderRadius: "8px",
-            cursor: "pointer",
-            fontWeight: "bold",
-            background: "#243357",
-            color: "#ffffff",
-          }}
+          onClick={() => window.location.assign(`${API_BASE_URL}/api/tiktok/login`)}
+          style={{ marginLeft: 12 }}
         >
           Connect / Reconnect TikTok
         </button>
-
-        {saved && (
-          <p style={{ marginTop: "16px" }}>
-            ✅ Settings saved
-          </p>
-        )}
-      </div>
+        {message && <p>{message}</p>}
+      </section>
     </div>
   );
 }

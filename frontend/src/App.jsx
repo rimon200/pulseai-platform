@@ -7,6 +7,7 @@ import Publishing from "./components/Publishing";
 import Performance from "./components/Performance";
 import AIAgents from "./components/AIAgents";
 import Settings from "./components/Settings";
+import UnpublishedQueue from "./components/UnpublishedQueue";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL;
 
@@ -28,6 +29,7 @@ function App() {
     { name: "Mission Control", icon: "🏠" },
     { name: "Live Streams", icon: "🔴" },
     { name: "AI Clips", icon: "✂️" },
+    { name: "Unpublished Queue", icon: "📋" },
     { name: "Publishing", icon: "📤" },
     { name: "Performance", icon: "📈" },
     { name: "AI Agents", icon: "🤖" },
@@ -68,7 +70,7 @@ function App() {
     }
 
     const data = await response.json();
-    setClips([...data].reverse().slice(0, 12));
+    setClips(Array.isArray(data) ? data : (data.items || []));
   } catch (error) {
     console.error(error);
     setClips([]);
@@ -390,6 +392,8 @@ function App() {
   clips={clips}
   setClips={setClips}
 />
+) : activePage === "Unpublished Queue" ? (
+  <UnpublishedQueue styles={styles} />
 ) : activePage === "Publishing" ? (
   <Publishing />
 ) : activePage === "Performance" ? (

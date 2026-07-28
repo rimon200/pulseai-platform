@@ -405,6 +405,7 @@ def create_tiktok_edited_video(
     transcript_segments: List[Dict[str, object]],
     output_path: Optional[str] = None,
     emphasis_moments: Optional[List[Dict[str, object]]] = None,
+    selected_duration_seconds: Optional[float] = None,
 ) -> str:
     ffmpeg_path = shutil.which("ffmpeg")
     ffprobe_path = shutil.which("ffprobe")
@@ -495,8 +496,10 @@ def create_tiktok_edited_video(
             "128k",
             "-movflags",
             "+faststart",
-            str(edited_path),
         ]
+        if selected_duration_seconds and selected_duration_seconds > 0:
+            command.extend(["-t", f"{selected_duration_seconds:.3f}"])
+        command.append(str(edited_path))
 
         print(
             "FFMPEG EDIT START | "

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL;
 const TIKTOK_RECONNECT_REQUIRED_MESSAGE = "TikTok authorization expired. Reconnect TikTok in Settings.";
@@ -9,6 +9,9 @@ const normalizeClipStatus = (status) => {
     return "Published";
   }
   if (value === "ready to review") {
+    return "Ready to review";
+  }
+  if (value === "ready_for_review") {
     return "Ready to review";
   }
   return "";
@@ -55,7 +58,19 @@ const clipsMatch = (left, right) => {
 function AIClips({ styles, clips, setClips }) {
   const [previewClipId, setPreviewClipId] = useState(null);
   const [previewErrors, setPreviewErrors] = useState({});
+  const [page, setPage] = useState(1);
+  const [hasMore, setHasMore] = useState(false);
   const reviewableClips = clips.filter(isReviewableClip);
+
+  useEffect(() => {
+    fetch(`${API_BASE_URL}/api/clips?limit=10&page=${page}&status=ready_for_review`)
+      .then((response) => response.json())
+      .then((data) => {
+        setClips(Array.isArray(data) ? data : (data.items || []));
+        setHasMore(Boolean(data.has_more));
+      })
+      .catch((error) => console.error("Could not load AI Clips page", error));
+  }, [page, setClips]);
 
   const getClipVideoUrl = (clipId, download = false) =>
     `${API_BASE_URL}/api/clips/${encodeURIComponent(clipId)}/video${
@@ -112,9 +127,7 @@ if (result.message) {
       const clipsResponse = await fetch(`${API_BASE_URL}/api/clips`);
 const updatedClips = await clipsResponse.json();
 
-if (Array.isArray(updatedClips)) {
-  setClips([...updatedClips].reverse().slice(0, 12));
-}
+setClips(Array.isArray(updatedClips) ? updatedClips : (updatedClips.items || []));
     } catch (error) {
     console.error(error);
     alert("Could not generate a clip.");
@@ -123,7 +136,7 @@ if (Array.isArray(updatedClips)) {
 
 const publishClip = async (clip) => {
   try {
-    if (!clip.video_path) {
+    if (!clip.video_path && !clip.durable_url) {
       alert("This clip is missing its local video file path.");
       return;
     }
@@ -350,6 +363,15 @@ return (
               No clips detected yet.
             </div>
           )}
+        </div>
+        <div style={{ marginTop: 20 }}>
+          <button disabled={page === 1} onClick={() => setPage(page - 1)}>
+            Previous
+          </button>
+          <span style={{ margin: "0 12px" }}>Page {page}</span>
+          <button disabled={!hasMore} onClick={() => setPage(page + 1)}>
+            Next
+          </button>
         </div>
       </section>
     </div>

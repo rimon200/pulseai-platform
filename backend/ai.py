@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import sys
 import time
@@ -243,6 +245,60 @@ Return only the description.
     )
 
     return response.output_text.strip()
+
+
+def generate_tiktok_caption_package(
+    transcript: str,
+    creator: str = "",
+    game: str = "",
+) -> dict[str, object]:
+    if not transcript.strip():
+        return {
+            "ai_post_caption": "",
+            "ai_hashtags": [],
+            "ai_tiktok_description": "",
+            "caption_generation_version": "caption-v1",
+        }
+    response = client.responses.create(
+        model="gpt-5-nano",
+        input=(
+            "Return JSON with keys caption and hashtags. Caption must be one or two "
+            "concise truthful sentences grounded only in the transcript/context. "
+            "Use a strong hook without misleading clickbait. Do not invent context, "
+            "defame the creator, or make sexual assumptions. Hashtags must be a JSON "
+            "array of 3 to 6 relevant tags, each beginning with #. Prefer creator, "
+            "game/category, event/theme, and Twitch/streamer tags. Avoid repeated "
+            "#fyp or generic #viral tags.\n"
+            f"Creator: {creator}\nGame: {game}\nTranscript:\n{transcript}"
+        ),
+    )
+    raw = response.output_text.strip()
+    try:
+        payload = json.loads(raw.removeprefix("```json").removesuffix("```").strip())
+    except (json.JSONDecodeError, AttributeError):
+        payload = {"caption": raw, "hashtags": []}
+    caption = _collapse_whitespace(str(payload.get("caption") or ""))
+    hashtags = []
+    for value in payload.get("hashtags", []) if isinstance(payload.get("hashtags"), list) else []:
+        tag = re.sub(r"[^A-Za-z0-9_]", "", str(value).lstrip("#"))
+        if tag and f"#{tag}" not in hashtags:
+            hashtags.append(f"#{tag}")
+    hashtags = hashtags[:6]
+    combined = " ".join(part for part in (caption, " ".join(hashtags)) if part)
+    while len(combined.encode("utf-16-le")) // 2 > 2200 and hashtags:
+        hashtags.pop()
+        combined = " ".join(part for part in (caption, " ".join(hashtags)) if part)
+    if len(combined.encode("utf-16-le")) // 2 > 2200:
+        combined = combined.encode("utf-16-le")[: 2198 * 2].decode(
+            "utf-16-le", errors="ignore"
+        ).rstrip()
+        caption = combined
+    return {
+        "ai_post_caption": caption,
+        "ai_hashtags": hashtags,
+        "ai_tiktok_description": combined,
+        "caption_generation_version": "caption-v1",
+    }
 
 def transcribe_video(video_path: str) -> str:
     transcript, _ = _transcribe_video_data(video_path)
