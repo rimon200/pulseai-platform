@@ -7,7 +7,7 @@ import re
 import secrets
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 import uuid
@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pathlib import Path
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 import subprocess
 import traceback
 from download_service import DownloadService
@@ -46,8 +46,10 @@ download_service = DownloadService()
 AUTO_CLIP_INTERVAL_SECONDS = 300
 AUTO_CLIP_MIN_SCORE = int(os.getenv("AUTO_CLIP_MIN_SCORE", "45"))
 AUTO_CLIP_CANDIDATE_COUNT = 3
+AUTO_CLIP_HISTORY_MAX_RETRIES = 2
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 app.state.tiktok_pkce_verifiers = {}
+app.state.clip_history_ready = False
 TIKTOK_RECONNECT_REQUIRED_MESSAGE = (
     "TikTok authorization expired. Reconnect TikTok in Settings."
 )
@@ -98,6 +100,97 @@ def _get_full_evaluation_count() -> int:
     except (TypeError, ValueError):
         configured_count = 2
     return max(1, min(configured_count, AUTO_CLIP_CANDIDATE_COUNT))
+
+
+def _bounded_environment_int(
+    variable_name: str,
+    default: int,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    try:
+        value = int(os.getenv(variable_name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    value = max(minimum, value)
+    return min(value, maximum) if maximum is not None else value
+
+
+def _processing_lease_minutes() -> int:
+    return _bounded_environment_int(
+        "AUTO_CLIP_PROCESSING_LEASE_MINUTES",
+        default=45,
+        minimum=5,
+    )
+
+
+def _publish_lease_minutes() -> int:
+    return _bounded_environment_int(
+        "AUTO_CLIP_PUBLISH_LEASE_MINUTES",
+        default=30,
+        minimum=5,
+    )
+
+
+def _twitch_max_pages() -> int:
+    return _bounded_environment_int(
+        "AUTO_CLIP_TWITCH_MAX_PAGES",
+        default=5,
+        minimum=1,
+        maximum=20,
+    )
+
+
+def _canonical_twitch_clip_id(value: object) -> str:
+    text = unquote(str(value or "").strip())
+    if not text:
+        return ""
+    parsed = urlparse(text if "://" in text else f"https://clips.twitch.tv/{text}")
+    host = parsed.netloc.lower().split(":", 1)[0]
+    path_parts = [part for part in parsed.path.split("/") if part]
+    clip_id = ""
+    query_clip = str(parse_qs(parsed.query).get("clip", [""])[0]).strip()
+    if query_clip and host in {
+        "clips.twitch.tv",
+        "www.clips.twitch.tv",
+        "player.twitch.tv",
+    }:
+        clip_id = query_clip
+    elif host in {"clips.twitch.tv", "www.clips.twitch.tv"} and path_parts:
+        clip_id = path_parts[0]
+    elif host in {"twitch.tv", "www.twitch.tv", "m.twitch.tv"}:
+        for marker in ("clip", "clips"):
+            if marker in path_parts:
+                marker_index = path_parts.index(marker)
+                if marker_index + 1 < len(path_parts):
+                    clip_id = path_parts[marker_index + 1]
+                    break
+    elif "://" not in text:
+        clip_id = text.split("?", 1)[0].split("#", 1)[0].strip("/")
+    clip_id = clip_id.strip()
+    return clip_id if re.fullmatch(r"[A-Za-z0-9_-]+", clip_id) else ""
+
+
+def _canonical_twitch_clip_url(clip_id_or_url: object) -> str:
+    clip_id = _canonical_twitch_clip_id(clip_id_or_url)
+    return f"https://clips.twitch.tv/{clip_id}" if clip_id else ""
+
+
+def _normalized_twitch_identifiers(clip: dict[str, object]) -> tuple[str, str]:
+    original_url = clip.get("public_url") or clip.get("url")
+    url_clip_id = _canonical_twitch_clip_id(original_url)
+    explicit_clip_id = (
+        _canonical_twitch_clip_id(clip.get("twitch_clip_id"))
+        or _canonical_twitch_clip_id(clip.get("id"))
+    )
+    if url_clip_id and explicit_clip_id and url_clip_id != explicit_clip_id:
+        print(
+            "CLIP HISTORY IDENTIFIER MISMATCH | "
+            f"explicit_clip_id={explicit_clip_id} | url_clip_id={url_clip_id}"
+        )
+        return "", ""
+    clip_id = url_clip_id or explicit_clip_id
+    return clip_id, _canonical_twitch_clip_url(clip_id)
 
 
 def _parse_twitch_created_at(value: object) -> datetime | None:
@@ -162,10 +255,7 @@ def _fast_prerank_candidates(
     }
 
     for candidate_index, twitch_clip in enumerate(twitch_clips, start=1):
-        clip_id = str(twitch_clip.get("id") or "").strip()
-        public_url = str(
-            twitch_clip.get("url") or f"https://clips.twitch.tv/{clip_id}"
-        ).strip()
+        clip_id, public_url = _normalized_twitch_identifiers(twitch_clip)
         title = str(twitch_clip.get("title") or "").strip()
         created_at = _parse_twitch_created_at(twitch_clip.get("created_at"))
         view_count = _nonnegative_int(twitch_clip.get("view_count"))
@@ -225,6 +315,7 @@ def _fast_prerank_candidates(
         ranked.append(
             {
                 "candidate_index": candidate_index,
+                "search_tier": int(twitch_clip.get("_search_tier", 1)),
                 "score": total_score,
                 "title_score": title_score,
                 "reasons": (
@@ -242,6 +333,7 @@ def _fast_prerank_candidates(
 
     ranked.sort(
         key=lambda item: (
+            -int(item["search_tier"]),
             float(item["score"]),
             -int(item["candidate_index"]),
         ),
@@ -434,6 +526,7 @@ def _fully_evaluate_candidate(
             "twitch_edit_url": twitch_clip.get("edit_url"),
             "public_url": public_url,
             "candidate_number": candidate_number,
+            "_search_tier": int(twitch_clip.get("_search_tier", 1)),
         }
 
         failure_stage = "download"
@@ -675,7 +768,13 @@ async def _auto_clip_loop():
 
 @app.on_event("startup")
 async def _start_auto_clip_task():
+    app.state.clip_history_ready = False
     _ensure_oauth_tokens_table()
+    if not _ensure_clip_history_table():
+        print("CLIP HISTORY INITIALIZATION FAILED")
+        return
+    app.state.clip_history_ready = True
+    print("CLIP HISTORY READY")
     if app.state.auto_clip_task is None or app.state.auto_clip_task.done():
         app.state.auto_clip_task = asyncio.create_task(_auto_clip_loop())
 
@@ -697,6 +796,703 @@ CREATORS_FILE = BASE_DIR / "creators.json"
 CREATOR_CURSOR_FILE = BASE_DIR / "creator_cursor.json"
 TWITCH_USER_TOKEN_FILE = BASE_DIR / "twitch_user_token.json"
 TIKTOK_USER_TOKEN_FILE = BASE_DIR / "tiktok_user_token.json"
+
+
+def _ensure_clip_history_table() -> bool:
+    if not DATABASE_URL:
+        return True
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(%s)",
+                    (22616960936427849,),
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS twitch_clip_history (
+                        provider TEXT NOT NULL DEFAULT 'twitch',
+                        clip_id TEXT NOT NULL,
+                        clip_url TEXT,
+                        creator_id TEXT,
+                        creator_name TEXT,
+                        created_at TIMESTAMPTZ,
+                        first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        last_processed_at TIMESTAMPTZ,
+                        status TEXT NOT NULL DEFAULT 'discovered',
+                        viral_score INTEGER,
+                        published_at TIMESTAMPTZ,
+                        publish_attempted_at TIMESTAMPTZ,
+                        provider_publish_id TEXT,
+                        failure_stage TEXT,
+                        retry_count INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (provider, clip_id)
+                    )
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE twitch_clip_history
+                    ADD COLUMN IF NOT EXISTS publish_attempted_at TIMESTAMPTZ
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE twitch_clip_history
+                    ADD COLUMN IF NOT EXISTS provider_publish_id TEXT
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS twitch_clip_history_status_idx
+                    ON twitch_clip_history (provider, status)
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS twitch_clip_history_creator_created_idx
+                    ON twitch_clip_history (creator_id, created_at DESC)
+                    """
+                )
+                cursor.execute(
+                    """
+                    SELECT provider, clip_id, clip_url, creator_id, creator_name,
+                           created_at, first_seen_at, last_processed_at, status,
+                           viral_score, published_at, publish_attempted_at,
+                           provider_publish_id, failure_stage, retry_count
+                    FROM twitch_clip_history
+                    WHERE provider = 'twitch'
+                    FOR UPDATE
+                    """
+                )
+                history_rows = cursor.fetchall()
+                status_precedence = {
+                    "published": 9,
+                    "generated": 8,
+                    "publishing": 7,
+                    "rejected_low_score": 6,
+                    "fully_evaluated": 5,
+                    "processing": 4,
+                    "failed": 3,
+                    "intentionally_skipped": 2,
+                    "discovered": 1,
+                }
+                reconciled_rows: dict[str, list[object]] = {}
+                duplicate_counts: dict[str, int] = {}
+                original_ids_by_canonical_id: dict[str, list[str]] = {}
+                for row in history_rows:
+                    canonical_id, canonical_url = _normalized_twitch_identifiers(
+                        {
+                            "twitch_clip_id": row[1],
+                            "public_url": row[2],
+                        }
+                    )
+                    if not canonical_id:
+                        canonical_id = _canonical_twitch_clip_id(row[2])
+                        canonical_url = _canonical_twitch_clip_url(canonical_id)
+                    if not canonical_id:
+                        invalid_key = f"invalid:{row[1]}"
+                        invalid_row = list(row)
+                        invalid_row[2] = None
+                        reconciled_rows[invalid_key] = invalid_row
+                        duplicate_counts[invalid_key] = 1
+                        cursor.execute(
+                            """
+                            UPDATE twitch_clip_history
+                            SET clip_url = NULL
+                            WHERE provider = 'twitch' AND clip_id = %s
+                            """,
+                            (row[1],),
+                        )
+                        continue
+                    original_ids_by_canonical_id.setdefault(canonical_id, []).append(
+                        str(row[1])
+                    )
+                    normalized_row = list(row)
+                    normalized_row[1] = canonical_id
+                    normalized_row[2] = canonical_url or None
+                    existing = reconciled_rows.get(canonical_id)
+                    if existing is None:
+                        reconciled_rows[canonical_id] = normalized_row
+                        duplicate_counts[canonical_id] = 1
+                        continue
+                    duplicate_counts[canonical_id] += 1
+                    existing_rank = status_precedence.get(str(existing[8]), 0)
+                    incoming_rank = status_precedence.get(str(normalized_row[8]), 0)
+                    survivor, other = (
+                        (normalized_row, existing)
+                        if incoming_rank > existing_rank
+                        else (existing, normalized_row)
+                    )
+                    survivor[6] = min(
+                        value for value in (existing[6], normalized_row[6]) if value is not None
+                    )
+                    survivor[7] = max(
+                        (value for value in (existing[7], normalized_row[7]) if value is not None),
+                        default=None,
+                    )
+                    survivor[10] = max(
+                        (value for value in (existing[10], normalized_row[10]) if value is not None),
+                        default=None,
+                    )
+                    survivor[14] = max(int(existing[14] or 0), int(normalized_row[14] or 0))
+                    for field_index in (3, 4, 5, 9, 11, 12, 13):
+                        if survivor[field_index] is None:
+                            survivor[field_index] = other[field_index]
+                    reconciled_rows[canonical_id] = survivor
+                for canonical_id, original_ids in original_ids_by_canonical_id.items():
+                    reconciled_row = reconciled_rows[canonical_id]
+                    if len(original_ids) == 1:
+                        cursor.execute(
+                            """
+                            UPDATE twitch_clip_history
+                            SET clip_id = %s, clip_url = %s
+                            WHERE provider = 'twitch' AND clip_id = %s
+                            """,
+                            (canonical_id, reconciled_row[2], original_ids[0]),
+                        )
+                        continue
+                    cursor.execute(
+                        """
+                        DELETE FROM twitch_clip_history
+                        WHERE provider = 'twitch' AND clip_id = ANY(%s)
+                        """,
+                        (original_ids,),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO twitch_clip_history (
+                            provider, clip_id, clip_url, creator_id, creator_name,
+                            created_at, first_seen_at, last_processed_at, status,
+                            viral_score, published_at, publish_attempted_at,
+                            provider_publish_id, failure_stage, retry_count
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s
+                        )
+                        """,
+                        reconciled_row,
+                    )
+                for canonical_id, count in duplicate_counts.items():
+                    if count > 1:
+                        print(
+                            "CLIP HISTORY MIGRATION DUPLICATE URL RECONCILED | "
+                            f"clip_id={canonical_id} | rows={count}"
+                        )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS twitch_clip_history_url_idx
+                    ON twitch_clip_history (provider, clip_url)
+                    WHERE clip_url IS NOT NULL
+                    """
+                )
+                if not _backfill_clip_history(cursor):
+                    raise RuntimeError("clip history backfill failed")
+            connection.commit()
+        return True
+    except Exception as error:
+        print(f"CLIP HISTORY DB ERROR | operation=init | error={error!r}")
+        return False
+
+
+def _clip_history_upsert(
+    clip: dict[str, object],
+    status_value: str,
+    failure_stage: object = None,
+    increment_retry: bool = False,
+) -> bool:
+    clip_id, clip_url = _normalized_twitch_identifiers(clip)
+    if not clip_id:
+        return False
+    if not DATABASE_URL:
+        return True
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO twitch_clip_history (
+                        provider, clip_id, clip_url, creator_id, creator_name,
+                        created_at, status, viral_score, last_processed_at,
+                        published_at, failure_stage, retry_count
+                    )
+                    VALUES (
+                        'twitch', %s, %s, %s, %s, %s, %s, %s,
+                        CASE WHEN %s = 'discovered' THEN NULL ELSE NOW() END,
+                        CASE WHEN %s = 'published' THEN NOW() ELSE NULL END,
+                        %s, CASE WHEN %s THEN 1 ELSE 0 END
+                    )
+                    ON CONFLICT (provider, clip_id) DO UPDATE SET
+                        clip_url = COALESCE(EXCLUDED.clip_url, twitch_clip_history.clip_url),
+                        creator_id = COALESCE(EXCLUDED.creator_id, twitch_clip_history.creator_id),
+                        creator_name = COALESCE(EXCLUDED.creator_name, twitch_clip_history.creator_name),
+                        created_at = COALESCE(EXCLUDED.created_at, twitch_clip_history.created_at),
+                        status = CASE
+                            WHEN twitch_clip_history.status = 'published' THEN 'published'
+                            WHEN EXCLUDED.status = 'discovered'
+                                THEN twitch_clip_history.status
+                            WHEN twitch_clip_history.status = 'generated'
+                                 AND EXCLUDED.status IN ('discovered', 'processing')
+                                THEN 'generated'
+                            ELSE EXCLUDED.status
+                        END,
+                        viral_score = COALESCE(EXCLUDED.viral_score, twitch_clip_history.viral_score),
+                        last_processed_at = COALESCE(EXCLUDED.last_processed_at, twitch_clip_history.last_processed_at),
+                        published_at = COALESCE(EXCLUDED.published_at, twitch_clip_history.published_at),
+                        failure_stage = EXCLUDED.failure_stage,
+                        retry_count = twitch_clip_history.retry_count
+                            + CASE WHEN %s THEN 1 ELSE 0 END
+                    """,
+                    (
+                        clip_id,
+                        clip_url,
+                        clip.get("creator_id") or clip.get("broadcaster_id"),
+                        clip.get("creator") or clip.get("creator_name"),
+                        clip.get("created_at"),
+                        status_value,
+                        clip.get("viral_score") or clip.get("score"),
+                        status_value,
+                        status_value,
+                        failure_stage,
+                        increment_retry,
+                        increment_retry,
+                    ),
+                )
+            connection.commit()
+        print(
+            "CLIP HISTORY STATUS UPDATED | "
+            f"clip_id={clip_id} | status={status_value}"
+        )
+        return True
+    except Exception as error:
+        print(
+            "CLIP HISTORY DB ERROR | "
+            f"operation=status_update | clip_id={clip_id} | error={error!r}"
+        )
+        return False
+
+
+def _claim_clip_for_processing(clip: dict[str, object]) -> bool:
+    clip_id, clip_url = _normalized_twitch_identifiers(clip)
+    if not clip_id:
+        print("CLIP HISTORY CLAIM SKIPPED | reason=missing_canonical_clip_id")
+        return False
+    if not DATABASE_URL:
+        return True
+    lease_minutes = _processing_lease_minutes()
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT status, last_processed_at
+                    FROM twitch_clip_history
+                    WHERE provider = 'twitch' AND clip_id = %s
+                    FOR UPDATE
+                    """,
+                    (clip_id,),
+                )
+                prior_row = cursor.fetchone()
+                stale_processing = bool(
+                    prior_row
+                    and prior_row[0] == "processing"
+                    and (
+                        prior_row[1] is None
+                        or prior_row[1]
+                        < datetime.now(timezone.utc) - timedelta(minutes=lease_minutes)
+                    )
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO twitch_clip_history (
+                        provider, clip_id, clip_url, creator_id, creator_name,
+                        created_at, status, last_processed_at, retry_count
+                    )
+                    VALUES ('twitch', %s, %s, %s, %s, %s, 'processing', NOW(), 0)
+                    ON CONFLICT (provider, clip_id) DO UPDATE SET
+                        clip_url = COALESCE(
+                            twitch_clip_history.clip_url, EXCLUDED.clip_url
+                        ),
+                        creator_id = COALESCE(
+                            twitch_clip_history.creator_id, EXCLUDED.creator_id
+                        ),
+                        creator_name = COALESCE(
+                            twitch_clip_history.creator_name, EXCLUDED.creator_name
+                        ),
+                        created_at = COALESCE(
+                            twitch_clip_history.created_at, EXCLUDED.created_at
+                        ),
+                        status = 'processing',
+                        last_processed_at = NOW(),
+                        failure_stage = NULL
+                    WHERE twitch_clip_history.status = 'discovered'
+                       OR (
+                            twitch_clip_history.status = 'failed'
+                            AND twitch_clip_history.retry_count < %s
+                       )
+                       OR (
+                            twitch_clip_history.status = 'processing'
+                            AND (
+                                twitch_clip_history.last_processed_at IS NULL
+                                OR twitch_clip_history.last_processed_at
+                                   < NOW() - (%s * INTERVAL '1 minute')
+                            )
+                       )
+                    RETURNING clip_id
+                    """,
+                    (
+                        clip_id,
+                        clip_url,
+                        clip.get("creator_id") or clip.get("broadcaster_id"),
+                        clip.get("creator") or clip.get("creator_name"),
+                        clip.get("created_at"),
+                        AUTO_CLIP_HISTORY_MAX_RETRIES,
+                        lease_minutes,
+                    ),
+                )
+                claimed_row = cursor.fetchone()
+            connection.commit()
+        if claimed_row is None:
+            print(f"CLIP HISTORY CLAIM SKIPPED | clip_id={clip_id}")
+            return False
+        if stale_processing:
+            print(
+                "CLIP HISTORY STALE PROCESSING RECLAIMED | "
+                f"clip_id={clip_id} | lease_minutes={lease_minutes}"
+            )
+        return True
+    except Exception as error:
+        print(
+            "CLIP HISTORY DB ERROR | "
+            f"operation=claim | clip_id={clip_id} | error={error!r}"
+        )
+        print(f"CLIP HISTORY CLAIM SKIPPED | clip_id={clip_id}")
+        return False
+
+
+def _claim_clip_for_publishing(clip: dict[str, object]) -> bool:
+    clip_id, _ = _normalized_twitch_identifiers(clip)
+    if not clip_id:
+        print("CLIP PUBLISH CLAIM SKIPPED | reason=invalid_identifier")
+        return False
+    if not DATABASE_URL:
+        return True
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE twitch_clip_history
+                    SET status = 'publishing',
+                        publish_attempted_at = NOW(),
+                        failure_stage = NULL
+                    WHERE provider = 'twitch'
+                      AND clip_id = %s
+                      AND (
+                          status = 'generated'
+                          OR (
+                              status = 'publishing'
+                              AND (
+                                  publish_attempted_at IS NULL
+                                  OR publish_attempted_at
+                                     < NOW() - (%s * INTERVAL '1 minute')
+                              )
+                          )
+                      )
+                    RETURNING clip_id
+                    """,
+                    (clip_id, _publish_lease_minutes()),
+                )
+                claimed = cursor.fetchone()
+            connection.commit()
+        if claimed is None:
+            print(f"CLIP PUBLISH CLAIM SKIPPED | clip_id={clip_id}")
+            return False
+        return True
+    except Exception as error:
+        print(
+            "CLIP HISTORY DB ERROR | "
+            f"operation=publish_claim | clip_id={clip_id} | error={error!r}"
+        )
+        print(f"CLIP PUBLISH CLAIM SKIPPED | clip_id={clip_id}")
+        return False
+
+
+def _restore_clip_after_publish_failure(clip: dict[str, object]) -> bool:
+    clip_id, _ = _normalized_twitch_identifiers(clip)
+    if not DATABASE_URL:
+        return True
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE twitch_clip_history
+                    SET status = 'generated',
+                        publish_attempted_at = NULL,
+                        failure_stage = 'tiktok_publish'
+                    WHERE provider = 'twitch'
+                      AND clip_id = %s
+                      AND status = 'publishing'
+                    RETURNING clip_id
+                    """,
+                    (clip_id,),
+                )
+                restored = cursor.fetchone()
+            connection.commit()
+        return restored is not None
+    except Exception as error:
+        print(
+            "CLIP HISTORY DB ERROR | "
+            f"operation=publish_restore | clip_id={clip_id} | error={error!r}"
+        )
+        return False
+
+
+def _mark_clip_published(
+    clip: dict[str, object],
+    provider_publish_id: str,
+) -> bool:
+    clip_id, _ = _normalized_twitch_identifiers(clip)
+    if not clip_id:
+        return False
+    if not DATABASE_URL:
+        return True
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE twitch_clip_history
+                    SET status = 'published',
+                        published_at = NOW(),
+                        provider_publish_id = %s,
+                        failure_stage = NULL
+                    WHERE provider = 'twitch'
+                      AND clip_id = %s
+                      AND status = 'publishing'
+                    RETURNING clip_id
+                    """,
+                    (provider_publish_id, clip_id),
+                )
+                published = cursor.fetchone()
+            connection.commit()
+        return published is not None
+    except Exception as error:
+        print(
+            "CLIP HISTORY DB ERROR | "
+            f"operation=publish_complete | clip_id={clip_id} | error={error!r}"
+        )
+        return False
+
+
+def _write_terminal_clip_history(
+    clip: dict[str, object],
+    status_value: str,
+    failure_stage: object = None,
+    increment_retry: bool = False,
+) -> bool:
+    written = _clip_history_upsert(
+        clip,
+        status_value,
+        failure_stage=failure_stage,
+        increment_retry=increment_retry,
+    )
+    if DATABASE_URL and not written:
+        clip_id, _ = _normalized_twitch_identifiers(clip)
+        print(
+            "CLIP HISTORY TERMINAL STATUS WRITE FAILED | "
+            f"clip_id={clip_id or 'missing'} | status={status_value} | "
+            "history_not_safely_persisted=true"
+        )
+    return written
+
+
+def _backfill_clip_history(cursor: object) -> bool:
+    if not DATABASE_URL:
+        return True
+    sources = (
+        (BASE_DIR / "clips.json", "generated"),
+        (BASE_DIR / "published_clips.json", "published"),
+    )
+    imported = 0
+    for source_path, default_status in sources:
+        try:
+            with source_path.open("r", encoding="utf-8") as file:
+                records = json.load(file)
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            records = []
+        for record in records if isinstance(records, list) else []:
+            if not isinstance(record, dict):
+                continue
+            clip_id, clip_url = _normalized_twitch_identifiers(record)
+            if not clip_id:
+                print(
+                    "CLIP HISTORY DB ERROR | "
+                    f"operation=backfill | source={source_path.name} | "
+                    "error=missing_stable_twitch_identifier"
+                )
+                continue
+            status_value = (
+                "published"
+                if str(record.get("status") or "").lower() == "published"
+                else default_status
+            )
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO twitch_clip_history (
+                        provider, clip_id, clip_url, creator_id, creator_name,
+                        created_at, status, viral_score, published_at,
+                        failure_stage, retry_count
+                    ) VALUES (
+                        'twitch', %s, %s, %s, %s, %s, %s, %s, %s, %s, 0
+                    )
+                    ON CONFLICT (provider, clip_id) DO UPDATE SET
+                        clip_url = COALESCE(
+                            twitch_clip_history.clip_url, EXCLUDED.clip_url
+                        ),
+                        creator_id = COALESCE(
+                            twitch_clip_history.creator_id, EXCLUDED.creator_id
+                        ),
+                        creator_name = COALESCE(
+                            twitch_clip_history.creator_name, EXCLUDED.creator_name
+                        ),
+                        created_at = COALESCE(
+                            twitch_clip_history.created_at, EXCLUDED.created_at
+                        ),
+                        viral_score = COALESCE(
+                            twitch_clip_history.viral_score, EXCLUDED.viral_score
+                        ),
+                        published_at = COALESCE(
+                            twitch_clip_history.published_at, EXCLUDED.published_at
+                        ),
+                        failure_stage = COALESCE(
+                            twitch_clip_history.failure_stage, EXCLUDED.failure_stage
+                        ),
+                        status = CASE
+                            WHEN CASE twitch_clip_history.status
+                                WHEN 'published' THEN 9 WHEN 'generated' THEN 8
+                                WHEN 'publishing' THEN 7
+                                WHEN 'rejected_low_score' THEN 6
+                                WHEN 'fully_evaluated' THEN 5
+                                WHEN 'processing' THEN 4 WHEN 'failed' THEN 3
+                                WHEN 'intentionally_skipped' THEN 2 ELSE 1 END
+                              >= CASE EXCLUDED.status
+                                WHEN 'published' THEN 9 WHEN 'generated' THEN 8
+                                WHEN 'publishing' THEN 7
+                                WHEN 'rejected_low_score' THEN 6
+                                WHEN 'fully_evaluated' THEN 5
+                                WHEN 'processing' THEN 4 WHEN 'failed' THEN 3
+                                WHEN 'intentionally_skipped' THEN 2 ELSE 1 END
+                            THEN twitch_clip_history.status
+                            ELSE EXCLUDED.status
+                        END
+                    """,
+                    (
+                        clip_id,
+                        clip_url,
+                        record.get("creator_id") or record.get("broadcaster_id"),
+                        record.get("creator") or record.get("creator_name"),
+                        record.get("created_at"),
+                        status_value,
+                        record.get("viral_score") or record.get("score"),
+                        record.get("published_at"),
+                        record.get("failure_stage"),
+                    ),
+                )
+                imported += 1
+            except Exception as error:
+                print(
+                    "CLIP HISTORY DB ERROR | "
+                    f"operation=backfill | clip_id={clip_id} | error={error!r}"
+                )
+                return False
+    print(f"CLIP HISTORY BACKFILL | records={imported}")
+    return True
+
+
+def _load_clip_history_exclusions() -> tuple[set[str], set[str], bool]:
+    if not DATABASE_URL:
+        clips: list[dict[str, object]] = []
+        for path in (BASE_DIR / "clips.json", BASE_DIR / "published_clips.json"):
+            try:
+                with path.open("r", encoding="utf-8") as file:
+                    payload = json.load(file)
+                if isinstance(payload, list):
+                    clips.extend(item for item in payload if isinstance(item, dict))
+            except (FileNotFoundError, OSError, json.JSONDecodeError):
+                pass
+        return (
+            {
+                identifiers[0]
+                for item in clips
+                if (identifiers := _normalized_twitch_identifiers(item))[0]
+            },
+            {
+                identifiers[1]
+                for item in clips
+                if (identifiers := _normalized_twitch_identifiers(item))[1]
+            },
+            True,
+        )
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT clip_id, clip_url FROM twitch_clip_history
+                    WHERE provider = 'twitch' AND (
+                        status IN (
+                            'fully_evaluated', 'rejected_low_score',
+                            'generated', 'publishing', 'published',
+                            'intentionally_skipped'
+                        )
+                        OR (
+                            status = 'processing'
+                            AND last_processed_at >=
+                                NOW() - (%s * INTERVAL '1 minute')
+                        )
+                        OR (status = 'failed' AND retry_count >= %s)
+                    )
+                    """,
+                    (
+                        _processing_lease_minutes(),
+                        AUTO_CLIP_HISTORY_MAX_RETRIES,
+                    ),
+                )
+                rows = cursor.fetchall()
+        normalized_rows = [
+            _normalized_twitch_identifiers(
+                {
+                    "twitch_clip_id": row[0],
+                    "public_url": row[1],
+                }
+            )
+            for row in rows
+        ]
+        return (
+            {clip_id for clip_id, _ in normalized_rows if clip_id},
+            {clip_url for _, clip_url in normalized_rows if clip_url},
+            True,
+        )
+    except Exception as error:
+        print(f"CLIP HISTORY DB ERROR | operation=load | error={error!r}")
+        return set(), set(), False
 
 
 def _ensure_oauth_tokens_table() -> None:
@@ -1598,6 +2394,7 @@ async def get_twitch_channel_data(channel_name: str) -> dict[str, Any]:
                 "display_name": user["display_name"],
                 "profile_image_url": user["profile_image_url"],
                 "is_live": False,
+                "stream_id": None,
                 "status": "OFFLINE",
                 "title": None,
                 "game_name": None,
@@ -1621,6 +2418,7 @@ async def get_twitch_channel_data(channel_name: str) -> dict[str, Any]:
             "display_name": user["display_name"],
             "profile_image_url": user["profile_image_url"],
             "is_live": True,
+            "stream_id": stream.get("id"),
             "status": "LIVE",
             "title": stream.get("title"),
             "game_name": stream.get("game_name"),
@@ -1750,10 +2548,12 @@ async def wait_for_twitch_clip(clip_id: str) -> dict:
 
 async def fetch_fresh_twitch_clips(
     broadcaster_id: str,
+    stream_started_at: object,
     ignored_clip_ids: set[str],
     ignored_clip_urls: set[str],
     limit: int = 5,
 ) -> list[dict[str, Any]]:
+    app.state.current_stream_grace_active = False
     try:
         access_token = await get_twitch_access_token()
     except Exception as error:
@@ -1768,41 +2568,156 @@ async def fetch_fresh_twitch_clips(
         "Authorization": f"Bearer {access_token}",
     }
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            response = await client.get(
-                "https://api.twitch.tv/helix/clips",
-                headers=headers,
-                params={"broadcaster_id": broadcaster_id, "first": 20},
-            )
-        except httpx.RequestError as error:
-            print(
-                f"TWITCH CLIP FETCH FAILED for broadcaster {broadcaster_id}:",
-                repr(error),
-            )
-            return []
-
-    if response.status_code != 200:
+    now = datetime.now(timezone.utc)
+    stream_start = _parse_twitch_created_at(stream_started_at)
+    grace_minutes = max(
+        0,
+        _nonnegative_int(os.getenv("AUTO_CLIP_CURRENT_STREAM_GRACE_MINUTES", "20")),
+    )
+    print(
+        "CURRENT STREAM WINDOW | "
+        f"broadcaster_id={broadcaster_id} | "
+        f"started_at={stream_start.isoformat() if stream_start else 'unknown'} | "
+        f"ended_at={now.isoformat()}"
+    )
+    if stream_start is None:
+        app.state.current_stream_grace_active = True
         print(
-            "TWITCH CLIP FETCH FAILED:",
-            response.status_code,
-            response.text,
+            "CURRENT STREAM GRACE ACTIVE | "
+            "reason=missing_stream_started_at"
         )
         return []
+    cutoff_24_hours = now - timedelta(hours=24)
+    cutoff_7_days = now - timedelta(days=7)
+    cutoff_30_days = now - timedelta(days=30)
+    tiers = [
+        ("current_stream", stream_start, now),
+        ("last_24_hours", cutoff_24_hours, min(stream_start, now)),
+        ("last_7_days", cutoff_7_days, min(cutoff_24_hours, stream_start)),
+        ("last_30_days", cutoff_30_days, min(cutoff_7_days, stream_start)),
+        (
+            "archive",
+            datetime(2016, 5, 26, tzinfo=timezone.utc),
+            min(cutoff_30_days, stream_start),
+        ),
+    ]
+    fresh_clips: list[dict[str, Any]] = []
+    seen_ids = {_canonical_twitch_clip_id(value) for value in ignored_clip_ids}
+    seen_urls = {_canonical_twitch_clip_url(value) for value in ignored_clip_urls}
+    max_pages = _twitch_max_pages()
 
-    fresh_clips = []
-    for twitch_clip in response.json().get("data", []):
-        clip_id = str(twitch_clip.get("id", "")).strip()
-        if not clip_id or clip_id in ignored_clip_ids:
-            continue
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for tier_number, (tier_name, started_at, ended_at) in enumerate(
+            tiers,
+            start=1,
+        ):
+            if tier_number > 1:
+                print(
+                    "FALLBACK TIER ACTIVATED | "
+                    f"tier={tier_number} | name={tier_name}"
+                )
+            if ended_at <= started_at:
+                continue
+            params: dict[str, object] = {
+                "broadcaster_id": broadcaster_id,
+                "first": 100,
+                "started_at": started_at.isoformat().replace("+00:00", "Z"),
+                "ended_at": ended_at.isoformat().replace("+00:00", "Z"),
+            }
+            print(
+                "CLIP SEARCH TIER | "
+                f"tier={tier_number} | name={tier_name} | "
+                f"started_at={params['started_at']} | ended_at={params['ended_at']}"
+            )
+            cursor_value = ""
+            tier_fresh_count = 0
+            for page_number in range(1, max_pages + 1):
+                page_params = dict(params)
+                if cursor_value:
+                    page_params["after"] = cursor_value
+                print(
+                    "CLIP SEARCH PAGE | "
+                    f"tier={tier_number} | name={tier_name} | "
+                    f"page={page_number}/{max_pages} | "
+                    f"cursor={'set' if cursor_value else 'initial'}"
+                )
+                try:
+                    response = await client.get(
+                        "https://api.twitch.tv/helix/clips",
+                        headers=headers,
+                        params=page_params,
+                    )
+                except httpx.RequestError as error:
+                    print(
+                        f"TWITCH CLIP FETCH FAILED for broadcaster {broadcaster_id}:",
+                        repr(error),
+                    )
+                    return []
+                if response.status_code != 200:
+                    print(
+                        "TWITCH CLIP FETCH FAILED:",
+                        response.status_code,
+                        response.text,
+                    )
+                    return []
+                payload = response.json()
+                tier_clips = sorted(
+                    payload.get("data", []),
+                    key=lambda clip: (
+                        _parse_twitch_created_at(clip.get("created_at"))
+                        or datetime.min.replace(tzinfo=timezone.utc)
+                    ),
+                    reverse=True,
+                )
+                for twitch_clip in tier_clips:
+                    clip_id, canonical_url = _normalized_twitch_identifiers(twitch_clip)
+                    if (
+                        not clip_id
+                        or clip_id in seen_ids
+                        or canonical_url in seen_urls
+                    ):
+                        print(
+                            "CLIP EXCLUDED BY HISTORY | "
+                            f"clip_id={clip_id or 'missing'} | tier={tier_name}"
+                        )
+                        continue
+                    twitch_clip["_search_tier"] = tier_number
+                    twitch_clip["_canonical_clip_id"] = clip_id
+                    twitch_clip["_canonical_clip_url"] = canonical_url
+                    _clip_history_upsert(twitch_clip, "discovered")
+                    fresh_clips.append(twitch_clip)
+                    tier_fresh_count += 1
+                    seen_ids.add(clip_id)
+                    seen_urls.add(canonical_url)
+                    if len(fresh_clips) >= limit:
+                        break
+                if len(fresh_clips) >= limit:
+                    break
+                cursor_value = str(
+                    payload.get("pagination", {}).get("cursor") or ""
+                ).strip()
+                if not cursor_value:
+                    break
 
-        public_url = twitch_clip.get("url") or f"https://clips.twitch.tv/{clip_id}"
-        if public_url in ignored_clip_urls:
-            continue
+            if tier_fresh_count:
+                print(
+                    "FRESH CLIPS FOUND | "
+                    f"tier={tier_number} | name={tier_name} | "
+                    f"count={tier_fresh_count} | total={len(fresh_clips)}"
+                )
+            if len(fresh_clips) >= limit:
+                return fresh_clips
 
-        fresh_clips.append(twitch_clip)
-        if len(fresh_clips) >= limit:
-            break
+            if tier_number == 1:
+                stream_age_minutes = (now - stream_start).total_seconds() / 60.0
+                if tier_fresh_count == 0 and stream_age_minutes < grace_minutes:
+                    app.state.current_stream_grace_active = True
+                    print(
+                        "CURRENT STREAM GRACE ACTIVE | "
+                        f"age_minutes={stream_age_minutes:.1f} | "
+                        f"grace_minutes={grace_minutes}"
+                    )
+                    return []
 
     return fresh_clips
 
@@ -2097,7 +3012,7 @@ async def get_clip_video(clip_id: str, download: int = 0):
 
 
 @app.post("/api/publish")
-async def publish_clip(clip: dict):
+async def publish_clip_to_tiktok(clip: dict):
     clips_file = Path(__file__).resolve().parent / "clips.json"
 
     try:
@@ -2140,18 +3055,65 @@ async def publish_clip(clip: dict):
             detail=f"Video file not found: {video_path}",
         )
 
-    tiktok_result = await upload_tiktok_draft(video_path)
+    if not _claim_clip_for_publishing(matching_clip):
+        raise HTTPException(
+            status_code=409,
+            detail="Clip publishing is already in progress or is not eligible.",
+        )
 
-    updated_clip_index = _find_clip_index_by_stable_identifier(clips, matching_clip)
-    if updated_clip_index is not None:
-        clips[updated_clip_index]["status"] = "Published"
-        with clips_file.open("w", encoding="utf-8") as file:
-            json.dump(clips, file, indent=2)
-        matching_clip = clips[updated_clip_index]
+    try:
+        tiktok_result = await upload_tiktok_draft(video_path)
+    except Exception as error:
+        restored = _restore_clip_after_publish_failure(matching_clip)
+        print(
+            "TIKTOK PUBLISH FAILED - STATUS UNCHANGED | "
+            f"clip_id={matching_clip.get('id')} | "
+            f"history_restored={restored} | error={error!r}"
+        )
+        raise
 
-    if not _contains_clip_with_same_identifier(published, matching_clip):
-        published.append(matching_clip)
-        save_published(published)
+    upload_result = tiktok_result.get("upload_result")
+    provider_publish_id = str(
+        tiktok_result.get("publish_id")
+        or (
+            upload_result.get("publish_id")
+            if isinstance(upload_result, dict)
+            else ""
+        )
+        or f"confirmed:{datetime.now(timezone.utc).isoformat()}"
+    )
+    if not _mark_clip_published(matching_clip, provider_publish_id):
+        print(
+            "TIKTOK PUBLISH SUCCEEDED BUT LOCAL STATE FAILED | "
+            f"clip_id={matching_clip.get('id')} | "
+            "stage=postgres_publish_completion"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="TikTok accepted the upload, but publishing state could not be saved.",
+        )
+
+    try:
+        updated_clip_index = _find_clip_index_by_stable_identifier(
+            clips,
+            matching_clip,
+        )
+        if updated_clip_index is not None:
+            clips[updated_clip_index]["status"] = "Published"
+            with clips_file.open("w", encoding="utf-8") as file:
+                json.dump(clips, file, indent=2)
+            matching_clip = clips[updated_clip_index]
+
+        if not _contains_clip_with_same_identifier(published, matching_clip):
+            published.append(matching_clip)
+            save_published(published)
+    except Exception as error:
+        print(
+            "TIKTOK PUBLISH SUCCEEDED BUT LOCAL STATE FAILED | "
+            f"clip_id={matching_clip.get('id')} | "
+            f"provider_publish_id={provider_publish_id} | error={error!r}"
+        )
+        raise
 
     return {
         "success": True,
@@ -2280,6 +3242,11 @@ async def auto_generate_clip():
 
 
 async def _run_auto_generate_clip_pipeline():
+    if not getattr(app.state, "clip_history_ready", False):
+        raise HTTPException(
+            status_code=503,
+            detail="Clip history is unavailable; Twitch generation is disabled.",
+        )
     generation_started_at = time.perf_counter()
     processed_candidates_count = 0
     fully_evaluated_candidates_count = 0
@@ -2357,16 +3324,13 @@ async def _run_auto_generate_clip_pipeline():
     except (FileNotFoundError, json.JSONDecodeError):
         existing_clips = []
 
-    cached_clip_ids = {
-        str(existing.get("twitch_clip_id", "")).strip()
-        for existing in existing_clips
-        if existing.get("twitch_clip_id")
-    }
-    cached_clip_urls = {
-        str(existing.get("public_url", "")).strip()
-        for existing in existing_clips
-        if existing.get("public_url")
-    }
+    cached_clip_ids, cached_clip_urls, history_available = (
+        _load_clip_history_exclusions()
+    )
+    if not history_available:
+        return {
+            "message": "Clip history is temporarily unavailable; generation skipped."
+        }
 
     attempted_clip_ids: set[str] = set()
     attempted_clip_urls: set[str] = set()
@@ -2385,6 +3349,7 @@ async def _run_auto_generate_clip_pipeline():
         fetch_started_at = time.perf_counter()
         fresh_batch = await fetch_fresh_twitch_clips(
             broadcaster_id=broadcaster_id,
+            stream_started_at=stream.get("started_at"),
             ignored_clip_ids=ignored_ids,
             ignored_clip_urls=ignored_urls,
             limit=AUTO_CLIP_CANDIDATE_COUNT,
@@ -2400,6 +3365,10 @@ async def _run_auto_generate_clip_pipeline():
         )
 
         if not fresh_batch:
+            if getattr(app.state, "current_stream_grace_active", False):
+                return {
+                    "message": "No fresh current-stream clips yet."
+                }
             print(
                 f"No fresh Twitch clips available for {creator['channel']} "
                 f"(batch {batch_attempt}/2)."
@@ -2418,8 +3387,16 @@ async def _run_auto_generate_clip_pipeline():
             advanced_candidates = preranked_candidates[:1]
             if full_evaluation_count > 1:
                 remaining_candidates = preranked_candidates[1:]
+                best_remaining_tier = min(
+                    int(candidate["search_tier"])
+                    for candidate in remaining_candidates
+                )
                 diversity_candidate = max(
-                    remaining_candidates,
+                    (
+                        candidate
+                        for candidate in remaining_candidates
+                        if int(candidate["search_tier"]) == best_remaining_tier
+                    ),
                     key=lambda candidate: (
                         float(candidate["title_score"]),
                         float(candidate["score"]),
@@ -2485,6 +3462,7 @@ async def _run_auto_generate_clip_pipeline():
 
         batch_candidates: list[dict[str, object]] = []
         batch_full_evaluated_candidates = 0
+        evaluated_candidate_numbers: set[int] = set()
         stage_two_started_at = time.perf_counter()
         evaluation_phases = [
             ("initial", advanced_candidate_numbers),
@@ -2502,15 +3480,14 @@ async def _run_auto_generate_clip_pipeline():
 
             for candidate_index in candidate_numbers:
                 twitch_clip = fresh_batch[candidate_index - 1]
-                twitch_clip_id = str(twitch_clip.get("id", "")).strip()
+                twitch_clip_id, public_url = _normalized_twitch_identifiers(twitch_clip)
                 if not twitch_clip_id:
                     continue
-                public_url = (
-                    twitch_clip.get("url")
-                    or f"https://clips.twitch.tv/{twitch_clip_id}"
-                )
                 attempted_clip_ids.add(twitch_clip_id)
                 attempted_clip_urls.add(public_url)
+                evaluated_candidate_numbers.add(candidate_index)
+                if not _claim_clip_for_processing(twitch_clip):
+                    continue
                 processed_candidates_count += 1
 
                 if phase == "rescue":
@@ -2530,6 +3507,12 @@ async def _run_auto_generate_clip_pipeline():
                     persisted_clips=existing_clips,
                 )
                 if not evaluation_result["success"]:
+                    _write_terminal_clip_history(
+                        twitch_clip,
+                        "failed",
+                        failure_stage=evaluation_result["failure_stage"],
+                        increment_retry=True,
+                    )
                     print(
                         f"Candidate {candidate_index} full evaluation failed:",
                         evaluation_result["error"],
@@ -2538,6 +3521,13 @@ async def _run_auto_generate_clip_pipeline():
 
                 clip = evaluation_result["clip"]
                 if not isinstance(clip, dict):
+                    continue
+                if not _write_terminal_clip_history(clip, "fully_evaluated"):
+                    _cleanup_candidate_video(
+                        clip.get("video_path"),
+                        candidate_index,
+                        existing_clips,
+                    )
                     continue
                 candidates.append(clip)
                 batch_candidates.append(clip)
@@ -2558,17 +3548,14 @@ async def _run_auto_generate_clip_pipeline():
 
         if batch_candidates:
             for candidate_index, twitch_clip in enumerate(fresh_batch, start=1):
-                if candidate_index in advanced_candidate_set:
+                if candidate_index in evaluated_candidate_numbers:
                     continue
-                twitch_clip_id = str(twitch_clip.get("id", "")).strip()
+                twitch_clip_id, public_url = _normalized_twitch_identifiers(twitch_clip)
                 if not twitch_clip_id:
                     continue
-                public_url = (
-                    twitch_clip.get("url")
-                    or f"https://clips.twitch.tv/{twitch_clip_id}"
-                )
                 attempted_clip_ids.add(twitch_clip_id)
                 attempted_clip_urls.add(public_url)
+                _write_terminal_clip_history(twitch_clip, "intentionally_skipped")
 
         _log_performance_timing(
             stage="candidate_full_evaluation_stage_2",
@@ -2600,7 +3587,20 @@ async def _run_auto_generate_clip_pipeline():
         print(f"Candidate {candidate['candidate_number']}: {candidate['score']}")
 
     winner_selection_started_at = time.perf_counter()
-    best_clip = max(candidates, key=lambda c: c["score"])
+    best_available_tier = min(
+        int(candidate.get("_search_tier", 1))
+        for candidate in candidates
+    )
+    tier_candidates = [
+        candidate
+        for candidate in candidates
+        if int(candidate.get("_search_tier", 1)) == best_available_tier
+    ]
+    best_clip = max(tier_candidates, key=lambda c: c["score"])
+    print(
+        "FINAL WINNER TIER | "
+        f"tier={best_available_tier} | eligible_candidates={len(tier_candidates)}"
+    )
     _log_performance_timing(
         stage="winner_selection",
         elapsed_seconds=time.perf_counter() - winner_selection_started_at,
@@ -2619,11 +3619,20 @@ async def _run_auto_generate_clip_pipeline():
     print("------------------------")
 
     if best_clip["decision"] == "reject" or best_clip["score"] < AUTO_CLIP_MIN_SCORE:
+        rejection_recorded = _write_terminal_clip_history(
+            best_clip,
+            "rejected_low_score",
+        )
         _cleanup_candidate_video(
             best_clip.get("video_path"),
             int(best_clip.get("candidate_number", 0) or 0),
             existing_clips,
         )
+        if DATABASE_URL and not rejection_recorded:
+            raise HTTPException(
+                status_code=503,
+                detail="Clip rejection could not be saved safely.",
+            )
         total_elapsed = time.perf_counter() - generation_started_at
         _log_performance_timing(
             stage="generation_total",
@@ -2748,6 +3757,11 @@ async def _run_auto_generate_clip_pipeline():
             f"video_path={best_clip.get('video_path')}"
         )
         raise
+    if not _write_terminal_clip_history(best_clip, "generated"):
+        raise HTTPException(
+            status_code=503,
+            detail="Clip was persisted, but its history status could not be saved.",
+        )
     _log_performance_timing(
         stage="persistence",
         elapsed_seconds=time.perf_counter() - persistence_started_at,
@@ -2772,25 +3786,8 @@ async def _run_auto_generate_clip_pipeline():
     return result["clip"]
 
 @app.post("/api/clips/{clip_id}/publish")
-async def publish_clip(clip_id: str):
-    clips_file = Path(__file__).resolve().parent / "clips.json"
-
-    try:
-        with clips_file.open("r", encoding="utf-8") as file:
-            clips = json.load(file)
-    except (FileNotFoundError, json.JSONDecodeError):
-        clips = []
-
-    for clip in clips:
-        if clip.get("id") == clip_id:
-            clip["status"] = "Published"
-
-            with clips_file.open("w", encoding="utf-8") as file:
-                json.dump(clips, file, indent=2)
-
-            return {"success": True, "clip": clip}
-
-    raise HTTPException(status_code=404, detail="Clip not found")
+async def publish_clip_by_id(clip_id: str):
+    return await publish_clip_to_tiktok({"id": clip_id})
 
 @app.get("/auth/twitch")
 async def twitch_login():

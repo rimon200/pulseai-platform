@@ -10,7 +10,6 @@ import json
 import os
 import re
 import tempfile
-import textwrap
 from typing import Optional
 
 load_dotenv()
@@ -29,8 +28,6 @@ _TITLE_BANNED_PHRASES = {
     "yesterday’s clip",
 }
 _TITLE_MAX_BODY_CHARS = 70
-_TITLE_MAX_LINE_WIDTH = 30
-_TITLE_MAX_LINES = 2
 _TITLE_ALLOWED_EMOJIS = ["😂", "😭", "💀", "😱", "😳", "🔥"]
 
 
@@ -78,20 +75,14 @@ def _pick_relevant_emoji(source_text: str) -> str:
 
 
 def _limit_title_lines(title_body: str) -> str:
-    wrapped = textwrap.wrap(
-        title_body,
-        width=_TITLE_MAX_LINE_WIDTH,
-        break_long_words=False,
-        break_on_hyphens=False,
-    )
-    if len(wrapped) <= _TITLE_MAX_LINES:
-        return " ".join(wrapped)
-
-    kept = wrapped[:_TITLE_MAX_LINES]
-    merged = " ".join(kept)
-    if len(merged) > _TITLE_MAX_BODY_CHARS:
-        merged = merged[:_TITLE_MAX_BODY_CHARS].rstrip()
-    return merged
+    words = _collapse_whitespace(title_body).split()
+    limited_words = words[:10]
+    while (
+        len(" ".join(limited_words)) > _TITLE_MAX_BODY_CHARS
+        and len(limited_words) > 5
+    ):
+        limited_words.pop()
+    return " ".join(limited_words)
 
 
 def _build_transcript_fallback_title(transcript: str) -> str:
@@ -128,12 +119,10 @@ def _sanitize_generated_title(raw_title: str, transcript: str) -> str:
 
     body = _strip_emojis(candidate)
     body = _collapse_whitespace(body)
-    if len(body) > _TITLE_MAX_BODY_CHARS:
-        body = body[:_TITLE_MAX_BODY_CHARS].rstrip()
     body = _limit_title_lines(body)
     body = body.rstrip(".,;:!? ")
 
-    if len(body) < 12:
+    if len(body.split()) < 5:
         return _build_transcript_fallback_title(transcript)
 
     emoji_source = f"{raw_title} {transcript}"

@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import textwrap
 import time
+import unicodedata
 from typing import Dict, List, Optional
 
 
@@ -319,13 +320,14 @@ def _build_filter_chain(
 
 
 def _prepare_title_text(value: str) -> tuple[str, int, int]:
-    title_text = _collapse_whitespace(value)
-    title_emoji = _extract_trailing_emoji(title_text)
-    title_body = _collapse_whitespace(_remove_all_emojis(title_text)).strip(".,;:!?")
+    title_text = _collapse_whitespace(_remove_all_emojis(value))
+    title_body = unicodedata.normalize("NFKD", title_text)
+    title_body = title_body.encode("ascii", "ignore").decode("ascii")
+    title_body = _collapse_whitespace(title_body).strip(".,;:!?")
     if not title_body:
         title_body = "Unexpected Stream Moment"
 
-    selected_lines = [f"{title_body} {title_emoji}"]
+    selected_lines = [title_body]
     selected_font_size = TITLE_MIN_FONT_SIZE
 
     for font_size in range(TITLE_PREFERRED_MAX_FONT_SIZE, TITLE_MIN_FONT_SIZE - 1, -1):
@@ -335,60 +337,63 @@ def _prepare_title_text(value: str) -> tuple[str, int, int]:
             int((CANVAS_WIDTH - (TITLE_HORIZONTAL_PADDING * 2)) / approx_char_width),
         )
 
-        fitted_body = title_body
-        candidate_text = f"{fitted_body} {title_emoji}".strip()
         candidate_lines = textwrap.wrap(
-            candidate_text,
+            title_body,
             width=max_chars_per_line,
             break_long_words=False,
             break_on_hyphens=False,
         )
-
-        if len(candidate_lines) > TITLE_MAX_LINES:
-            body_limit = max(
-                8,
-                (max_chars_per_line * TITLE_MAX_LINES) - len(title_emoji) - 1,
-            )
-            truncated_body = fitted_body
-            if len(truncated_body) > body_limit:
-                truncated_body = truncated_body[:body_limit].rstrip()
-                if " " in truncated_body:
-                    truncated_body = truncated_body.rsplit(" ", 1)[0]
-                truncated_body = truncated_body.rstrip(".,;:!?")
-                if truncated_body:
-                    truncated_body = f"{truncated_body}..."
-                else:
-                    truncated_body = "Stream Moment"
-
-            candidate_text = f"{truncated_body} {title_emoji}".strip()
-            candidate_lines = textwrap.wrap(
-                candidate_text,
-                width=max_chars_per_line,
-                break_long_words=False,
-                break_on_hyphens=False,
-            )
-
         if len(candidate_lines) <= TITLE_MAX_LINES:
             selected_lines = candidate_lines
             selected_font_size = font_size
             break
+    else:
+        min_font_char_width = max(8.0, TITLE_MIN_FONT_SIZE * 0.60)
+        min_font_line_width = max(
+            14,
+            int(
+                (CANVAS_WIDTH - (TITLE_HORIZONTAL_PADDING * 2))
+                / min_font_char_width
+            ),
+        )
+        fitted_words: List[str] = []
+        for word in title_body.split():
+            candidate = " ".join(fitted_words + [word])
+            candidate_lines = textwrap.wrap(
+                candidate,
+                width=min_font_line_width,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+            if len(candidate_lines) > TITLE_MAX_LINES:
+                break
+            fitted_words.append(word)
 
-    if len(selected_lines) > TITLE_MAX_LINES:
-        merged = _collapse_whitespace(" ".join(selected_lines))
-        max_chars = 42
-        merged_body = _collapse_whitespace(_remove_all_emojis(merged)).strip(".,;:!?")
-        if len(merged_body) > max_chars:
-            merged_body = merged_body[:max_chars].rstrip()
-            if " " in merged_body:
-                merged_body = merged_body.rsplit(" ", 1)[0]
-            merged_body = merged_body.rstrip(".,;:!?") + "..."
-        merged = f"{merged_body} {title_emoji}".strip()
-        selected_lines = textwrap.wrap(
-            merged,
-            width=24,
-            break_long_words=False,
-            break_on_hyphens=False,
-        )[:TITLE_MAX_LINES]
+        if len(fitted_words) < len(title_body.split()) and fitted_words:
+            truncated_text = " ".join(fitted_words).rstrip(".,;:!?") + "..."
+            truncated_lines = textwrap.wrap(
+                truncated_text,
+                width=min_font_line_width,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )
+            while len(truncated_lines) > TITLE_MAX_LINES and len(fitted_words) > 1:
+                fitted_words.pop()
+                truncated_text = " ".join(fitted_words).rstrip(".,;:!?") + "..."
+                truncated_lines = textwrap.wrap(
+                    truncated_text,
+                    width=min_font_line_width,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                )
+            selected_lines = truncated_lines
+        else:
+            selected_lines = textwrap.wrap(
+                title_body,
+                width=min_font_line_width,
+                break_long_words=False,
+                break_on_hyphens=False,
+            )[:TITLE_MAX_LINES]
 
     line_spacing = max(6, int(selected_font_size * 0.18))
     return "\n".join(selected_lines), selected_font_size, line_spacing
