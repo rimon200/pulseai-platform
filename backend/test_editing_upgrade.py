@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import ai
+import main
 import video_editing
 
 
@@ -67,6 +68,9 @@ class SpeechCaptionAndLayoutTests(unittest.TestCase):
                 },
             )
         self.assertIn("split=2", graph)
+        self.assertEqual(graph.count("split=2"), 1)
+        self.assertNotIn("split=3", graph)
+        self.assertEqual(graph.count("[layout_input_"), 4)
         self.assertIn("x='iw*0.00000'", graph)
         self.assertIn("x='iw*0.48000'", graph)
         self.assertIn("vstack=inputs=2", graph)
@@ -141,16 +145,79 @@ class SpeechCaptionAndLayoutTests(unittest.TestCase):
                 self.requested_frames.append(value)
 
             def read(self):
-                return False, None
+                return True, np.zeros((270, 480, 3), dtype=np.uint8)
 
             def release(self):
                 pass
 
         capture = FakeCapture()
-        with patch.dict(os.environ, {"VIDEO_LAYOUT_SAMPLE_COUNT": "99"}):
+        sampled_widths = []
+
+        def inspect_one_frame(frame):
+            sampled_widths.append(frame.shape[1])
+            return []
+
+        with patch.dict(
+            os.environ,
+            {
+                "VIDEO_LAYOUT_SAMPLE_COUNT": "99",
+                "VIDEO_LAYOUT_SAMPLE_MAX_WIDTH": "999",
+            },
+        ):
             with patch.object(video_editing.cv2, "VideoCapture", return_value=capture):
+                with patch.object(
+                    video_editing,
+                    "_detect_face_like_regions",
+                    side_effect=inspect_one_frame,
+                ):
+                    video_editing.detect_visual_layout("fake.mp4")
+        self.assertLessEqual(len(capture.requested_frames), 4)
+        self.assertEqual(len(sampled_widths), len(capture.requested_frames))
+        self.assertTrue(all(width <= 320 for width in sampled_widths))
+
+    def test_low_memory_fallback_selects_single_subject(self):
+        split_layout = {
+            "mode": "reaction_split",
+            "confidence": 0.9,
+            "reason": "test",
+            "version": "layout-v1",
+            "sample_count": 3,
+            "regions": [{"x": 0}, {"x": 0.5}],
+        }
+        with patch.dict(
+            os.environ,
+            {"VIDEO_LAYOUT_MEMORY_FALLBACK_MB": "120"},
+        ):
+            fallback = main._apply_visual_layout_memory_fallback(
+                split_layout,
+                119.9,
+            )
+        self.assertEqual(fallback["mode"], "single_subject")
+        self.assertEqual(fallback["regions"], [])
+
+    def test_layout_frames_are_processed_sequentially(self):
+        state = {"active": 0, "maximum": 0, "calls": 0}
+
+        def inspect_frame(_frame):
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+            state["calls"] += 1
+            state["active"] -= 1
+            return []
+
+        with patch.object(
+            video_editing.cv2,
+            "VideoCapture",
+            return_value=self._ReadableCapture(),
+        ):
+            with patch.object(
+                video_editing,
+                "_detect_face_like_regions",
+                side_effect=inspect_frame,
+            ):
                 video_editing.detect_visual_layout("fake.mp4")
-        self.assertLessEqual(len(capture.requested_frames), 8)
+        self.assertEqual(state["calls"], 3)
+        self.assertEqual(state["maximum"], 1)
 
     @unittest.skipUnless(
         os.getenv("RUN_FFMPEG_LAYOUT_TESTS", "").lower() == "true",

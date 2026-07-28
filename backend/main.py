@@ -70,13 +70,79 @@ def _get_current_rss_mb() -> float:
     return rss_value / 1024
 
 
+def _get_available_memory_mb() -> float | None:
+    cgroup_pairs = (
+        (
+            Path("/sys/fs/cgroup/memory.current"),
+            Path("/sys/fs/cgroup/memory.max"),
+        ),
+        (
+            Path("/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+        ),
+    )
+    for usage_path, limit_path in cgroup_pairs:
+        try:
+            usage_bytes = int(usage_path.read_text(encoding="utf-8").strip())
+            limit_text = limit_path.read_text(encoding="utf-8").strip()
+            if limit_text == "max":
+                continue
+            limit_bytes = int(limit_text)
+            if 0 < limit_bytes < (1 << 60):
+                return max(0.0, (limit_bytes - usage_bytes) / (1024 * 1024))
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+    if psutil is None:
+        return None
+    return psutil.virtual_memory().available / (1024 * 1024)
+
+
 def _log_memory_check(stage: str, candidate_number: int, total_candidates: int) -> None:
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     rss_mb = _get_current_rss_mb()
+    available_mb = _get_available_memory_mb()
+    available_label = (
+        f"{available_mb:.1f}" if available_mb is not None else "unknown"
+    )
     print(
         f"MEMORY CHECK | stage={stage} | candidate={candidate_number}/{total_candidates} | "
-        f"rss_mb={rss_mb:.1f} | ts={timestamp}"
+        f"rss_mb={rss_mb:.1f} | available_mb={available_label} | ts={timestamp}"
     )
+
+
+def _apply_visual_layout_memory_fallback(
+    visual_layout: dict[str, object],
+    available_memory_mb: float | None,
+) -> dict[str, object]:
+    try:
+        threshold_mb = max(
+            0.0,
+            float(os.getenv("VIDEO_LAYOUT_MEMORY_FALLBACK_MB", "120")),
+        )
+    except ValueError:
+        threshold_mb = 120.0
+    if (
+        available_memory_mb is None
+        or available_memory_mb >= threshold_mb
+        or visual_layout.get("mode") == "single_subject"
+    ):
+        return visual_layout
+    print(
+        "VISUAL LAYOUT FALLBACK | mode=single_subject | "
+        f"reason=low_available_memory | available_mb={available_memory_mb:.1f} | "
+        f"threshold_mb={threshold_mb:.1f}"
+    )
+    return {
+        "mode": "single_subject",
+        "confidence": 1.0,
+        "reason": (
+            "split layout disabled because available memory was below "
+            f"{threshold_mb:.0f} MB"
+        ),
+        "version": str(visual_layout.get("version") or "layout-v1"),
+        "sample_count": int(visual_layout.get("sample_count") or 0),
+        "regions": [],
+    }
 
 
 def _log_performance_timing(
@@ -5013,10 +5079,22 @@ async def _run_auto_generate_clip_pipeline():
         elapsed_seconds=time.perf_counter() - caption_generation_started_at,
     )
     best_clip["raw_video_path"] = best_clip.get("video_path")
+    best_candidate_number = int(best_clip.get("candidate_number", 0) or 0)
+    total_candidates = len(candidates)
+    _log_memory_check(
+        stage="before_visual_layout_detection",
+        candidate_number=best_candidate_number,
+        total_candidates=total_candidates,
+    )
     layout_detection_started_at = time.perf_counter()
     visual_layout = await asyncio.to_thread(
         detect_visual_layout,
         str(best_clip["raw_video_path"]),
+    )
+    _log_memory_check(
+        stage="after_visual_layout_detection",
+        candidate_number=best_candidate_number,
+        total_candidates=total_candidates,
     )
     _log_performance_timing(
         stage="visual_layout_detection",
@@ -5034,12 +5112,18 @@ async def _run_auto_generate_clip_pipeline():
             transcript_segments=caption_segments,
             duration_seconds=float(best_clip.get("duration", 0) or 0),
         )
-        best_candidate_number = int(best_clip.get("candidate_number", 0) or 0)
-        total_candidates = len(candidates)
 
         async with app.state.video_edit_lock:
+            visual_layout = _apply_visual_layout_memory_fallback(
+                visual_layout,
+                _get_available_memory_mb(),
+            )
+            best_clip["visual_layout_mode"] = visual_layout["mode"]
+            best_clip["visual_layout_confidence"] = visual_layout["confidence"]
+            best_clip["visual_layout_reason"] = visual_layout["reason"]
+            best_clip["visual_layout_version"] = visual_layout["version"]
             _log_memory_check(
-                stage="before_ffmpeg_video_editing",
+                stage="before_ffmpeg_edit",
                 candidate_number=best_candidate_number,
                 total_candidates=total_candidates,
             )
@@ -5067,7 +5151,7 @@ async def _run_auto_generate_clip_pipeline():
                 elapsed_seconds=time.perf_counter() - ffmpeg_started_at,
             )
             _log_memory_check(
-                stage="after_ffmpeg_video_editing",
+                stage="after_ffmpeg_edit",
                 candidate_number=best_candidate_number,
                 total_candidates=total_candidates,
             )

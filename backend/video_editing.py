@@ -1,4 +1,5 @@
 from functools import lru_cache
+import gc
 from pathlib import Path
 import json
 import os
@@ -376,54 +377,71 @@ def _normalized_layout_region(region: object) -> Dict[str, float]:
 
 def _detect_face_like_regions(frame: object) -> List[Dict[str, float]]:
     height, width = frame.shape[:2]
-    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
-    skin_mask = cv2.inRange(
-        ycrcb,
-        (0, 133, 77),
-        (255, 173, 127),
-    )
-    contours_result = cv2.findContours(
-        skin_mask,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE,
-    )
-    contours = contours_result[-2]
-    regions = []
-    minimum_area = width * height * 0.003
-    for contour in contours:
-        x, y, region_width, region_height = cv2.boundingRect(contour)
-        area = cv2.contourArea(contour)
-        aspect_ratio = region_width / max(1, region_height)
-        if (
-            area < minimum_area
-            or not 0.35 <= aspect_ratio <= 1.8
-            or region_height < height * 0.08
-        ):
-            continue
-        regions.append(
-            {
-                "x": x / width,
-                "y": y / height,
-                "width": region_width / width,
-                "height": region_height / height,
-                "center_x": (x + region_width / 2) / width,
-            }
+    ycrcb = None
+    skin_mask = None
+    contours_result = None
+    contours = None
+    try:
+        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+        skin_mask = cv2.inRange(
+            ycrcb,
+            (0, 133, 77),
+            (255, 173, 127),
         )
-    regions.sort(
-        key=lambda region: region["width"] * region["height"],
-        reverse=True,
-    )
-    return regions[:4]
+        contours_result = cv2.findContours(
+            skin_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        contours = contours_result[-2]
+        regions = []
+        minimum_area = width * height * 0.003
+        for contour in contours:
+            x, y, region_width, region_height = cv2.boundingRect(contour)
+            area = cv2.contourArea(contour)
+            aspect_ratio = region_width / max(1, region_height)
+            if (
+                area < minimum_area
+                or not 0.35 <= aspect_ratio <= 1.8
+                or region_height < height * 0.08
+            ):
+                continue
+            regions.append(
+                {
+                    "x": x / width,
+                    "y": y / height,
+                    "width": region_width / width,
+                    "height": region_height / height,
+                    "center_x": (x + region_width / 2) / width,
+                }
+            )
+        regions.sort(
+            key=lambda region: region["width"] * region["height"],
+            reverse=True,
+        )
+        return regions[:4]
+    finally:
+        del contours
+        del contours_result
+        del skin_mask
+        del ycrcb
 
 
 def detect_visual_layout(video_path: str) -> Dict[str, object]:
     if os.getenv("VIDEO_LAYOUT_DETECTION_ENABLED", "true").lower() != "true":
         return _single_subject_layout("layout detection disabled")
     try:
-        requested_samples = int(os.getenv("VIDEO_LAYOUT_SAMPLE_COUNT", "5"))
+        requested_samples = int(os.getenv("VIDEO_LAYOUT_SAMPLE_COUNT", "3"))
     except ValueError:
-        requested_samples = 5
-    sample_count = max(1, min(8, requested_samples))
+        requested_samples = 3
+    sample_count = max(1, min(4, requested_samples))
+    try:
+        configured_max_width = int(
+            os.getenv("VIDEO_LAYOUT_SAMPLE_MAX_WIDTH", "320")
+        )
+    except ValueError:
+        configured_max_width = 320
+    sample_max_width = max(64, min(320, configured_max_width))
     try:
         minimum_confidence = min(
             1.0,
@@ -432,47 +450,87 @@ def detect_visual_layout(video_path: str) -> Dict[str, object]:
     except ValueError:
         minimum_confidence = 0.70
 
-    capture = cv2.VideoCapture(video_path)
-    if not capture.isOpened():
-        return _single_subject_layout("video could not be sampled")
-    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    source_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    source_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if frame_count <= 0 or source_width <= 0 or source_height <= 0:
-        capture.release()
-        return _single_subject_layout("video metadata unavailable")
-    indices = [
-        int(round(index * (frame_count - 1) / max(1, sample_count - 1)))
-        for index in range(sample_count)
-    ]
-    sampled_faces: List[List[Dict[str, float]]] = []
-    for frame_index in indices:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-        success, frame = capture.read()
-        if not success or frame is None:
-            continue
-        height, width = frame.shape[:2]
-        if width > 480:
-            ratio = 480.0 / width
-            frame = cv2.resize(
-                frame,
-                (480, max(1, int(height * ratio))),
-                interpolation=cv2.INTER_AREA,
-            )
-        sampled_faces.append(_detect_face_like_regions(frame))
-        del frame
-    capture.release()
+    capture = None
+    try:
+        capture = cv2.VideoCapture(video_path)
+        if not capture.isOpened():
+            return _single_subject_layout("video could not be sampled")
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        source_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        source_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if frame_count <= 0 or source_width <= 0 or source_height <= 0:
+            return _single_subject_layout("video metadata unavailable")
 
-    usable_samples = len(sampled_faces)
-    if not usable_samples:
-        return _single_subject_layout("no usable samples")
-    two_face_samples = [
-        faces for faces in sampled_faces
-        if len(faces) >= 2
-        and max(face["center_x"] for face in faces)
-        - min(face["center_x"] for face in faces) >= 0.25
-    ]
-    two_face_confidence = len(two_face_samples) / usable_samples
+        usable_samples = 0
+        two_face_sample_count = 0
+        edge_face_sample_count = 0
+        left_edge_face_count = 0
+        for sample_index in range(sample_count):
+            frame_index = int(
+                round(
+                    sample_index
+                    * (frame_count - 1)
+                    / max(1, sample_count - 1)
+                )
+            )
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            success, decoded_frame = capture.read()
+            if not success or decoded_frame is None:
+                continue
+            sampled_frame = None
+            faces = None
+            try:
+                height, width = decoded_frame.shape[:2]
+                if width > sample_max_width:
+                    ratio = sample_max_width / width
+                    sampled_frame = cv2.resize(
+                        decoded_frame,
+                        (
+                            sample_max_width,
+                            max(1, int(height * ratio)),
+                        ),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                else:
+                    sampled_frame = decoded_frame
+                faces = _detect_face_like_regions(sampled_frame)
+                usable_samples += 1
+                if (
+                    len(faces) >= 2
+                    and max(face["center_x"] for face in faces)
+                    - min(face["center_x"] for face in faces) >= 0.25
+                ):
+                    two_face_sample_count += 1
+                elif (
+                    len(faces) == 1
+                    and (
+                        faces[0]["center_x"] <= 0.32
+                        or faces[0]["center_x"] >= 0.68
+                    )
+                ):
+                    edge_face_sample_count += 1
+                    if faces[0]["center_x"] < 0.5:
+                        left_edge_face_count += 1
+            finally:
+                del faces
+                del sampled_frame
+                del decoded_frame
+
+        if not usable_samples:
+            return _single_subject_layout("no usable samples")
+        two_face_confidence = two_face_sample_count / usable_samples
+        reaction_confidence = edge_face_sample_count / usable_samples
+        face_on_left = (
+            left_edge_face_count >= edge_face_sample_count / 2
+            if edge_face_sample_count
+            else True
+        )
+    finally:
+        if capture is not None:
+            capture.release()
+        del capture
+        gc.collect()
+
     if two_face_confidence >= minimum_confidence:
         result = {
             "mode": "multi_person_split",
@@ -490,17 +548,7 @@ def detect_visual_layout(video_path: str) -> Dict[str, object]:
         return result
 
     wide_source = source_width / source_height >= 1.45
-    edge_face_samples = [
-        faces[0]
-        for faces in sampled_faces
-        if len(faces) == 1
-        and (faces[0]["center_x"] <= 0.32 or faces[0]["center_x"] >= 0.68)
-    ]
-    reaction_confidence = len(edge_face_samples) / usable_samples
     if wide_source and reaction_confidence >= minimum_confidence:
-        face_on_left = sum(face["center_x"] < 0.5 for face in edge_face_samples) >= (
-            len(edge_face_samples) / 2
-        )
         face_region = (
             {"x": 0.0, "y": 0.0, "width": 0.42, "height": 1.0}
             if face_on_left
