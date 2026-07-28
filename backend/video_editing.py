@@ -12,6 +12,8 @@ import time
 import unicodedata
 from typing import Dict, List, Optional
 
+import cv2
+
 
 CANVAS_WIDTH = 720
 CANVAS_HEIGHT = 1280
@@ -98,6 +100,7 @@ def _build_overlay_ass_content(
     title_text: str,
     title_font_size: int,
     transcript_segments: List[Dict[str, object]],
+    speech_captions_enabled: bool = False,
 ) -> str:
     header = [
         "[Script Info]",
@@ -114,6 +117,11 @@ def _build_overlay_ass_content(
         "[Events]",
         "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
     ]
+    if not speech_captions_enabled:
+        header = [
+            line for line in header
+            if not line.startswith("Style: Caption")
+        ]
 
     events = []
 
@@ -125,7 +133,7 @@ def _build_overlay_ass_content(
             f"{{\\q2}}{cleaned_title}"
         )
 
-    for segment in transcript_segments[:120]:
+    for segment in transcript_segments[:120] if speech_captions_enabled else []:
         text = str(segment.get("text", "")).strip()
         if not text:
             continue
@@ -290,7 +298,43 @@ def _ensure_subtitles_filter_available(ffmpeg_path: str) -> None:
 def _build_filter_chain(
     overlay_ass_file_path: Path,
     emphasis_moments: Optional[List[Dict[str, object]]] = None,
+    visual_layout: Optional[Dict[str, object]] = None,
 ) -> str:
+    layout = visual_layout or {}
+    layout_mode = str(layout.get("mode") or "single_subject")
+    regions = layout.get("regions") if isinstance(layout.get("regions"), list) else []
+    safe_overlay_ass_file = _escape_filter_path(overlay_ass_file_path)
+
+    if layout_mode in {"multi_person_split", "reaction_split"} and len(regions) >= 2:
+        crop_filters = []
+        output_labels = []
+        for index, region in enumerate(regions[:2]):
+            normalized = _normalized_layout_region(region)
+            output_label = f"layout_region_{index}"
+            output_labels.append(output_label)
+            crop_filters.append(
+                f"[layout_input_{index}]"
+                f"crop=w='iw*{normalized['width']:.5f}':"
+                f"h='ih*{normalized['height']:.5f}':"
+                f"x='iw*{normalized['x']:.5f}':"
+                f"y='ih*{normalized['y']:.5f}',"
+                f"scale={CANVAS_WIDTH}:{VIDEO_REGION_HEIGHT // 2}:"
+                "force_original_aspect_ratio=increase,"
+                f"crop={CANVAS_WIDTH}:{VIDEO_REGION_HEIGHT // 2}"
+                f"[{output_label}]"
+            )
+        filters = [
+            "fps=24,split=2[layout_input_0][layout_input_1]",
+            *crop_filters,
+            f"[{output_labels[0]}][{output_labels[1]}]"
+            "vstack=inputs=2[video_region]",
+            f"color=c=white:s={CANVAS_WIDTH}x{CANVAS_HEIGHT}[base]",
+            f"[base][video_region]overlay=x=0:y={VIDEO_REGION_TOP}:"
+            "shortest=1:eof_action=endall[composed]",
+            f"[composed]subtitles=filename='{safe_overlay_ass_file}'",
+        ]
+        return ";".join(filters)
+
     normalized_moments = _normalize_emphasis_moments(emphasis_moments)
     zoom_expression = _build_zoom_expression(normalized_moments)
 
@@ -313,10 +357,196 @@ def _build_filter_chain(
         f"[base][video_region]overlay=x=0:y={VIDEO_REGION_TOP}:shortest=1:eof_action=endall[composed]",
     ]
 
-    safe_overlay_ass_file = _escape_filter_path(overlay_ass_file_path)
     filters.append(f"[composed]subtitles=filename='{safe_overlay_ass_file}'")
 
     return ";".join(filters)
+
+
+def _normalized_layout_region(region: object) -> Dict[str, float]:
+    source = region if isinstance(region, dict) else {}
+    try:
+        x = min(0.95, max(0.0, float(source.get("x", 0.0))))
+        y = min(0.95, max(0.0, float(source.get("y", 0.0))))
+        width = min(1.0 - x, max(0.05, float(source.get("width", 1.0))))
+        height = min(1.0 - y, max(0.05, float(source.get("height", 1.0))))
+    except (TypeError, ValueError):
+        return {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0}
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def _detect_face_like_regions(frame: object) -> List[Dict[str, float]]:
+    height, width = frame.shape[:2]
+    ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+    skin_mask = cv2.inRange(
+        ycrcb,
+        (0, 133, 77),
+        (255, 173, 127),
+    )
+    contours_result = cv2.findContours(
+        skin_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    contours = contours_result[-2]
+    regions = []
+    minimum_area = width * height * 0.003
+    for contour in contours:
+        x, y, region_width, region_height = cv2.boundingRect(contour)
+        area = cv2.contourArea(contour)
+        aspect_ratio = region_width / max(1, region_height)
+        if (
+            area < minimum_area
+            or not 0.35 <= aspect_ratio <= 1.8
+            or region_height < height * 0.08
+        ):
+            continue
+        regions.append(
+            {
+                "x": x / width,
+                "y": y / height,
+                "width": region_width / width,
+                "height": region_height / height,
+                "center_x": (x + region_width / 2) / width,
+            }
+        )
+    regions.sort(
+        key=lambda region: region["width"] * region["height"],
+        reverse=True,
+    )
+    return regions[:4]
+
+
+def detect_visual_layout(video_path: str) -> Dict[str, object]:
+    if os.getenv("VIDEO_LAYOUT_DETECTION_ENABLED", "true").lower() != "true":
+        return _single_subject_layout("layout detection disabled")
+    try:
+        requested_samples = int(os.getenv("VIDEO_LAYOUT_SAMPLE_COUNT", "5"))
+    except ValueError:
+        requested_samples = 5
+    sample_count = max(1, min(8, requested_samples))
+    try:
+        minimum_confidence = min(
+            1.0,
+            max(0.0, float(os.getenv("VIDEO_LAYOUT_MIN_CONFIDENCE", "0.70"))),
+        )
+    except ValueError:
+        minimum_confidence = 0.70
+
+    capture = cv2.VideoCapture(video_path)
+    if not capture.isOpened():
+        return _single_subject_layout("video could not be sampled")
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    source_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    source_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if frame_count <= 0 or source_width <= 0 or source_height <= 0:
+        capture.release()
+        return _single_subject_layout("video metadata unavailable")
+    indices = [
+        int(round(index * (frame_count - 1) / max(1, sample_count - 1)))
+        for index in range(sample_count)
+    ]
+    sampled_faces: List[List[Dict[str, float]]] = []
+    for frame_index in indices:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+        success, frame = capture.read()
+        if not success or frame is None:
+            continue
+        height, width = frame.shape[:2]
+        if width > 480:
+            ratio = 480.0 / width
+            frame = cv2.resize(
+                frame,
+                (480, max(1, int(height * ratio))),
+                interpolation=cv2.INTER_AREA,
+            )
+        sampled_faces.append(_detect_face_like_regions(frame))
+        del frame
+    capture.release()
+
+    usable_samples = len(sampled_faces)
+    if not usable_samples:
+        return _single_subject_layout("no usable samples")
+    two_face_samples = [
+        faces for faces in sampled_faces
+        if len(faces) >= 2
+        and max(face["center_x"] for face in faces)
+        - min(face["center_x"] for face in faces) >= 0.25
+    ]
+    two_face_confidence = len(two_face_samples) / usable_samples
+    if two_face_confidence >= minimum_confidence:
+        result = {
+            "mode": "multi_person_split",
+            "confidence": round(two_face_confidence, 3),
+            "reason": "multiple separated faces remained visible across samples",
+            "version": "layout-v1",
+            "sample_count": usable_samples,
+            "regions": [
+                {"x": 0.0, "y": 0.0, "width": 0.52, "height": 1.0},
+                {"x": 0.48, "y": 0.0, "width": 0.52, "height": 1.0},
+            ],
+        }
+        print(f"VISUAL LAYOUT SELECTED | mode=multi_person_split | confidence={two_face_confidence:.3f}")
+        print(f"VISUAL LAYOUT REGIONS | regions={result['regions']}")
+        return result
+
+    wide_source = source_width / source_height >= 1.45
+    edge_face_samples = [
+        faces[0]
+        for faces in sampled_faces
+        if len(faces) == 1
+        and (faces[0]["center_x"] <= 0.32 or faces[0]["center_x"] >= 0.68)
+    ]
+    reaction_confidence = len(edge_face_samples) / usable_samples
+    if wide_source and reaction_confidence >= minimum_confidence:
+        face_on_left = sum(face["center_x"] < 0.5 for face in edge_face_samples) >= (
+            len(edge_face_samples) / 2
+        )
+        face_region = (
+            {"x": 0.0, "y": 0.0, "width": 0.42, "height": 1.0}
+            if face_on_left
+            else {"x": 0.58, "y": 0.0, "width": 0.42, "height": 1.0}
+        )
+        content_region = (
+            {"x": 0.32, "y": 0.0, "width": 0.68, "height": 1.0}
+            if face_on_left
+            else {"x": 0.0, "y": 0.0, "width": 0.68, "height": 1.0}
+        )
+        result = {
+            "mode": "reaction_split",
+            "confidence": round(reaction_confidence, 3),
+            "reason": "persistent edge webcam face with wide reacted-content area",
+            "version": "layout-v1",
+            "sample_count": usable_samples,
+            "regions": [face_region, content_region],
+        }
+        print(f"VISUAL LAYOUT SELECTED | mode=reaction_split | confidence={reaction_confidence:.3f}")
+        print(f"VISUAL LAYOUT REGIONS | regions={result['regions']}")
+        return result
+    return _single_subject_layout(
+        "layout evidence below confidence threshold",
+        max(two_face_confidence, reaction_confidence),
+        usable_samples,
+    )
+
+
+def _single_subject_layout(
+    reason: str,
+    confidence: float = 1.0,
+    sample_count: int = 0,
+) -> Dict[str, object]:
+    result = {
+        "mode": "single_subject",
+        "confidence": round(float(confidence), 3),
+        "reason": reason,
+        "version": "layout-v1",
+        "sample_count": sample_count,
+        "regions": [],
+    }
+    print(
+        "VISUAL LAYOUT FALLBACK | "
+        f"mode=single_subject | confidence={confidence:.3f} | reason={reason}"
+    )
+    return result
 
 
 def _prepare_title_text(value: str) -> tuple[str, int, int]:
@@ -406,6 +636,7 @@ def create_tiktok_edited_video(
     output_path: Optional[str] = None,
     emphasis_moments: Optional[List[Dict[str, object]]] = None,
     selected_duration_seconds: Optional[float] = None,
+    visual_layout: Optional[Dict[str, object]] = None,
 ) -> str:
     ffmpeg_path = shutil.which("ffmpeg")
     ffprobe_path = shutil.which("ffprobe")
@@ -464,6 +695,12 @@ def create_tiktok_edited_video(
                     prepared_title,
                     title_font_size,
                     transcript_segments,
+                    speech_captions_enabled=(
+                        os.getenv(
+                            "VIDEO_SPEECH_CAPTIONS_ENABLED",
+                            "false",
+                        ).lower() == "true"
+                    ),
                 )
             )
             overlay_temp_path = Path(overlay_temp.name)
@@ -471,6 +708,7 @@ def create_tiktok_edited_video(
         filter_chain = _build_filter_chain(
             overlay_ass_file_path=overlay_temp_path,
             emphasis_moments=emphasis_moments,
+            visual_layout=visual_layout,
         )
 
         command = [

@@ -28,9 +28,21 @@ _TITLE_BANNED_PHRASES = {
     "this moment went viral",
     "yesterday's clip",
     "yesterday’s clip",
+    "crazy stream moment",
+    "streamer goes viral",
+    "unexpected stream moment",
+    "this was insane",
 }
 _TITLE_MAX_BODY_CHARS = 70
-_TITLE_ALLOWED_EMOJIS = ["😂", "😭", "💀", "😱", "😳", "🔥"]
+_TITLE_PROFANITY_PATTERN = re.compile(
+    r"\b(fuck(?:ing)?|shit|bitch|asshole|cunt|nigg(?:a|er))\b",
+    re.IGNORECASE,
+)
+_TITLE_STOP_WORDS = {
+    "about", "after", "again", "before", "could", "from", "have", "just",
+    "moment", "really", "stream", "streamer", "that", "their", "there",
+    "these", "they", "this", "those", "with", "would", "your",
+}
 
 
 def _log_timing(stage: str, elapsed_seconds: float) -> None:
@@ -65,13 +77,23 @@ def _pick_relevant_emoji(source_text: str) -> str:
     text = (source_text or "").lower()
     if any(word in text for word in ("laugh", "lol", "lmao", "funny", "joke")):
         return "😂"
-    if any(word in text for word in ("cry", "sad", "regret", "sorry", "pain")):
-        return "😭"
+    if any(word in text for word in ("awkward", "cringe", "embarrass")):
+        return "😬"
+    if any(word in text for word in ("heartbreak", "heartbroken", "breakup")):
+        return "💔"
+    if any(word in text for word in ("sad", "disappoint", "regret", "sorry")):
+        return "😔"
     if any(word in text for word in ("dead", "clipped", "obliterated", "destroyed", "cooked")):
         return "💀"
-    if any(word in text for word in ("what", "no way", "wtf", "insane", "shock", "unexpected")):
+    if any(word in text for word in ("mind blown", "unbelievable", "speechless")):
+        return "🤯"
+    if any(word in text for word in ("scream", "shock", "terrified")):
         return "😱"
-    if any(word in text for word in ("clutch", "win", "comeback", "ace", "crazy")):
+    if any(word in text for word in ("confused", "what", "no way", "unexpected")):
+        return "😳"
+    if any(word in text for word in ("goat", "best ever", "legend")):
+        return "🐐"
+    if any(word in text for word in ("clutch", "win", "comeback", "ace", "impressive")):
         return "🔥"
     return "😳"
 
@@ -120,6 +142,7 @@ def _sanitize_generated_title(raw_title: str, transcript: str) -> str:
         return _build_transcript_fallback_title(transcript)
 
     body = _strip_emojis(candidate)
+    body = _TITLE_PROFANITY_PATTERN.sub("", body)
     body = _collapse_whitespace(body)
     body = _limit_title_lines(body)
     body = body.rstrip(".,;:!? ")
@@ -130,6 +153,41 @@ def _sanitize_generated_title(raw_title: str, transcript: str) -> str:
     emoji_source = f"{raw_title} {transcript}"
     trailing_emoji = _pick_relevant_emoji(emoji_source)
     return f"{body} {trailing_emoji}"
+
+
+def _title_terms(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9']+", (value or "").lower())
+        if len(token) >= 4 and token not in _TITLE_STOP_WORDS
+    }
+
+
+def _title_relevance_score(title: str, evidence: str) -> float:
+    title_terms = _title_terms(_strip_emojis(title))
+    evidence_terms = _title_terms(evidence)
+    if not title_terms:
+        return 0.0
+    supported = len(title_terms & evidence_terms)
+    return round(supported / len(title_terms), 3)
+
+
+def _deterministic_title_fallback(transcript: str, event_summary: str) -> str:
+    evidence = _collapse_whitespace(
+        _TITLE_PROFANITY_PATTERN.sub("", event_summary or transcript)
+    )
+    meaningful = [
+        word.strip(".,;:!?")
+        for word in evidence.split()
+        if word.strip(".,;:!?")
+    ][:10]
+    while len(meaningful) > 5 and len(" ".join(meaningful)) > _TITLE_MAX_BODY_CHARS:
+        meaningful.pop()
+    if len(meaningful) < 5:
+        meaningful = ["Reaction", "Builds", "Into", "A", "Real", "Payoff"]
+    body = " ".join(meaningful[:10]).strip(".,;:!?")
+    body = body[0].upper() + body[1:] if body else "Reaction Builds Into A Real Payoff"
+    return f"{body} {_pick_relevant_emoji(evidence)}"
 
 
 def _get_whisper_model() -> object:
@@ -190,10 +248,33 @@ def generate_ai_title(
     transcript: str,
     context: Optional[dict[str, object]] = None,
 ) -> str:
-    if not transcript.strip():
-        return _build_transcript_fallback_title(transcript)
+    return str(generate_ai_title_package(transcript, context)["generated_title"])
 
+
+def generate_ai_title_package(
+    transcript: str,
+    context: Optional[dict[str, object]] = None,
+) -> dict[str, object]:
     context = context or {}
+    selected_transcript = _collapse_whitespace(transcript)
+    event_summary = _collapse_whitespace(
+        " ".join(
+            str(context.get(key) or "")
+            for key in ("score_hook", "score_reason", "visual_event_summary")
+        )
+    )
+    if not event_summary:
+        event_summary = " ".join(selected_transcript.split()[:40])
+    if not selected_transcript:
+        fallback = _deterministic_title_fallback("", event_summary)
+        return {
+            "generated_title": fallback,
+            "title_event_summary": event_summary,
+            "title_relevance_score": 1.0,
+            "title_generation_version": "title-v3",
+            "title_fallback_used": True,
+        }
+
     context_lines = [
         f"visual_score: {context.get('visual_score', '')}",
         f"transcript_score: {context.get('transcript_score', '')}",
@@ -202,30 +283,52 @@ def generate_ai_title(
         f"score_reason: {context.get('score_reason', '')}",
         f"stream_title: {context.get('stream_title', '')}",
         f"game: {context.get('game', '')}",
+        f"creator: {context.get('creator', '')}",
+        f"clip_start_seconds: {context.get('clip_start_seconds', 0)}",
+        f"clip_end_seconds: {context.get('clip_end_seconds', '')}",
+        f"event_summary: {event_summary}",
     ]
     context_text = "\n".join(context_lines)
-
-    response = client.responses.create(
-        model="gpt-5-nano",
-        input=(
-            "Create exactly one curiosity-driven title for this short-form gaming clip.\n"
-            "Rules:\n"
-            "- Truthful to the clip and transcript\n"
-            "- Concrete language, not generic hype\n"
-            "- 5 to 10 words preferred\n"
-            "- No hashtags\n"
-            "- No creator name unless absolutely necessary\n"
-            "- End with exactly one relevant emoji\n"
-            "- Avoid these exact phrases: This got crazy; Out of pocket chaos; You won't believe this; This moment went viral; Yesterday's clip\n"
-            "Return only the title and nothing else.\n\n"
-            "Clip transcript:\n"
-            f"{transcript}\n\n"
-            "Visual and scoring context:\n"
-            f"{context_text}"
-        ),
+    evidence = f"{selected_transcript} {event_summary} {context_text}"
+    prompt = (
+        "Write exactly one truthful TikTok-style title for the selected clip. "
+        "Describe the central action or reaction, using 5-10 words before one "
+        "relevant trailing emoji. Use only facts supported by the transcript and "
+        "event summary. No hashtags, profanity, invented people, motives, outcomes, "
+        "or generic phrases such as Crazy Stream Moment, You Won't Believe This, "
+        "Streamer Goes Viral, Unexpected Stream Moment, or This Was Insane. "
+        "Return only the title.\n\n"
+        f"Selected transcript:\n{selected_transcript}\n\nContext:\n{context_text}"
     )
-
-    return _sanitize_generated_title(response.output_text.strip(), transcript)
+    fallback_used = False
+    title = ""
+    relevance = 0.0
+    for attempt in range(2):
+        retry_instruction = (
+            "\nYour prior title was unsupported. Reuse concrete words and actions "
+            "from the evidence; do not generalize."
+            if attempt
+            else ""
+        )
+        response = client.responses.create(
+            model="gpt-5-nano",
+            input=prompt + retry_instruction,
+        )
+        title = _sanitize_generated_title(response.output_text.strip(), evidence)
+        relevance = _title_relevance_score(title, evidence)
+        if relevance >= 0.45:
+            break
+    else:
+        title = _deterministic_title_fallback(selected_transcript, event_summary)
+        relevance = _title_relevance_score(title, evidence)
+        fallback_used = True
+    return {
+        "generated_title": title,
+        "title_event_summary": event_summary,
+        "title_relevance_score": relevance,
+        "title_generation_version": "title-v3",
+        "title_fallback_used": fallback_used,
+    }
 
 def generate_ai_description(transcript: str) -> str:
     if not transcript.strip():

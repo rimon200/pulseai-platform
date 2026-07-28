@@ -33,13 +33,13 @@ except ImportError:
     import resource
 from ai import (
     client,
-    generate_ai_title,
+    generate_ai_title_package,
     generate_ai_description,
     generate_tiktok_caption_package,
     release_whisper_model,
     score_multimodal_clip,
 )
-from video_editing import create_tiktok_edited_video
+from video_editing import create_tiktok_edited_video, detect_visual_layout
 from storage_service import object_storage_enabled, upload_video
 
 load_dotenv()
@@ -1018,6 +1018,15 @@ def _ensure_clip_history_table() -> bool:
                     "rights_status": "TEXT",
                     "authorization_reference": "TEXT",
                     "authorization_notes": "TEXT",
+                    "visual_layout_mode": "TEXT",
+                    "visual_layout_confidence": "DOUBLE PRECISION",
+                    "visual_layout_reason": "TEXT",
+                    "visual_layout_version": "TEXT",
+                    "generated_title": "TEXT",
+                    "title_event_summary": "TEXT",
+                    "title_relevance_score": "DOUBLE PRECISION",
+                    "title_generation_version": "TEXT",
+                    "title_fallback_used": "BOOLEAN",
                 }
                 for column_name, column_type in additive_columns.items():
                     cursor.execute(
@@ -1046,6 +1055,22 @@ def _ensure_clip_history_table() -> bool:
                     )
                     """
                 )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS monitored_creators (
+                        id BIGSERIAL PRIMARY KEY,
+                        twitch_user_id TEXT,
+                        login TEXT NOT NULL UNIQUE,
+                        display_name TEXT NOT NULL,
+                        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                        priority INTEGER NOT NULL DEFAULT 0,
+                        notes TEXT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                _backfill_monitored_creators(cursor)
                 cursor.execute(
                     """
                     CREATE INDEX IF NOT EXISTS twitch_clip_history_status_idx
@@ -1243,6 +1268,7 @@ def _ensure_clip_history_table() -> bool:
                 if not _backfill_clip_history(cursor):
                     raise RuntimeError("clip history backfill failed")
             connection.commit()
+        print("MONITORED CREATORS READY")
         return True
     except Exception as error:
         print(f"CLIP HISTORY DB ERROR | operation=init | error={error!r}")
@@ -2002,41 +2028,74 @@ def clean_channel_name(channel: str) -> str:
     return channel.strip().removeprefix("@").lower()
 
 
-def load_creators() -> list[dict[str, str]]:
+def _load_creators_from_json() -> list[dict[str, str]]:
     if not CREATORS_FILE.exists():
-        save_creators(DEFAULT_CREATORS)
         return DEFAULT_CREATORS.copy()
-
     try:
         with CREATORS_FILE.open("r", encoding="utf-8") as file:
             data = json.load(file)
-
-        if not isinstance(data, list):
-            raise ValueError("Creator data must be a list.")
-
-        creators = []
-
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-
-            name = str(item.get("name", "")).strip()
-            channel = clean_channel_name(str(item.get("channel", "")))
-
-            if name and channel:
-                creators.append(
-                    {
-                        "name": name,
-                        "channel": channel,
-                    }
-                )
-
-        return creators
-
-    except (json.JSONDecodeError, OSError, ValueError) as error:
+    except (json.JSONDecodeError, OSError) as error:
         raise HTTPException(
             status_code=500,
             detail=f"Unable to read creators.json: {error}",
+        ) from error
+    creators = []
+    for item in data if isinstance(data, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()
+        channel = clean_channel_name(str(item.get("channel", "")))
+        if name and channel:
+            creators.append({"name": name, "channel": channel})
+    return creators
+
+
+def _backfill_monitored_creators(cursor: object) -> None:
+    creators = _load_creators_from_json()
+    inserted = 0
+    for priority, creator in enumerate(creators):
+        cursor.execute(
+            """
+            INSERT INTO monitored_creators (
+                login, display_name, enabled, priority
+            ) VALUES (%s, %s, TRUE, %s)
+            ON CONFLICT (login) DO NOTHING
+            RETURNING login
+            """,
+            (creator["channel"], creator["name"], priority),
+        )
+        if cursor.fetchone():
+            inserted += 1
+    print(
+        "MONITORED CREATOR BACKFILL | "
+        f"source_records={len(creators)} | inserted={inserted}"
+    )
+
+
+def load_creators() -> list[dict[str, str]]:
+    if not DATABASE_URL:
+        return _load_creators_from_json()
+    if not getattr(app.state, "clip_history_ready", False):
+        raise HTTPException(status_code=503, detail="Creator storage is unavailable.")
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT display_name, login FROM monitored_creators
+                    WHERE enabled = TRUE
+                    ORDER BY priority, created_at, id
+                    """
+                )
+                rows = cursor.fetchall()
+        return [{"name": row[0], "channel": row[1]} for row in rows]
+    except Exception as error:
+        print(f"MONITORED CREATOR LOAD FAILED | error={error!r}")
+        raise HTTPException(
+            status_code=503,
+            detail="Creator storage is unavailable.",
         ) from error
 
 
@@ -3356,14 +3415,56 @@ async def add_creator(creator: CreatorCreate):
 
     twitch_data = await get_twitch_channel_data(clean_channel)
 
-    saved_creators.append(
-        {
-            "name": twitch_data["display_name"] or clean_name,
-            "channel": twitch_data["channel"],
-        }
-    )
+    if DATABASE_URL:
+        try:
+            import psycopg
 
-    save_creators(saved_creators)
+            with psycopg.connect(DATABASE_URL) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO monitored_creators (
+                            twitch_user_id, login, display_name, enabled
+                        ) VALUES (%s, %s, %s, TRUE)
+                        ON CONFLICT (login) DO UPDATE SET
+                            twitch_user_id = COALESCE(
+                                EXCLUDED.twitch_user_id,
+                                monitored_creators.twitch_user_id
+                            ),
+                            display_name = EXCLUDED.display_name,
+                            enabled = TRUE,
+                            updated_at = NOW()
+                        RETURNING id, (xmax = 0) AS inserted
+                        """,
+                        (
+                            twitch_data.get("user_id"),
+                            twitch_data["channel"],
+                            twitch_data["display_name"] or clean_name,
+                        ),
+                    )
+                    saved_row = cursor.fetchone()
+                connection.commit()
+            if not saved_row:
+                raise RuntimeError("creator upsert returned no row")
+            action = "ADDED" if saved_row[1] else "UPDATED"
+            print(
+                f"MONITORED CREATOR {action} | "
+                f"login={twitch_data['channel']}"
+            )
+        except Exception as error:
+            print(f"MONITORED CREATOR UPDATE FAILED | error={error!r}")
+            raise HTTPException(
+                status_code=503,
+                detail="Creator could not be saved.",
+            ) from error
+    else:
+        saved_creators.append(
+            {
+                "name": twitch_data["display_name"] or clean_name,
+                "channel": twitch_data["channel"],
+            }
+        )
+        save_creators(saved_creators)
 
     return twitch_data
 
@@ -3371,6 +3472,38 @@ async def add_creator(creator: CreatorCreate):
 @app.delete("/creators/{channel_name}")
 def delete_creator(channel_name: str):
     clean_channel = clean_channel_name(channel_name)
+    if DATABASE_URL:
+        try:
+            import psycopg
+
+            with psycopg.connect(DATABASE_URL) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE monitored_creators
+                        SET enabled = FALSE, updated_at = NOW()
+                        WHERE login = %s AND enabled = TRUE
+                        RETURNING id
+                        """,
+                        (clean_channel,),
+                    )
+                    disabled = cursor.fetchone()
+                connection.commit()
+            if not disabled:
+                raise HTTPException(
+                    status_code=404,
+                    detail="That creator is not currently being monitored.",
+                )
+            print(f"MONITORED CREATOR DISABLED | login={clean_channel}")
+            return {"message": f"{clean_channel} was removed from monitoring."}
+        except HTTPException:
+            raise
+        except Exception as error:
+            print(f"MONITORED CREATOR UPDATE FAILED | error={error!r}")
+            raise HTTPException(
+                status_code=503,
+                detail="Creator could not be disabled.",
+            ) from error
     saved_creators = load_creators()
 
     updated_creators = [
@@ -3463,11 +3596,17 @@ def _persist_generated_clip_record(
                         actual_duration, longform_eligible_reason,
                         longform_rejection_reason, generated_at, title_version,
                         source_creator_id, source_platform, rights_status
+                        , visual_layout_mode, visual_layout_confidence,
+                        visual_layout_reason, visual_layout_version,
+                        generated_title, title_event_summary,
+                        title_relevance_score, title_generation_version,
+                        title_fallback_used
                     ) VALUES (
                         'twitch', %s, %s, %s, %s, %s,
                         'ready_for_review', %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s,
-                        NOW(), 'title-v2', %s, 'twitch', %s
+                        NOW(), 'title-v3', %s, 'twitch', %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
                     ON CONFLICT (provider, clip_id) DO UPDATE SET
                         clip_url = COALESCE(
@@ -3578,6 +3717,42 @@ def _persist_generated_clip_record(
                         rights_status = COALESCE(
                             twitch_clip_history.rights_status,
                             EXCLUDED.rights_status
+                        ),
+                        visual_layout_mode = COALESCE(
+                            EXCLUDED.visual_layout_mode,
+                            twitch_clip_history.visual_layout_mode
+                        ),
+                        visual_layout_confidence = COALESCE(
+                            EXCLUDED.visual_layout_confidence,
+                            twitch_clip_history.visual_layout_confidence
+                        ),
+                        visual_layout_reason = COALESCE(
+                            EXCLUDED.visual_layout_reason,
+                            twitch_clip_history.visual_layout_reason
+                        ),
+                        visual_layout_version = COALESCE(
+                            EXCLUDED.visual_layout_version,
+                            twitch_clip_history.visual_layout_version
+                        ),
+                        generated_title = COALESCE(
+                            EXCLUDED.generated_title,
+                            twitch_clip_history.generated_title
+                        ),
+                        title_event_summary = COALESCE(
+                            EXCLUDED.title_event_summary,
+                            twitch_clip_history.title_event_summary
+                        ),
+                        title_relevance_score = COALESCE(
+                            EXCLUDED.title_relevance_score,
+                            twitch_clip_history.title_relevance_score
+                        ),
+                        title_generation_version = COALESCE(
+                            EXCLUDED.title_generation_version,
+                            twitch_clip_history.title_generation_version
+                        ),
+                        title_fallback_used = COALESCE(
+                            EXCLUDED.title_fallback_used,
+                            twitch_clip_history.title_fallback_used
                         )
                     RETURNING clip_id, clip_url, generated_clip_id, status,
                               object_key, durable_url, generated_at
@@ -3606,6 +3781,15 @@ def _persist_generated_clip_record(
                             or clip.get("broadcaster_id")
                         ),
                         clip.get("rights_status") or "unknown",
+                        clip.get("visual_layout_mode"),
+                        clip.get("visual_layout_confidence"),
+                        clip.get("visual_layout_reason"),
+                        clip.get("visual_layout_version"),
+                        clip.get("generated_title") or clip.get("ai_title"),
+                        clip.get("title_event_summary"),
+                        clip.get("title_relevance_score"),
+                        clip.get("title_generation_version"),
+                        clip.get("title_fallback_used"),
                     ),
                 )
                 saved = cursor.fetchone()
@@ -4293,6 +4477,15 @@ async def create_clip(clip: dict):
     "longform_rejection_reason": clip.get("longform_rejection_reason", ""),
     "object_key": clip.get("object_key", ""),
     "durable_url": clip.get("durable_url", ""),
+    "visual_layout_mode": clip.get("visual_layout_mode", "single_subject"),
+    "visual_layout_confidence": clip.get("visual_layout_confidence", 0),
+    "visual_layout_reason": clip.get("visual_layout_reason", ""),
+    "visual_layout_version": clip.get("visual_layout_version", "layout-v1"),
+    "generated_title": clip.get("generated_title", clip.get("ai_title", "")),
+    "title_event_summary": clip.get("title_event_summary", ""),
+    "title_relevance_score": clip.get("title_relevance_score", 0),
+    "title_generation_version": clip.get("title_generation_version", "title-v3"),
+    "title_fallback_used": bool(clip.get("title_fallback_used", False)),
 }
 
     clips.append(new_clip)
@@ -4776,6 +4969,7 @@ async def _run_auto_generate_clip_pipeline():
             "best_score": best_clip["score"],
         }
 
+    best_clip.update(_select_duration_profile(best_clip))
     title_context = {
         "visual_score": best_clip.get("visual_score", 0),
         "transcript_score": best_clip.get("transcript_score", 0),
@@ -4784,9 +4978,18 @@ async def _run_auto_generate_clip_pipeline():
         "score_reason": best_clip.get("score_reason", ""),
         "stream_title": best_clip.get("title", ""),
         "game": best_clip.get("game", ""),
+        "creator": best_clip.get("creator", ""),
+        "clip_start_seconds": 0,
+        "clip_end_seconds": best_clip.get("requested_duration")
+        or best_clip.get("duration"),
     }
     title_generation_started_at = time.perf_counter()
-    best_clip["ai_title"] = generate_ai_title(best_clip["transcript"], context=title_context)
+    title_package = generate_ai_title_package(
+        best_clip["transcript"],
+        context=title_context,
+    )
+    best_clip.update(title_package)
+    best_clip["ai_title"] = title_package["generated_title"]
     _log_performance_timing(
         stage="title_generation",
         elapsed_seconds=time.perf_counter() - title_generation_started_at,
@@ -4809,8 +5012,20 @@ async def _run_auto_generate_clip_pipeline():
         stage="caption_hashtag_generation",
         elapsed_seconds=time.perf_counter() - caption_generation_started_at,
     )
-    best_clip.update(_select_duration_profile(best_clip))
     best_clip["raw_video_path"] = best_clip.get("video_path")
+    layout_detection_started_at = time.perf_counter()
+    visual_layout = await asyncio.to_thread(
+        detect_visual_layout,
+        str(best_clip["raw_video_path"]),
+    )
+    _log_performance_timing(
+        stage="visual_layout_detection",
+        elapsed_seconds=time.perf_counter() - layout_detection_started_at,
+    )
+    best_clip["visual_layout_mode"] = visual_layout["mode"]
+    best_clip["visual_layout_confidence"] = visual_layout["confidence"]
+    best_clip["visual_layout_reason"] = visual_layout["reason"]
+    best_clip["visual_layout_version"] = visual_layout["version"]
 
     try:
         title_for_overlay = best_clip.get("ai_title") or best_clip.get("title", "")
@@ -4829,6 +5044,7 @@ async def _run_auto_generate_clip_pipeline():
                 total_candidates=total_candidates,
             )
             ffmpeg_started_at = time.perf_counter()
+            visual_layout_render_started_at = time.perf_counter()
             edited_video_path = await asyncio.to_thread(
                 create_tiktok_edited_video,
                 best_clip["raw_video_path"],
@@ -4838,6 +5054,11 @@ async def _run_auto_generate_clip_pipeline():
                 selected_duration_seconds=float(
                     best_clip.get("requested_duration") or 0
                 ),
+                visual_layout=visual_layout,
+            )
+            _log_performance_timing(
+                stage="visual_layout_render",
+                elapsed_seconds=time.perf_counter() - visual_layout_render_started_at,
             )
             _log_performance_timing(
                 stage="ffmpeg_editing",

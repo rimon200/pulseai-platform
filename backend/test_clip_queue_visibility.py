@@ -39,6 +39,12 @@ class FrontendVisibilityContractTests(unittest.TestCase):
         self.assertNotIn("return true", fallback_block)
         self.assertIn('return normalized === "Ready to review"', fallback_block)
 
+    def test_unpublished_queue_navigation_is_wired(self):
+        source = (self.frontend_dir / "App.jsx").read_text(encoding="utf-8")
+        self.assertIn('{ name: "Unpublished Queue", icon: "📋" }', source)
+        self.assertIn('activePage === "Unpublished Queue"', source)
+        self.assertIn("<UnpublishedQueue styles={styles} />", source)
+
 
 @unittest.skipUnless(
     os.getenv("TEST_DATABASE_URL", "").strip(),
@@ -70,15 +76,18 @@ class PostgreSQLQueuePersistenceTests(unittest.TestCase):
         )
         cls.original_database_url = main.DATABASE_URL
         cls.original_base_dir = main.BASE_DIR
+        cls.original_history_ready = main.app.state.clip_history_ready
         main.DATABASE_URL = cls.schema_url
         main.BASE_DIR = Path(__file__).resolve().parent
         if not main._ensure_clip_history_table():
             raise RuntimeError("isolated clip-history migration failed")
+        main.app.state.clip_history_ready = True
 
     @classmethod
     def tearDownClass(cls):
         main.DATABASE_URL = cls.original_database_url
         main.BASE_DIR = cls.original_base_dir
+        main.app.state.clip_history_ready = cls.original_history_ready
         with cls.psycopg.connect(
             cls.base_url,
             options="-c search_path=pg_catalog",
@@ -186,6 +195,53 @@ class PostgreSQLQueuePersistenceTests(unittest.TestCase):
             captured.getvalue(),
         )
         self.assertIn(str(clip["object_key"]), captured.getvalue())
+
+    def test_database_creator_survives_reload_and_reinitialization(self):
+        with self.psycopg.connect(self.schema_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO monitored_creators (
+                        twitch_user_id, login, display_name, enabled, priority
+                    ) VALUES (
+                        'FAKE_USER_ID', 'fakepersistentcreator',
+                        'Fake Persistent Creator', TRUE, 99
+                    )
+                    """
+                )
+            connection.commit()
+        self.assertIn(
+            "fakepersistentcreator",
+            {creator["channel"] for creator in main.load_creators()},
+        )
+        self.assertTrue(main._ensure_clip_history_table())
+        self.assertIn(
+            "fakepersistentcreator",
+            {creator["channel"] for creator in main.load_creators()},
+        )
+
+    def test_json_backfill_does_not_overwrite_database_creator(self):
+        with self.psycopg.connect(self.schema_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE monitored_creators
+                    SET display_name = 'Database Owned Name', priority = 77
+                    WHERE login = 'kaicenat'
+                    """
+                )
+            connection.commit()
+        self.assertTrue(main._ensure_clip_history_table())
+        with self.psycopg.connect(self.schema_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT display_name, priority FROM monitored_creators
+                    WHERE login = 'kaicenat'
+                    """
+                )
+                row = cursor.fetchone()
+        self.assertEqual(row, ("Database Owned Name", 77))
 
 
 if __name__ == "__main__":
