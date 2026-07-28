@@ -387,11 +387,7 @@ function App() {
     renderCreatorRow={renderCreatorRow}
   />
 ) : activePage === "AI Clips" ? (
-  <AIClips
-  styles={styles}
-  clips={clips}
-  setClips={setClips}
-/>
+  <AIClips styles={styles} />
 ) : activePage === "Unpublished Queue" ? (
   <UnpublishedQueue styles={styles} />
 ) : activePage === "Publishing" ? (

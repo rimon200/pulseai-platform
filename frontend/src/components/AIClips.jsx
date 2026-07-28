@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL;
 const TIKTOK_RECONNECT_REQUIRED_MESSAGE = "TikTok authorization expired. Reconnect TikTok in Settings.";
+const AI_CLIPS_PAGE_SIZE = 10;
+const AI_CLIPS_STATUS = "ready_for_review";
 
 const normalizeClipStatus = (status) => {
   const value = String(status || "").trim().toLowerCase();
@@ -19,9 +21,6 @@ const normalizeClipStatus = (status) => {
 
 const isReviewableClip = (clip) => {
   const normalized = normalizeClipStatus(clip?.status);
-  if (!normalized) {
-    return true;
-  }
   return normalized === "Ready to review";
 };
 
@@ -55,22 +54,35 @@ const clipsMatch = (left, right) => {
   return false;
 };
 
-function AIClips({ styles, clips, setClips }) {
+function AIClips({ styles }) {
+  const [clips, setClips] = useState([]);
   const [previewClipId, setPreviewClipId] = useState(null);
   const [previewErrors, setPreviewErrors] = useState({});
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
+  const [loadError, setLoadError] = useState("");
   const reviewableClips = clips.filter(isReviewableClip);
 
+  const loadClips = useCallback(async (requestedPage) => {
+    const response = await fetch(
+      `${API_BASE_URL}/api/clips?limit=${AI_CLIPS_PAGE_SIZE}`
+      + `&page=${requestedPage}&status=${AI_CLIPS_STATUS}`,
+    );
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.detail || "Could not load AI Clips.");
+    }
+    setClips(Array.isArray(data) ? data : (data.items || []));
+    setHasMore(Boolean(data.has_more));
+    setLoadError("");
+  }, []);
+
   useEffect(() => {
-    fetch(`${API_BASE_URL}/api/clips?limit=10&page=${page}&status=ready_for_review`)
-      .then((response) => response.json())
-      .then((data) => {
-        setClips(Array.isArray(data) ? data : (data.items || []));
-        setHasMore(Boolean(data.has_more));
-      })
-      .catch((error) => console.error("Could not load AI Clips page", error));
-  }, [page, setClips]);
+    loadClips(page).catch((error) => {
+      console.error("Could not load AI Clips page", error);
+      setLoadError(error.message);
+    });
+  }, [loadClips, page]);
 
   const getClipVideoUrl = (clipId, download = false) =>
     `${API_BASE_URL}/api/clips/${encodeURIComponent(clipId)}/video${
@@ -124,10 +136,8 @@ if (result.message) {
   alert(result.message);
   return;
 }
-      const clipsResponse = await fetch(`${API_BASE_URL}/api/clips`);
-const updatedClips = await clipsResponse.json();
-
-setClips(Array.isArray(updatedClips) ? updatedClips : (updatedClips.items || []));
+      setPage(1);
+      await loadClips(1);
     } catch (error) {
     console.error(error);
     alert("Could not generate a clip.");
@@ -223,6 +233,9 @@ return (
         </div>
 
         <div style={styles.clipGrid}>
+          {loadError && (
+            <div style={styles.emptyState}>{loadError}</div>
+          )}
           {reviewableClips.length > 0 ? (
             reviewableClips.map((clip, index) => (
               <div

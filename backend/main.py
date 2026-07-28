@@ -3419,51 +3419,176 @@ def _paginate_items(
     }
 
 
-def _persist_generated_clip_record(clip: dict[str, object]) -> bool:
+def _log_queue_persistence_recovery(
+    clip_id: str,
+    object_key: object,
+    error: object,
+) -> None:
+    print(
+        "CLIP QUEUE PERSISTENCE FAILED - R2 MEDIA RETAINED | "
+        f"clip_id={clip_id or 'unknown'} | "
+        f"object_key={str(object_key or '') or 'none'} | "
+        f"error={error!r}"
+    )
+
+
+def _persist_generated_clip_record(
+    clip: dict[str, object],
+) -> dict[str, object] | None:
     if not DATABASE_URL:
-        return True
+        return {"clip_id": "", "status": "ready_for_review"}
     clip_id, clip_url = _normalized_twitch_identifiers(clip)
     if not clip_id:
-        return False
+        _log_queue_persistence_recovery(
+            "",
+            clip.get("object_key"),
+            "invalid or mismatched Twitch clip ID/URL",
+        )
+        return None
     try:
         import psycopg
+        from psycopg.rows import dict_row
 
-        with psycopg.connect(DATABASE_URL) as connection:
+        with psycopg.connect(DATABASE_URL, row_factory=dict_row) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    UPDATE twitch_clip_history SET
-                        generated_clip_id = %s,
-                        display_title = %s,
-                        creator_name = COALESCE(creator_name, %s),
-                        category = %s,
-                        viral_score = %s,
-                        status = 'ready_for_review',
-                        local_video_path = %s,
-                        raw_video_path = %s,
-                        object_key = %s,
-                        durable_url = %s,
-                        ai_post_caption = %s,
-                        ai_hashtags = %s::jsonb,
-                        ai_tiktok_description = %s,
-                        caption_generation_version = %s,
-                        transcript = %s,
-                        duration_profile = %s,
-                        requested_duration = %s,
-                        actual_duration = %s,
-                        longform_eligible_reason = %s,
-                        longform_rejection_reason = %s,
-                        generated_at = COALESCE(generated_at, NOW()),
-                        title_version = COALESCE(title_version, 'title-v2'),
-                        source_creator_id = COALESCE(source_creator_id, creator_id),
-                        source_platform = COALESCE(source_platform, 'twitch'),
-                        rights_status = COALESCE(rights_status, 'unknown')
-                    WHERE provider = 'twitch' AND clip_id = %s
-                    RETURNING clip_id
+                    INSERT INTO twitch_clip_history (
+                        provider, clip_id, clip_url, creator_id, creator_name,
+                        created_at, status, viral_score, generated_clip_id,
+                        display_title, category, local_video_path, raw_video_path,
+                        object_key, durable_url, ai_post_caption, ai_hashtags,
+                        ai_tiktok_description, caption_generation_version,
+                        transcript, duration_profile, requested_duration,
+                        actual_duration, longform_eligible_reason,
+                        longform_rejection_reason, generated_at, title_version,
+                        source_creator_id, source_platform, rights_status
+                    ) VALUES (
+                        'twitch', %s, %s, %s, %s, %s,
+                        'ready_for_review', %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s,
+                        NOW(), 'title-v2', %s, 'twitch', %s
+                    )
+                    ON CONFLICT (provider, clip_id) DO UPDATE SET
+                        clip_url = COALESCE(
+                            EXCLUDED.clip_url, twitch_clip_history.clip_url
+                        ),
+                        creator_id = COALESCE(
+                            twitch_clip_history.creator_id, EXCLUDED.creator_id
+                        ),
+                        creator_name = COALESCE(
+                            twitch_clip_history.creator_name, EXCLUDED.creator_name
+                        ),
+                        created_at = COALESCE(
+                            twitch_clip_history.created_at, EXCLUDED.created_at
+                        ),
+                        status = CASE
+                            WHEN twitch_clip_history.status IN (
+                                'publishing', 'uploaded_to_inbox',
+                                'published', 'archived'
+                            ) THEN twitch_clip_history.status
+                            ELSE 'ready_for_review'
+                        END,
+                        viral_score = COALESCE(
+                            EXCLUDED.viral_score,
+                            twitch_clip_history.viral_score
+                        ),
+                        generated_clip_id = EXCLUDED.generated_clip_id,
+                        display_title = COALESCE(
+                            NULLIF(EXCLUDED.display_title, ''),
+                            twitch_clip_history.display_title
+                        ),
+                        category = COALESCE(
+                            NULLIF(EXCLUDED.category, ''),
+                            twitch_clip_history.category
+                        ),
+                        local_video_path = COALESCE(
+                            NULLIF(EXCLUDED.local_video_path, ''),
+                            twitch_clip_history.local_video_path
+                        ),
+                        raw_video_path = COALESCE(
+                            NULLIF(EXCLUDED.raw_video_path, ''),
+                            twitch_clip_history.raw_video_path
+                        ),
+                        object_key = COALESCE(
+                            NULLIF(EXCLUDED.object_key, ''),
+                            twitch_clip_history.object_key
+                        ),
+                        durable_url = COALESCE(
+                            NULLIF(EXCLUDED.durable_url, ''),
+                            twitch_clip_history.durable_url
+                        ),
+                        ai_post_caption = COALESCE(
+                            EXCLUDED.ai_post_caption,
+                            twitch_clip_history.ai_post_caption
+                        ),
+                        ai_hashtags = COALESCE(
+                            EXCLUDED.ai_hashtags,
+                            twitch_clip_history.ai_hashtags
+                        ),
+                        ai_tiktok_description = COALESCE(
+                            EXCLUDED.ai_tiktok_description,
+                            twitch_clip_history.ai_tiktok_description
+                        ),
+                        caption_generation_version = COALESCE(
+                            NULLIF(EXCLUDED.caption_generation_version, ''),
+                            twitch_clip_history.caption_generation_version
+                        ),
+                        transcript = COALESCE(
+                            NULLIF(EXCLUDED.transcript, ''),
+                            twitch_clip_history.transcript
+                        ),
+                        duration_profile = COALESCE(
+                            NULLIF(EXCLUDED.duration_profile, ''),
+                            twitch_clip_history.duration_profile
+                        ),
+                        requested_duration = COALESCE(
+                            EXCLUDED.requested_duration,
+                            twitch_clip_history.requested_duration
+                        ),
+                        actual_duration = COALESCE(
+                            EXCLUDED.actual_duration,
+                            twitch_clip_history.actual_duration
+                        ),
+                        longform_eligible_reason = COALESCE(
+                            NULLIF(EXCLUDED.longform_eligible_reason, ''),
+                            twitch_clip_history.longform_eligible_reason
+                        ),
+                        longform_rejection_reason = COALESCE(
+                            NULLIF(EXCLUDED.longform_rejection_reason, ''),
+                            twitch_clip_history.longform_rejection_reason
+                        ),
+                        generated_at = COALESCE(
+                            twitch_clip_history.generated_at,
+                            EXCLUDED.generated_at
+                        ),
+                        title_version = COALESCE(
+                            twitch_clip_history.title_version,
+                            EXCLUDED.title_version
+                        ),
+                        source_creator_id = COALESCE(
+                            twitch_clip_history.source_creator_id,
+                            EXCLUDED.source_creator_id,
+                            twitch_clip_history.creator_id
+                        ),
+                        source_platform = COALESCE(
+                            twitch_clip_history.source_platform,
+                            EXCLUDED.source_platform
+                        ),
+                        rights_status = COALESCE(
+                            twitch_clip_history.rights_status,
+                            EXCLUDED.rights_status
+                        )
+                    RETURNING clip_id, clip_url, generated_clip_id, status,
+                              object_key, durable_url, generated_at
                     """,
                     (
+                        clip_id, clip_url,
+                        clip.get("creator_id") or clip.get("broadcaster_id"),
+                        clip.get("creator") or clip.get("creator_name"),
+                        clip.get("created_at"), clip.get("score"),
                         clip.get("id"), clip.get("ai_title") or clip.get("title"),
-                        clip.get("creator"), clip.get("game"), clip.get("score"),
+                        clip.get("game"),
                         clip.get("video_path"), clip.get("raw_video_path"),
                         clip.get("object_key"), clip.get("durable_url"),
                         clip.get("ai_post_caption"),
@@ -3474,18 +3599,38 @@ def _persist_generated_clip_record(clip: dict[str, object]) -> bool:
                         clip.get("duration_profile"), clip.get("requested_duration"),
                         clip.get("actual_duration"),
                         clip.get("longform_eligible_reason"),
-                        clip.get("longform_rejection_reason"), clip_id,
+                        clip.get("longform_rejection_reason"),
+                        (
+                            clip.get("source_creator_id")
+                            or clip.get("creator_id")
+                            or clip.get("broadcaster_id")
+                        ),
+                        clip.get("rights_status") or "unknown",
                     ),
                 )
                 saved = cursor.fetchone()
+                if saved is None:
+                    raise RuntimeError("queue upsert returned no saved row")
             connection.commit()
-        return saved is not None
+        saved_result = dict(saved)
+        print(
+            "CLIP QUEUE PERSISTENCE COMPLETE | "
+            f"clip_id={saved_result['clip_id']} | "
+            f"status={saved_result['status']} | "
+            f"object_key={saved_result.get('object_key') or 'none'}"
+        )
+        return saved_result
     except Exception as error:
         print(
             "CLIP HISTORY DB ERROR | operation=generated_metadata | "
             f"clip_id={clip_id} | error={error!r}"
         )
-        return False
+        _log_queue_persistence_recovery(
+            clip_id,
+            clip.get("object_key"),
+            error,
+        )
+        return None
 
 
 @app.get("/api/clips")
@@ -4736,15 +4881,23 @@ async def _run_auto_generate_clip_pipeline():
     persistence_started_at = time.perf_counter()
     try:
         result = await create_clip(best_clip)
-    except Exception:
+    except Exception as error:
         print(
             "CLIP PERSISTENCE FAILED - MEDIA RETAINED FOR RECOVERY | "
             f"raw_video_path={best_clip.get('raw_video_path')} | "
             f"video_path={best_clip.get('video_path')}"
         )
+        if best_clip.get("object_key"):
+            canonical_clip_id, _ = _normalized_twitch_identifiers(best_clip)
+            _log_queue_persistence_recovery(
+                canonical_clip_id,
+                best_clip.get("object_key"),
+                error,
+            )
         raise
     persisted_clip = result["clip"]
-    if not _persist_generated_clip_record(persisted_clip):
+    queue_clip = {**best_clip, **persisted_clip}
+    if not _persist_generated_clip_record(queue_clip):
         raise HTTPException(
             status_code=503,
             detail="Clip was persisted, but its durable queue record could not be saved.",
