@@ -4466,18 +4466,30 @@ async def publish_clip_to_tiktok(clip: dict):
             detail=f"Video file not found: {video_path}",
         )
 
-    creator_info = await _get_tiktok_creator_info()
-    allowed_duration = int(
-        creator_info.get("max_video_post_duration_sec") or 0
-    )
-    actual_duration = float(matching_clip.get("actual_duration") or 0)
-    if allowed_duration and actual_duration > allowed_duration:
+    publish_settings = await get_publish_settings()
+    post_mode = str(publish_settings.get("post_mode") or "draft").lower()
+    if post_mode not in {"draft", "direct"}:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"TikTok allows up to {allowed_duration} seconds, but this clip "
-                f"is {actual_duration:.1f} seconds."
-            ),
+            detail="Invalid TikTok publishing mode.",
+        )
+    if post_mode == "direct":
+        creator_info = await _get_tiktok_creator_info()
+        allowed_duration = int(
+            creator_info.get("max_video_post_duration_sec") or 0
+        )
+        actual_duration = float(matching_clip.get("actual_duration") or 0)
+        if allowed_duration and actual_duration > allowed_duration:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"TikTok allows up to {allowed_duration} seconds, but this "
+                    f"clip is {actual_duration:.1f} seconds."
+                ),
+            )
+        raise HTTPException(
+            status_code=409,
+            detail="Direct Post is unavailable until video.publish is approved.",
         )
 
     if not _claim_clip_for_publishing(matching_clip):
@@ -4511,6 +4523,11 @@ async def publish_clip_to_tiktok(clip: dict):
         tiktok_result = await upload_tiktok_draft(video_path)
     except Exception as error:
         restored = _restore_clip_after_publish_failure(matching_clip)
+        print(
+            "TIKTOK DRAFT UPLOAD FAILED | "
+            f"clip_id={matching_clip.get('id')} | "
+            f"history_restored={restored} | error={error!r}"
+        )
         print(
             "TIKTOK PUBLISH FAILED - STATUS UNCHANGED | "
             f"clip_id={matching_clip.get('id')} | "
@@ -4547,6 +4564,11 @@ async def publish_clip_to_tiktok(clip: dict):
             status_code=503,
             detail="TikTok accepted the draft, but upload state could not be saved.",
         )
+    print(
+        "TIKTOK DRAFT UPLOAD COMPLETE | "
+        f"clip_id={matching_clip.get('id')} | "
+        f"publish_id={provider_publish_id}"
+    )
 
     try:
         updated_clip_index = _find_clip_index_by_stable_identifier(
