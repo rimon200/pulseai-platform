@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import gc
 import hashlib
 import json
@@ -33,14 +34,12 @@ except ImportError:
     psutil = None
     import resource
 from ai import (
-    client,
     generate_ai_title_package,
     generate_ai_description,
     generate_tiktok_caption_package,
     release_whisper_model,
-    score_multimodal_clip,
 )
-from video_editing import create_tiktok_edited_video, detect_visual_layout
+from video_editing import create_tiktok_edited_video
 from storage_service import object_storage_enabled, upload_video
 
 load_dotenv()
@@ -96,6 +95,27 @@ def _get_available_memory_mb() -> float | None:
     if psutil is None:
         return None
     return psutil.virtual_memory().available / (1024 * 1024)
+
+
+def _trim_native_memory(stage: str) -> bool:
+    before_rss_mb = _get_current_rss_mb()
+    trimmed = False
+    try:
+        libc = ctypes.CDLL(None)
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if malloc_trim is not None:
+            malloc_trim.argtypes = [ctypes.c_size_t]
+            malloc_trim.restype = ctypes.c_int
+            trimmed = bool(malloc_trim(0))
+    except (AttributeError, OSError, TypeError, ValueError):
+        trimmed = False
+    after_rss_mb = _get_current_rss_mb()
+    print(
+        "MEMORY TRIM | "
+        f"stage={stage} | before_rss_mb={before_rss_mb:.1f} | "
+        f"after_rss_mb={after_rss_mb:.1f} | supported={str(trimmed).lower()}"
+    )
+    return trimmed
 
 
 def _log_memory_check(stage: str, candidate_number: int, total_candidates: int) -> None:
@@ -183,6 +203,7 @@ def _recheck_whisper_memory_once(
 ) -> tuple[bool, float | None, float]:
     cooldown_seconds = _whisper_memory_recheck_seconds()
     gc.collect()
+    _trim_native_memory(f"{admission_point}_cooldown")
     print(
         "WHISPER MEMORY COOLDOWN START | "
         f"candidate={candidate_number}/{total_candidates} | "
@@ -206,6 +227,42 @@ def _recheck_whisper_memory_once(
         f"available_mb={available_label} | "
         f"required_mb={required_memory_mb:.1f}"
     )
+    return admitted, available_memory_mb, required_memory_mb
+
+
+def _admit_candidate_batch_memory(
+    total_candidates: int,
+    batch_attempt: int,
+) -> tuple[bool, float | None, float]:
+    gc.collect()
+    _trim_native_memory("candidate_batch_start")
+    _log_memory_check(
+        stage="before_candidate_download_admission",
+        candidate_number=0,
+        total_candidates=total_candidates,
+    )
+    admitted, available_memory_mb, required_memory_mb = (
+        _whisper_memory_admitted()
+    )
+    if not admitted:
+        admitted, available_memory_mb, required_memory_mb = (
+            _recheck_whisper_memory_once(
+                0,
+                total_candidates,
+                "candidate_batch_start",
+            )
+        )
+    if not admitted:
+        available_label = (
+            f"{available_memory_mb:.1f}"
+            if available_memory_mb is not None
+            else "unknown"
+        )
+        print(
+            "MEMORY BASELINE UNRECOVERED | "
+            f"batch={batch_attempt}/2 | available_mb={available_label} | "
+            f"required_mb={required_memory_mb:.1f}"
+        )
     return admitted, available_memory_mb, required_memory_mb
 
 
@@ -625,9 +682,126 @@ def _transcribe_video_with_segments_subprocess(video_path: str) -> dict[str, obj
     finally:
         if os.path.exists(output_json_path):
             os.remove(output_json_path)
+        gc.collect()
+        _trim_native_memory("whisper_subprocess_cleanup")
 
 
-def _cleanup_candidate_video(
+def _score_multimodal_clip_subprocess(
+    video_path: str,
+    transcript: str,
+    creator: str,
+    game: str,
+    stream_title: str,
+    viewer_count: object,
+    duration: object,
+) -> dict[str, object]:
+    input_descriptor, input_json_path = tempfile.mkstemp(suffix=".json")
+    output_descriptor, output_json_path = tempfile.mkstemp(suffix=".json")
+    os.close(input_descriptor)
+    os.close(output_descriptor)
+    try:
+        with open(input_json_path, "w", encoding="utf-8") as input_file:
+            json.dump(
+                {
+                    "video_path": video_path,
+                    "transcript": transcript,
+                    "creator": creator,
+                    "game": game,
+                    "stream_title": stream_title,
+                    "viewer_count": viewer_count,
+                    "duration": duration,
+                },
+                input_file,
+            )
+        os.remove(output_json_path)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(BASE_DIR / "ai.py"),
+                "--score-worker",
+                "--input-json",
+                input_json_path,
+                "--output-json",
+                output_json_path,
+            ],
+            check=True,
+            timeout=180,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if completed.stderr.strip():
+            print(completed.stderr.strip())
+        with open(output_json_path, "r", encoding="utf-8") as output_file:
+            result = json.load(output_file)
+        if not isinstance(result, dict) or "score" not in result:
+            raise RuntimeError("Scoring worker returned an invalid result.")
+        return result
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("Multimodal scoring worker timed out.") from error
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(
+            "Multimodal scoring worker failed: "
+            f"{(error.stderr or '').strip() or 'no stderr output'}"
+        ) from error
+    finally:
+        for temporary_path in (input_json_path, output_json_path):
+            try:
+                os.remove(temporary_path)
+            except FileNotFoundError:
+                pass
+        gc.collect()
+        _trim_native_memory("multimodal_scoring_cleanup")
+
+
+def _detect_visual_layout_subprocess(video_path: str) -> dict[str, object]:
+    output_descriptor, output_json_path = tempfile.mkstemp(suffix=".json")
+    os.close(output_descriptor)
+    try:
+        os.remove(output_json_path)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(BASE_DIR / "video_editing.py"),
+                "--detect-layout-worker",
+                "--video-path",
+                video_path,
+                "--output-json",
+                output_json_path,
+            ],
+            check=True,
+            timeout=60,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if completed.stderr.strip():
+            print(completed.stderr.strip())
+        with open(output_json_path, "r", encoding="utf-8") as output_file:
+            result = json.load(output_file)
+        if not isinstance(result, dict) or "mode" not in result:
+            raise RuntimeError("Layout worker returned an invalid result.")
+        return result
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError) as error:
+        print(f"VISUAL LAYOUT WORKER FAILED | error={error!r}")
+        return {
+            "mode": "single_subject",
+            "confidence": 1.0,
+            "reason": "layout worker unavailable",
+            "version": "layout-v1",
+            "sample_count": 0,
+            "regions": [],
+        }
+    finally:
+        try:
+            os.remove(output_json_path)
+        except FileNotFoundError:
+            pass
+        gc.collect()
+        _trim_native_memory("visual_layout_detection_cleanup")
+
+
+def _cleanup_candidate_video_impl(
     video_path: object,
     candidate_number: int,
     persisted_clips: list[dict[str, object]],
@@ -697,6 +871,22 @@ def _cleanup_candidate_video(
         )
 
 
+def _cleanup_candidate_video(
+    video_path: object,
+    candidate_number: int,
+    persisted_clips: list[dict[str, object]],
+) -> None:
+    try:
+        _cleanup_candidate_video_impl(
+            video_path,
+            candidate_number,
+            persisted_clips,
+        )
+    finally:
+        gc.collect()
+        _trim_native_memory("candidate_media_cleanup")
+
+
 def _fully_evaluate_candidate(
     twitch_clip: dict[str, Any],
     candidate_number: int,
@@ -735,42 +925,6 @@ def _fully_evaluate_candidate(
         }
 
         failure_stage = "download"
-        _log_memory_check(
-            stage="before_candidate_download_admission",
-            candidate_number=candidate_number,
-            total_candidates=total_candidates,
-        )
-        admitted, available_memory_mb, required_memory_mb = (
-            _whisper_memory_admitted()
-        )
-        if not admitted:
-            admitted, available_memory_mb, required_memory_mb = (
-                _recheck_whisper_memory_once(
-                    candidate_number,
-                    total_candidates,
-                    "before_download",
-                )
-            )
-        if not admitted:
-            available_label = (
-                f"{available_memory_mb:.1f}"
-                if available_memory_mb is not None
-                else "unknown"
-            )
-            return {
-                "success": False,
-                "clip": None,
-                "video_path": "",
-                "failure_stage": "whisper_admission",
-                "error": (
-                    "insufficient memory before candidate download: "
-                    f"available={available_label} MB, "
-                    f"required={required_memory_mb:.1f} MB"
-                ),
-                "memory_deferred_before_download": True,
-                "memory_rejected_after_download": False,
-                "expensive_evaluation_started": False,
-            }
         _log_memory_check(
             stage="before_ytdlp_download",
             candidate_number=candidate_number,
@@ -838,6 +992,7 @@ def _fully_evaluate_candidate(
                 persisted_clips,
             )
             video_path = ""
+            rescue_allowed, _, _ = _whisper_memory_admitted()
             return {
                 "success": False,
                 "clip": None,
@@ -851,6 +1006,7 @@ def _fully_evaluate_candidate(
                 "memory_deferred_before_download": False,
                 "memory_rejected_after_download": True,
                 "expensive_evaluation_started": False,
+                "rescue_allowed": rescue_allowed,
             }
         processing_error: Exception | None = None
         release_error: Exception | None = None
@@ -885,14 +1041,14 @@ def _fully_evaluate_candidate(
                 total_candidates=total_candidates,
             )
             scoring_started_at = time.perf_counter()
-            multimodal = score_multimodal_clip(
-                video_path=video_path,
-                transcript=str(clip["transcript"]),
-                creator=str(clip["creator"]),
-                game=str(clip.get("game") or ""),
-                stream_title=str(clip["title"]),
-                viewer_count=clip["viewer_count"],
-                duration=clip.get("duration", 0),
+            multimodal = _score_multimodal_clip_subprocess(
+                video_path,
+                str(clip["transcript"]),
+                str(clip["creator"]),
+                str(clip.get("game") or ""),
+                str(clip["title"]),
+                clip["viewer_count"],
+                clip.get("duration", 0),
             )
             _log_performance_timing(
                 stage="multimodal_scoring",
@@ -4974,6 +5130,28 @@ async def _run_auto_generate_clip_pipeline():
             continue
 
         total_candidates = len(fresh_batch)
+        batch_memory_admitted, available_memory_mb, required_memory_mb = (
+            _admit_candidate_batch_memory(
+                total_candidates,
+                batch_attempt,
+            )
+        )
+        if not batch_memory_admitted:
+            candidates_deferred_before_download += total_candidates
+            return {
+                "message": (
+                    "Clip generation deferred because worker memory did not "
+                    "recover."
+                ),
+                "best_score": 0,
+                "candidates_deferred_before_download": (
+                    candidates_deferred_before_download
+                ),
+                "candidates_rejected_after_download": (
+                    candidates_rejected_after_download
+                ),
+                "candidates_evaluated": candidates_evaluated,
+            }
         stage_one_started_at = time.perf_counter()
         preranked_candidates, has_sufficient_prerank_metadata = _fast_prerank_candidates(
             fresh_batch,
@@ -5121,6 +5299,34 @@ async def _run_auto_generate_clip_pipeline():
                         f"Candidate {candidate_index} full evaluation failed:",
                         evaluation_result["error"],
                     )
+                    if (
+                        evaluation_result.get(
+                            "memory_rejected_after_download"
+                        )
+                        and not evaluation_result.get(
+                            "rescue_allowed",
+                            False,
+                        )
+                    ):
+                        print(
+                            "MEMORY BASELINE UNRECOVERED | "
+                            f"batch={batch_attempt}/2 | "
+                            "stage=after_download_cleanup"
+                        )
+                        return {
+                            "message": (
+                                "Clip generation deferred because worker "
+                                "memory did not recover."
+                            ),
+                            "best_score": 0,
+                            "candidates_deferred_before_download": (
+                                candidates_deferred_before_download
+                            ),
+                            "candidates_rejected_after_download": (
+                                candidates_rejected_after_download
+                            ),
+                            "candidates_evaluated": candidates_evaluated,
+                        }
                     continue
 
                 clip = evaluation_result["clip"]
@@ -5358,7 +5564,7 @@ async def _run_auto_generate_clip_pipeline():
     )
     layout_detection_started_at = time.perf_counter()
     visual_layout = await asyncio.to_thread(
-        detect_visual_layout,
+        _detect_visual_layout_subprocess,
         str(best_clip["raw_video_path"]),
     )
     _log_memory_check(
@@ -5431,6 +5637,9 @@ async def _run_auto_generate_clip_pipeline():
         print("TIKTOK VIDEO EDIT FAILED:", repr(error))
         print(traceback.format_exc())
         best_clip["video_path"] = best_clip.get("raw_video_path")
+    finally:
+        gc.collect()
+        _trim_native_memory("ffmpeg_completion")
 
     if object_storage_enabled():
         try:

@@ -6,7 +6,6 @@ import time
 from dotenv import load_dotenv
 from openai import OpenAI
 import base64
-import cv2
 import gc
 import json
 import os
@@ -439,23 +438,61 @@ def run_transcription_worker(video_path: str, output_json_path: str) -> int:
     return 0
 
 
+def run_scoring_worker(input_json_path: str, output_json_path: str) -> int:
+    with open(input_json_path, "r", encoding="utf-8") as input_file:
+        request = json.load(input_file)
+    result = score_multimodal_clip(
+        video_path=str(request.get("video_path") or ""),
+        transcript=str(request.get("transcript") or ""),
+        creator=str(request.get("creator") or ""),
+        game=str(request.get("game") or ""),
+        stream_title=str(request.get("stream_title") or ""),
+        viewer_count=int(request.get("viewer_count") or 0),
+        duration=int(float(request.get("duration") or 0)),
+    )
+    output_path = os.path.abspath(output_json_path)
+    output_dir = os.path.dirname(output_path) or "."
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".json",
+        prefix="scoring_",
+        dir=output_dir,
+        delete=False,
+    ) as temp_file:
+        json.dump(result, temp_file)
+        temp_file.flush()
+        os.fsync(temp_file.fileno())
+        temporary_output_path = temp_file.name
+    os.replace(temporary_output_path, output_path)
+    return 0
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--transcribe-worker", action="store_true")
+    parser.add_argument("--score-worker", action="store_true")
     parser.add_argument("--video-path")
+    parser.add_argument("--input-json")
     parser.add_argument("--output-json")
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
-    if not args.transcribe_worker:
-        return 0
-    if not args.video_path or not args.output_json:
-        raise ValueError("--video-path and --output-json are required.")
-    return run_transcription_worker(args.video_path, args.output_json)
+    if args.transcribe_worker:
+        if not args.video_path or not args.output_json:
+            raise ValueError("--video-path and --output-json are required.")
+        return run_transcription_worker(args.video_path, args.output_json)
+    if args.score_worker:
+        if not args.input_json or not args.output_json:
+            raise ValueError("--input-json and --output-json are required.")
+        return run_scoring_worker(args.input_json, args.output_json)
+    return 0
 
 def analyze_video_frames(video_path: str) -> int:
+    import cv2
+
     capture = cv2.VideoCapture(video_path)
     if not capture.isOpened():
         return 0
@@ -576,6 +613,8 @@ def score_multimodal_clip(
     viewer_count: int = 0,
     duration: int = 0,
 ) -> dict:
+    import cv2
+
     capture = cv2.VideoCapture(video_path)
     if not capture.isOpened():
         return _default_clip_score()

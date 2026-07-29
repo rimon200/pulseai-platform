@@ -1,5 +1,7 @@
+import argparse
 from functools import lru_cache
 import gc
+import importlib
 from pathlib import Path
 import json
 import os
@@ -11,9 +13,17 @@ import tempfile
 import textwrap
 import time
 import unicodedata
+import sys
 from typing import Dict, List, Optional
 
-import cv2
+
+class _LazyCV2:
+    def __getattr__(self, name: str):
+        module = importlib.import_module("cv2")
+        return getattr(module, name)
+
+
+cv2 = _LazyCV2()
 
 
 CANVAS_WIDTH = 720
@@ -880,3 +890,54 @@ def create_tiktok_edited_video(
                 os.remove(overlay_temp_path)
             except OSError:
                 pass
+
+
+def _run_layout_detection_worker(
+    video_path: str,
+    output_json_path: str,
+) -> int:
+    result = detect_visual_layout(video_path)
+    output_path = Path(output_json_path).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".json",
+        prefix="layout_",
+        dir=output_path.parent,
+        delete=False,
+    ) as temporary_output:
+        json.dump(result, temporary_output)
+        temporary_path = Path(temporary_output.name)
+    os.replace(temporary_path, output_path)
+    return 0
+
+
+def _parse_worker_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--detect-layout-worker", action="store_true")
+    parser.add_argument("--video-path")
+    parser.add_argument("--output-json")
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    worker_args = _parse_worker_args()
+    if worker_args.detect_layout_worker:
+        if not worker_args.video_path or not worker_args.output_json:
+            raise SystemExit(
+                "--video-path and --output-json are required."
+            )
+        try:
+            raise SystemExit(
+                _run_layout_detection_worker(
+                    worker_args.video_path,
+                    worker_args.output_json,
+                )
+            )
+        except Exception as worker_error:
+            print(
+                f"Visual layout worker failed: {worker_error}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)

@@ -5,8 +5,9 @@ import io
 import os
 import tempfile
 import unittest
+import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import main
 from download_service import DownloadService
@@ -191,7 +192,7 @@ class WhisperAdmissionTests(unittest.TestCase):
             stack.enter_context(
                 patch.object(
                     main,
-                    "score_multimodal_clip",
+                    "_score_multimodal_clip_subprocess",
                     return_value=self._successful_score(),
                 )
             )
@@ -211,40 +212,34 @@ class WhisperAdmissionTests(unittest.TestCase):
             ],
         ) as admission:
             with patch.object(main.time, "sleep") as sleep:
-                with patch.object(
-                    main, "download_twitch_clip"
-                ) as download:
-                    result = main._fully_evaluate_candidate(
-                        **self._candidate_arguments()
-                    )
+                admitted, _, _ = main._admit_candidate_batch_memory(3, 1)
 
-        self.assertFalse(result["success"])
-        self.assertTrue(result["memory_deferred_before_download"])
-        self.assertEqual(result["failure_stage"], "whisper_admission")
+        self.assertFalse(admitted)
         self.assertEqual(admission.call_count, 2)
         sleep.assert_called_once_with(3.0)
-        download.assert_not_called()
 
     def test_recovered_memory_before_download_permits_download(self):
-        video_path = self._download_file()
-        try:
-            result, download, admission, sleep, transcribe = (
-                self._evaluate_successfully(
-                    video_path,
-                    [
-                        (False, 100.0, 180.0),
-                        (True, 190.0, 180.0),
-                        (True, 190.0, 180.0),
-                    ],
-                )
-            )
-            self.assertTrue(result["success"])
-            self.assertEqual(admission.call_count, 3)
-            sleep.assert_called_once_with(3.0)
-            download.assert_called_once()
-            transcribe.assert_called_once()
-        finally:
-            video_path.unlink(missing_ok=True)
+        with patch.object(
+            main,
+            "_whisper_memory_admitted",
+            side_effect=[
+                (False, 100.0, 180.0),
+                (True, 190.0, 180.0),
+            ],
+        ) as admission:
+            with patch.object(main.time, "sleep") as sleep:
+                admitted, _, _ = main._admit_candidate_batch_memory(3, 1)
+
+        self.assertTrue(admitted)
+        self.assertEqual(admission.call_count, 2)
+        sleep.assert_called_once_with(3.0)
+        source = Path(main.__file__).read_text(encoding="utf-8")
+        self.assertLess(
+            source.index("_admit_candidate_batch_memory(",
+                         source.index("async def _run_auto_generate_clip_pipeline")),
+            source.index("_fully_evaluate_candidate(",
+                         source.index("async def _run_auto_generate_clip_pipeline")),
+        )
 
     def test_low_memory_after_download_gets_one_recheck_and_cleans_file(self):
         video_path = self._download_file()
@@ -257,8 +252,8 @@ class WhisperAdmissionTests(unittest.TestCase):
                 main,
                 "_whisper_memory_admitted",
                 side_effect=[
-                    (True, 220.0, 180.0),
                     (False, 100.0, 180.0),
+                    (False, 110.0, 180.0),
                     (False, 110.0, 180.0),
                 ],
             ) as admission:
@@ -285,14 +280,13 @@ class WhisperAdmissionTests(unittest.TestCase):
                 self._evaluate_successfully(
                     video_path,
                     [
-                        (True, 220.0, 180.0),
                         (False, 100.0, 180.0),
                         (True, 190.7, 180.0),
                     ],
                 )
             )
             self.assertTrue(result["success"])
-            self.assertEqual(admission.call_count, 3)
+            self.assertEqual(admission.call_count, 2)
             sleep.assert_called_once_with(3.0)
             download.assert_called_once()
             transcribe.assert_called_once_with(str(video_path))
@@ -313,11 +307,9 @@ class WhisperAdmissionTests(unittest.TestCase):
                 ],
             ) as admission:
                 with patch.object(main.time, "sleep") as sleep:
-                    result = main._fully_evaluate_candidate(
-                        **self._candidate_arguments()
-                    )
+                    admitted, _, _ = main._admit_candidate_batch_memory(3, 1)
 
-        self.assertFalse(result["success"])
+        self.assertFalse(admitted)
         self.assertEqual(admission.call_count, 2)
         sleep.assert_called_once_with(30.0)
 
@@ -332,7 +324,7 @@ class WhisperAdmissionTests(unittest.TestCase):
                 main,
                 "_whisper_memory_admitted",
                 side_effect=[
-                    (True, 220.0, 180.0),
+                    (False, 100.0, 180.0),
                     (False, 100.0, 180.0),
                     (False, 100.0, 180.0),
                 ],
@@ -357,12 +349,11 @@ class WhisperAdmissionTests(unittest.TestCase):
                     video_path,
                     [
                         (True, 250.0, 180.0),
-                        (True, 250.0, 180.0),
                     ],
                 )
             )
             self.assertTrue(result["success"])
-            self.assertEqual(admission.call_count, 2)
+            self.assertEqual(admission.call_count, 1)
             sleep.assert_not_called()
             download.assert_called_once()
             transcribe.assert_called_once_with(str(video_path))
@@ -378,6 +369,64 @@ class WhisperAdmissionTests(unittest.TestCase):
         ):source.index(
             'clip = evaluation_result["clip"]'
         )])
+
+
+class NativeMemoryLifecycleTests(unittest.TestCase):
+    def test_native_trim_is_safe_when_libc_is_unavailable(self):
+        with patch.object(
+            main.ctypes,
+            "CDLL",
+            side_effect=OSError("libc unavailable"),
+        ):
+            self.assertFalse(main._trim_native_memory("test_unavailable"))
+
+    def test_layout_detection_runs_in_waited_subprocess(self):
+        layout = {
+            "mode": "single_subject",
+            "confidence": 1.0,
+            "reason": "fake",
+            "version": "layout-v1",
+            "sample_count": 3,
+            "regions": [],
+        }
+
+        def complete_worker(command, **kwargs):
+            output_path = Path(
+                command[command.index("--output-json") + 1]
+            )
+            output_path.write_text(json.dumps(layout), encoding="utf-8")
+            return MagicMock(stderr="")
+
+        with patch.object(
+            main.subprocess,
+            "run",
+            side_effect=complete_worker,
+        ) as run:
+            result = main._detect_visual_layout_subprocess("/fake/video.mp4")
+
+        self.assertEqual(result, layout)
+        run.assert_called_once()
+        self.assertTrue(run.call_args.kwargs["check"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 60)
+
+    def test_unrecovered_batch_admission_precedes_all_downloads(self):
+        source = Path(main.__file__).read_text(encoding="utf-8")
+        pipeline_start = source.index(
+            "async def _run_auto_generate_clip_pipeline"
+        )
+        admission = source.index(
+            "_admit_candidate_batch_memory(",
+            pipeline_start,
+        )
+        evaluation = source.index(
+            "_fully_evaluate_candidate(",
+            pipeline_start,
+        )
+        self.assertLess(admission, evaluation)
+        self.assertIn(
+            '"Clip generation deferred because worker memory did not "',
+            source[admission:evaluation],
+        )
 
 
 if __name__ == "__main__":
