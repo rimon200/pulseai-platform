@@ -2,12 +2,46 @@ from __future__ import annotations
 
 import json
 import os
+import functools
+import inspect
 from datetime import datetime
 from typing import Any
 
 
 STREAM_HISTORY_ADVISORY_LOCK_ID = 22616960936427853
 STREAM_STATES = {"pending", "partial", "exhausted", "succeeded"}
+
+
+def _log_stream_write_failures(
+    operation: str,
+    table: str,
+    columns: tuple[str, ...],
+):
+    def decorate(function):
+        signature = inspect.signature(function)
+
+        @functools.wraps(function)
+        def wrapped(*args, **kwargs):
+            try:
+                return function(*args, **kwargs)
+            except Exception as error:
+                bound = signature.bind_partial(*args, **kwargs)
+                parameter_types = ",".join(
+                    f"{name}:{'none' if value is None else value.__class__.__name__}"
+                    for name, value in sorted(bound.arguments.items())
+                )
+                print(
+                    "STREAM HISTORY DB ERROR | "
+                    f"operation={operation} | table={table} | "
+                    f"columns={','.join(columns)} | "
+                    f"parameter_types={parameter_types or 'none'} | "
+                    f"error_type={error.__class__.__name__}"
+                )
+                raise
+
+        return wrapped
+
+    return decorate
 
 
 def _database_url() -> str:
@@ -109,6 +143,14 @@ def _stream_values(stream: dict[str, Any]) -> tuple[str, datetime, datetime | No
     return stream_id, started_at, normalized_end
 
 
+@_log_stream_write_failures(
+    "register_newest_stream",
+    "auto_clip_stream_state,auto_clip_historical_cursor",
+    (
+        "stream_id", "stream_started_at", "stream_ended_at",
+        "is_refreshable", "processing_state", "next_before_timestamp",
+    ),
+)
 def register_newest_stream(
     creator_id: str,
     stream: dict[str, Any],
@@ -214,6 +256,14 @@ def get_stream_state(creator_id: str, stream_id: str) -> dict[str, Any] | None:
             return dict(row) if row else None
 
 
+@_log_stream_write_failures(
+    "register_historical_stream",
+    "auto_clip_stream_state",
+    (
+        "stream_id", "stream_started_at", "stream_ended_at",
+        "is_refreshable", "processing_state",
+    ),
+)
 def register_historical_stream(
     creator_id: str,
     stream: dict[str, Any],
@@ -295,6 +345,16 @@ def get_historical_cursor(creator_id: str) -> dict[str, Any]:
             return dict(row) if row else {}
 
 
+@_log_stream_write_failures(
+    "update_stream_progress",
+    "auto_clip_stream_state",
+    (
+        "processing_state", "last_evaluated_at",
+        "last_evaluated_range_end", "evaluated_ranges",
+        "last_discovered_candidate_cursor", "retryable_failure_state",
+        "exhausted_at", "last_checked_at",
+    ),
+)
 def update_stream_progress(
     creator_id: str,
     stream_id: str,
@@ -398,6 +458,11 @@ def update_stream_progress(
     return updated
 
 
+@_log_stream_write_failures(
+    "save_historical_cursor",
+    "auto_clip_historical_cursor",
+    ("next_before_timestamp", "last_stream_id"),
+)
 def save_historical_cursor(
     creator_id: str,
     *,
@@ -435,5 +500,91 @@ def save_historical_cursor(
                     updated_at = NOW()
                 """,
                 (creator_id, next_before_timestamp, last_stream_id),
+            )
+        connection.commit()
+
+
+@_log_stream_write_failures(
+    "exhaust_stream_and_advance_cursor",
+    "auto_clip_stream_state,auto_clip_historical_cursor",
+    (
+        "processing_state", "exhausted_at", "last_checked_at",
+        "next_before_timestamp", "last_stream_id",
+    ),
+)
+def exhaust_stream_and_advance_cursor(
+    creator_id: str,
+    stream_id: str,
+    *,
+    range_start: datetime,
+    range_end: datetime,
+) -> None:
+    """Atomically exhaust one older stream and advance its creator cursor."""
+    database_url = _database_url()
+    if not database_url:
+        raise RuntimeError("PostgreSQL is required for stream exhaustion.")
+    import psycopg
+
+    evaluated_range = json.dumps(
+        {
+            "start": range_start.isoformat(),
+            "end": range_end.isoformat(),
+            "evaluated_at": datetime.now().astimezone().isoformat(),
+        }
+    )
+    with psycopg.connect(database_url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(%s)",
+                (STREAM_HISTORY_ADVISORY_LOCK_ID,),
+            )
+            cursor.execute(
+                """
+                UPDATE auto_clip_stream_state SET
+                    processing_state = 'exhausted',
+                    last_evaluated_at = NOW(),
+                    last_evaluated_range_end = %s,
+                    evaluated_ranges = evaluated_ranges
+                        || jsonb_build_array(%s::jsonb),
+                    retryable_failure_state = NULL,
+                    exhausted_at = NOW(),
+                    last_checked_at = %s,
+                    updated_at = NOW()
+                WHERE provider = 'twitch' AND creator_id = %s
+                  AND stream_id = %s AND is_refreshable = FALSE
+                RETURNING stream_id
+                """,
+                (
+                    range_end,
+                    evaluated_range,
+                    range_end,
+                    creator_id,
+                    stream_id,
+                ),
+            )
+            if cursor.fetchone() is None:
+                raise RuntimeError(
+                    "historical stream was unavailable for exhaustion"
+                )
+            cursor.execute(
+                """
+                INSERT INTO auto_clip_historical_cursor (
+                    provider, creator_id, next_before_timestamp,
+                    last_stream_id
+                ) VALUES ('twitch', %s, %s, %s)
+                ON CONFLICT (provider, creator_id) DO UPDATE SET
+                    next_before_timestamp = LEAST(
+                        auto_clip_historical_cursor.next_before_timestamp,
+                        EXCLUDED.next_before_timestamp
+                    ),
+                    last_stream_id = CASE
+                        WHEN EXCLUDED.next_before_timestamp <=
+                             auto_clip_historical_cursor.next_before_timestamp
+                        THEN EXCLUDED.last_stream_id
+                        ELSE auto_clip_historical_cursor.last_stream_id
+                    END,
+                    updated_at = NOW()
+                """,
+                (creator_id, range_start, stream_id),
             )
         connection.commit()

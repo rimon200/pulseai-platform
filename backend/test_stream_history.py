@@ -197,7 +197,7 @@ class StreamDiscoveryTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(
                     main,
                     "_clip_history_upsert",
-                    return_value=True,
+                    return_value=False,
                 ):
                     clips, complete, _ = (
                         await main.fetch_twitch_clips_for_stream(
@@ -306,13 +306,15 @@ class StreamTraversalTests(unittest.IsolatedAsyncioTestCase):
                 exhausted.add(stream_id)
             return True
 
-        def save_cursor(
+        def exhaust_and_save_cursor(
             _creator_id,
+            stream_id,
             *,
+            range_end,
             next_before_timestamp,
-            last_stream_id,
         ):
-            del last_stream_id
+            del range_end
+            exhausted.add(stream_id)
             cursor["value"] = next_before_timestamp
 
         stack.enter_context(
@@ -352,7 +354,18 @@ class StreamTraversalTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "update_stream_progress", side_effect=update_progress)
         )
         stack.enter_context(
-            patch.object(main, "save_historical_cursor", side_effect=save_cursor)
+            patch.object(
+                main,
+                "exhaust_stream_and_advance_cursor",
+                side_effect=lambda creator_id, stream_id, range_start, range_end: (
+                    exhaust_and_save_cursor(
+                        creator_id,
+                        stream_id,
+                        range_end=range_end,
+                        next_before_timestamp=range_start,
+                    )
+                ),
+            )
         )
         stack.enter_context(
             patch.object(
@@ -510,6 +523,35 @@ class StreamTraversalTests(unittest.IsolatedAsyncioTestCase):
             result["outcome_reason"],
             "partial_streams_remaining",
         )
+
+    async def test_essential_exhaustion_failure_preserves_cursor(self):
+        searched_streams = []
+
+        async def fetch(broadcaster_id, stream_target, **_kwargs):
+            del broadcaster_id
+            searched_streams.append(stream_target["stream_id"])
+            return [], True, ""
+
+        stack, _, exhausted, cursor = self._pipeline_patches(fetch)
+        stack.enter_context(
+            patch.object(
+                main,
+                "exhaust_stream_and_advance_cursor",
+                side_effect=RuntimeError("fake cursor outage"),
+            )
+        )
+        captured = io.StringIO()
+        with stack:
+            with contextlib.redirect_stdout(captured):
+                result = await main._run_auto_generate_clip_pipeline()
+        self.assertEqual(searched_streams, ["live-newest", "vod-newer"])
+        self.assertNotIn("vod-newer", exhausted)
+        self.assertIsNone(cursor["value"])
+        self.assertEqual(
+            result["outcome_reason"],
+            "stream_state_persistence_failed",
+        )
+        self.assertIn("result=partial", captured.getvalue())
 
 
 @unittest.skipUnless(
@@ -704,6 +746,73 @@ class PostgreSQLStreamHistoryTests(unittest.TestCase):
             saved_timestamp,
         )
         self.assertEqual(second_worker_view, first_worker_view)
+
+    def test_atomic_exhaustion_rolls_back_when_cursor_write_fails(self):
+        old = {
+            "stream_id": "fake-atomic-old",
+            "started_at": self.now - timedelta(days=1),
+            "ended_at": self.now - timedelta(hours=22),
+        }
+        new = {
+            "stream_id": "fake-atomic-new",
+            "started_at": self.now,
+        }
+        stream_history.register_newest_stream("fake-atomic-creator", old)
+        stream_history.register_newest_stream("fake-atomic-creator", new)
+        cursor_before = stream_history.get_historical_cursor(
+            "fake-atomic-creator"
+        )
+        import psycopg
+
+        with psycopg.connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE FUNCTION fail_fake_cursor_write()
+                    RETURNS trigger LANGUAGE plpgsql AS $$
+                    BEGIN
+                        RAISE EXCEPTION 'fake cursor failure';
+                    END
+                    $$
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TRIGGER fail_fake_cursor_write_trigger
+                    BEFORE INSERT OR UPDATE
+                    ON auto_clip_historical_cursor
+                    FOR EACH ROW EXECUTE FUNCTION fail_fake_cursor_write()
+                    """
+                )
+            connection.commit()
+        try:
+            with self.assertRaises(Exception):
+                stream_history.exhaust_stream_and_advance_cursor(
+                    "fake-atomic-creator",
+                    "fake-atomic-old",
+                    range_start=old["started_at"],
+                    range_end=old["ended_at"],
+                )
+        finally:
+            with psycopg.connect(self.database_url) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        DROP TRIGGER fail_fake_cursor_write_trigger
+                        ON auto_clip_historical_cursor
+                        """
+                    )
+                    cursor.execute("DROP FUNCTION fail_fake_cursor_write()")
+                connection.commit()
+        old_state = stream_history.get_stream_state(
+            "fake-atomic-creator",
+            "fake-atomic-old",
+        )
+        cursor_after = stream_history.get_historical_cursor(
+            "fake-atomic-creator"
+        )
+        self.assertNotEqual(old_state["processing_state"], "exhausted")
+        self.assertEqual(cursor_after, cursor_before)
 
 
 if __name__ == "__main__":

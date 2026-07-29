@@ -49,13 +49,13 @@ from generation_jobs import (
     update_generation_job_stage,
 )
 from stream_history import (
+    exhaust_stream_and_advance_cursor,
     ensure_stream_history_tables,
     get_exhausted_stream_ids,
     get_historical_cursor,
     get_stream_state,
     register_historical_stream,
     register_newest_stream,
-    save_historical_cursor,
     update_stream_progress,
 )
 
@@ -74,6 +74,39 @@ app.state.clip_history_ready = False
 TIKTOK_RECONNECT_REQUIRED_MESSAGE = (
     "TikTok authorization expired. Reconnect TikTok in Settings."
 )
+
+
+def _safe_parameter_type(value: object) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, datetime):
+        return "datetime"
+    if isinstance(value, (int, float, str, list, tuple, dict)):
+        return type(value).__name__
+    return value.__class__.__name__
+
+
+def _log_database_write_error(
+    *,
+    operation: str,
+    table: str,
+    columns: tuple[str, ...],
+    parameters: dict[str, object],
+    error: object,
+) -> None:
+    parameter_types = ",".join(
+        f"{name}:{_safe_parameter_type(parameters.get(name))}"
+        for name in sorted(parameters)
+    )
+    print(
+        "CLIP HISTORY DB ERROR | "
+        f"operation={operation} | table={table} | "
+        f"columns={','.join(columns)} | "
+        f"parameter_types={parameter_types or 'none'} | "
+        f"error_type={error.__class__.__name__}"
+    )
 
 
 def _get_current_rss_mb() -> float:
@@ -1913,6 +1946,24 @@ def _clip_history_upsert(
     try:
         import psycopg
 
+        parameters = {
+            "clip_id": clip_id,
+            "clip_url": clip_url,
+            "creator_id": (
+                clip.get("creator_id") or clip.get("broadcaster_id")
+            ),
+            "creator_name": (
+                clip.get("creator") or clip.get("creator_name")
+            ),
+            "created_at": clip.get("created_at"),
+            "status": status_value,
+            "viral_score": clip.get("viral_score") or clip.get("score"),
+            "failure_stage": failure_stage,
+            "increment_retry": bool(increment_retry),
+            "source_stream_id": (
+                clip.get("_stream_id") or clip.get("source_stream_id")
+            ),
+        }
         with psycopg.connect(DATABASE_URL) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -1924,10 +1975,16 @@ def _clip_history_upsert(
                         source_stream_id
                     )
                     VALUES (
-                        'twitch', %s, %s, %s, %s, %s, %s, %s,
-                        CASE WHEN %s = 'discovered' THEN NULL ELSE NOW() END,
-                        CASE WHEN %s = 'published' THEN NOW() ELSE NULL END,
-                        %s, CASE WHEN %s THEN 1 ELSE 0 END, %s
+                        'twitch', %(clip_id)s, %(clip_url)s, %(creator_id)s,
+                        %(creator_name)s, %(created_at)s, %(status)s,
+                        %(viral_score)s,
+                        CASE WHEN %(status)s = 'discovered'
+                            THEN NULL ELSE NOW() END,
+                        CASE WHEN %(status)s = 'published'
+                            THEN NOW() ELSE NULL END,
+                        %(failure_stage)s,
+                        CASE WHEN %(increment_retry)s THEN 1 ELSE 0 END,
+                        %(source_stream_id)s
                     )
                     ON CONFLICT (provider, clip_id) DO UPDATE SET
                         clip_url = COALESCE(EXCLUDED.clip_url, twitch_clip_history.clip_url),
@@ -1948,27 +2005,13 @@ def _clip_history_upsert(
                         published_at = COALESCE(EXCLUDED.published_at, twitch_clip_history.published_at),
                         failure_stage = EXCLUDED.failure_stage,
                         retry_count = twitch_clip_history.retry_count
-                            + CASE WHEN %s THEN 1 ELSE 0 END,
+                            + CASE WHEN %(increment_retry)s THEN 1 ELSE 0 END,
                         source_stream_id = COALESCE(
                             EXCLUDED.source_stream_id,
                             twitch_clip_history.source_stream_id
                         )
                     """,
-                    (
-                        clip_id,
-                        clip_url,
-                        clip.get("creator_id") or clip.get("broadcaster_id"),
-                        clip.get("creator") or clip.get("creator_name"),
-                        clip.get("created_at"),
-                        status_value,
-                        clip.get("viral_score") or clip.get("score"),
-                        status_value,
-                        status_value,
-                        failure_stage,
-                        increment_retry,
-                        increment_retry,
-                        clip.get("_stream_id") or clip.get("source_stream_id"),
-                    ),
+                    parameters,
                 )
             connection.commit()
         print(
@@ -1977,9 +2020,16 @@ def _clip_history_upsert(
         )
         return True
     except Exception as error:
-        print(
-            "CLIP HISTORY DB ERROR | "
-            f"operation=status_update | clip_id={clip_id} | error={error!r}"
+        _log_database_write_error(
+            operation="status_update",
+            table="twitch_clip_history",
+            columns=(
+                "clip_id", "clip_url", "creator_id", "creator_name",
+                "created_at", "status", "viral_score", "failure_stage",
+                "retry_count", "source_stream_id",
+            ),
+            parameters=locals().get("parameters", {}),
+            error=error,
         )
         return False
 
@@ -2289,9 +2339,9 @@ def _backfill_clip_history(cursor: object) -> bool:
             clip_id, clip_url = _normalized_twitch_identifiers(record)
             if not clip_id:
                 print(
-                    "CLIP HISTORY DB ERROR | "
-                    f"operation=backfill | source={source_path.name} | "
-                    "error=missing_stable_twitch_identifier"
+                    "CLIP HISTORY BACKFILL SKIPPED | "
+                    "reason=missing_stable_twitch_identifier | "
+                    f"source={source_path.name}"
                 )
                 continue
             status_value = (
@@ -2299,6 +2349,25 @@ def _backfill_clip_history(cursor: object) -> bool:
                 if str(record.get("status") or "").lower() == "published"
                 else default_status
             )
+            backfill_parameters = {
+                "clip_id": clip_id,
+                "clip_url": clip_url,
+                "creator_id": (
+                    record.get("creator_id")
+                    or record.get("broadcaster_id")
+                ),
+                "creator_name": (
+                    record.get("creator") or record.get("creator_name")
+                ),
+                "created_at": record.get("created_at"),
+                "status": status_value,
+                "viral_score": (
+                    record.get("viral_score") or record.get("score")
+                ),
+                "published_at": record.get("published_at"),
+                "failure_stage": record.get("failure_stage"),
+            }
+            cursor.execute("SAVEPOINT clip_history_backfill_record")
             try:
                 cursor.execute(
                     """
@@ -2356,24 +2425,38 @@ def _backfill_clip_history(cursor: object) -> bool:
                         END
                     """,
                     (
-                        clip_id,
-                        clip_url,
-                        record.get("creator_id") or record.get("broadcaster_id"),
-                        record.get("creator") or record.get("creator_name"),
-                        record.get("created_at"),
-                        status_value,
-                        record.get("viral_score") or record.get("score"),
-                        record.get("published_at"),
-                        record.get("failure_stage"),
+                        backfill_parameters["clip_id"],
+                        backfill_parameters["clip_url"],
+                        backfill_parameters["creator_id"],
+                        backfill_parameters["creator_name"],
+                        backfill_parameters["created_at"],
+                        backfill_parameters["status"],
+                        backfill_parameters["viral_score"],
+                        backfill_parameters["published_at"],
+                        backfill_parameters["failure_stage"],
                     ),
                 )
+                cursor.execute("RELEASE SAVEPOINT clip_history_backfill_record")
                 imported += 1
             except Exception as error:
-                print(
-                    "CLIP HISTORY DB ERROR | "
-                    f"operation=backfill | clip_id={clip_id} | error={error!r}"
+                cursor.execute(
+                    "ROLLBACK TO SAVEPOINT clip_history_backfill_record"
                 )
-                return False
+                cursor.execute(
+                    "RELEASE SAVEPOINT clip_history_backfill_record"
+                )
+                _log_database_write_error(
+                    operation="backfill_record",
+                    table="twitch_clip_history",
+                    columns=(
+                        "clip_id", "clip_url", "creator_id", "creator_name",
+                        "created_at", "status", "viral_score",
+                        "published_at", "failure_stage", "retry_count",
+                    ),
+                    parameters=backfill_parameters,
+                    error=error,
+                )
+                continue
     print(f"CLIP HISTORY BACKFILL | records={imported}")
     return True
 
@@ -5753,6 +5836,52 @@ async def _run_auto_generate_clip_pipeline(
             f"started_at={stream_range_start.isoformat()}"
         )
 
+    def persist_stream_progress(**values: object) -> bool:
+        parameters = {
+            "creator_id": str(broadcaster_id),
+            "stream_id": stream_id,
+            **values,
+        }
+        try:
+            return bool(
+                update_stream_progress(
+                    str(broadcaster_id),
+                    stream_id,
+                    **values,
+                )
+            )
+        except Exception as error:
+            _log_database_write_error(
+                operation="stream_state_update",
+                table="auto_clip_stream_state",
+                columns=tuple(values),
+                parameters=parameters,
+                error=error,
+            )
+            return False
+
+    def stream_persistence_retry_result() -> dict[str, object]:
+        persist_stream_progress(
+            processing_state="partial",
+            range_start=stream_range_start,
+            range_end=None,
+            retryable_failure_state="stream_state_persistence_failed",
+        )
+        print(
+            "STREAM SEARCH RESULT | "
+            f"stream_id={stream_id} | result=partial"
+        )
+        print(
+            "STREAM SEARCH COMPLETE | "
+            f"streams_checked={streams_examined} | "
+            "clip_created=false | "
+            "reason=stream_state_persistence_failed"
+        )
+        return pipeline_result(
+            "Clip search paused because stream history could not be saved.",
+            outcome_reason="stream_state_persistence_failed",
+        )
+
     async def continue_historical_search(
         *,
         outcome_reason: str,
@@ -5765,14 +5894,13 @@ async def _run_auto_generate_clip_pipeline(
         next_had_partial_stream = _job_had_partial_stream
         next_cursor_blocked = _historical_cursor_blocked
         if retryable_failure or not discovery_complete:
-            update_stream_progress(
-                str(broadcaster_id),
-                stream_id,
+            if not persist_stream_progress(
                 processing_state="partial",
                 range_start=stream_range_start,
                 range_end=None,
                 retryable_failure_state=outcome_reason,
-            )
+            ):
+                return stream_persistence_retry_result()
             print(
                 "STREAM SEARCH RESULT | "
                 f"stream_id={stream_id} | result=partial"
@@ -5800,29 +5928,58 @@ async def _run_auto_generate_clip_pipeline(
                     outcome_reason=outcome_reason,
                 )
         elif is_newest:
-            update_stream_progress(
-                str(broadcaster_id),
-                stream_id,
+            if not persist_stream_progress(
                 processing_state="partial",
                 range_start=stream_range_start,
                 range_end=stream_range_end,
                 retryable_failure_state=None,
                 checked_complete=True,
-            )
+            ):
+                return stream_persistence_retry_result()
             print(
                 "STREAM SEARCH RESULT | "
                 f"stream_id={stream_id} | result=no_clip"
             )
         else:
-            update_stream_progress(
-                str(broadcaster_id),
-                stream_id,
-                processing_state="exhausted",
-                range_start=stream_range_start,
-                range_end=stream_range_end,
-                retryable_failure_state=None,
-                checked_complete=True,
-            )
+            try:
+                if _historical_cursor_blocked:
+                    exhausted_saved = persist_stream_progress(
+                        processing_state="exhausted",
+                        range_start=stream_range_start,
+                        range_end=stream_range_end,
+                        retryable_failure_state=None,
+                        checked_complete=True,
+                    )
+                    if not exhausted_saved:
+                        return stream_persistence_retry_result()
+                else:
+                    exhaust_stream_and_advance_cursor(
+                        str(broadcaster_id),
+                        stream_id,
+                        range_start=stream_range_start,
+                        range_end=stream_range_end,
+                    )
+            except Exception as error:
+                _log_database_write_error(
+                    operation="stream_exhaustion_and_cursor_advance",
+                    table=(
+                        "auto_clip_stream_state,"
+                        "auto_clip_historical_cursor"
+                    ),
+                    columns=(
+                        "processing_state", "exhausted_at",
+                        "next_before_timestamp", "last_stream_id",
+                    ),
+                    parameters={
+                        "creator_id": str(broadcaster_id),
+                        "stream_id": stream_id,
+                        "processing_state": "exhausted",
+                        "range_start": stream_range_start,
+                        "range_end": stream_range_end,
+                    },
+                    error=error,
+                )
+                return stream_persistence_retry_result()
             print(
                 "STREAM SEARCH RESULT | "
                 f"stream_id={stream_id} | result=exhausted"
@@ -5832,11 +5989,6 @@ async def _run_auto_generate_clip_pipeline(
                 f"creator_id={broadcaster_id} | stream_id={stream_id}"
             )
             if not _historical_cursor_blocked:
-                save_historical_cursor(
-                    str(broadcaster_id),
-                    next_before_timestamp=stream_range_start,
-                    last_stream_id=stream_id,
-                )
                 print(
                     "AUTO CLIP HISTORICAL CURSOR SAVED | "
                     f"creator_id={broadcaster_id} | stream_id={stream_id} | "
@@ -6224,6 +6376,7 @@ async def _run_auto_generate_clip_pipeline(
                     )
                     continue
                 if not _write_terminal_clip_history(clip, "fully_evaluated"):
+                    stream_retryable_failure = True
                     candidates_rejected_count += 1
                     _log_candidate_rejection(
                         clip,
