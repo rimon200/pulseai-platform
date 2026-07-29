@@ -148,6 +148,26 @@ def _log_memory_check(stage: str, candidate_number: int, total_candidates: int) 
     )
 
 
+def _log_memory_admission(
+    stage: str,
+    available_memory_mb: float | None,
+    required_memory_mb: float,
+    admitted: bool,
+) -> None:
+    available_label = (
+        f"{available_memory_mb:.1f}"
+        if available_memory_mb is not None
+        else "unknown"
+    )
+    print(
+        "MEMORY CHECK | "
+        f"stage={stage} | "
+        f"available_mb={available_label} | "
+        f"required_mb={required_memory_mb:.1f} | "
+        f"decision={'allow' if admitted else 'defer'}"
+    )
+
+
 def _log_candidate_rejection(
     candidate: dict[str, object] | None,
     rejection_reason: str,
@@ -301,6 +321,12 @@ def _admit_candidate_batch_memory(
     admitted, available_memory_mb, required_memory_mb = (
         _whisper_memory_admitted()
     )
+    _log_memory_admission(
+        "before_download",
+        available_memory_mb,
+        required_memory_mb,
+        admitted,
+    )
     if not admitted:
         admitted, available_memory_mb, required_memory_mb = (
             _recheck_whisper_memory_once(
@@ -308,6 +334,12 @@ def _admit_candidate_batch_memory(
                 total_candidates,
                 "candidate_batch_start",
             )
+        )
+        _log_memory_admission(
+            "before_download",
+            available_memory_mb,
+            required_memory_mb,
+            admitted,
         )
     if not admitted:
         available_label = (
@@ -1046,6 +1078,12 @@ def _fully_evaluate_candidate(
         admitted, available_memory_mb, required_memory_mb = (
             _whisper_memory_admitted()
         )
+        _log_memory_admission(
+            "before_whisper",
+            available_memory_mb,
+            required_memory_mb,
+            admitted,
+        )
         if not admitted:
             admitted, available_memory_mb, required_memory_mb = (
                 _recheck_whisper_memory_once(
@@ -1053,6 +1091,12 @@ def _fully_evaluate_candidate(
                     total_candidates,
                     "after_download",
                 )
+            )
+            _log_memory_admission(
+                "before_whisper",
+                available_memory_mb,
+                required_memory_mb,
+                admitted,
             )
         if not admitted:
             failure_stage = "whisper_admission"
@@ -1073,7 +1117,17 @@ def _fully_evaluate_candidate(
                 persisted_clips,
             )
             video_path = ""
-            rescue_allowed, _, _ = _whisper_memory_admitted()
+            (
+                rescue_allowed,
+                rescue_available_memory_mb,
+                rescue_required_memory_mb,
+            ) = _whisper_memory_admitted()
+            _log_memory_admission(
+                "before_download",
+                rescue_available_memory_mb,
+                rescue_required_memory_mb,
+                rescue_allowed,
+            )
             return {
                 "success": False,
                 "clip": None,
@@ -1088,6 +1142,8 @@ def _fully_evaluate_candidate(
                 "memory_rejected_after_download": True,
                 "expensive_evaluation_started": False,
                 "rescue_allowed": rescue_allowed,
+                "available_memory_mb": available_memory_mb,
+                "required_memory_mb": required_memory_mb,
             }
         processing_error: Exception | None = None
         release_error: Exception | None = None
@@ -5483,6 +5539,8 @@ async def _run_auto_generate_clip_pipeline(
     candidates_evaluated = 0
     candidates_examined_count = 0
     candidates_rejected_count = 0
+    deferred_available_memory_mb: float | None = None
+    deferred_required_memory_mb: float | None = None
 
     def pipeline_result(
         message: str,
@@ -5507,6 +5565,8 @@ async def _run_auto_generate_clip_pipeline(
             "_job_candidates_rejected": (
                 _prior_candidates_rejected + candidates_rejected_count
             ),
+            "available_memory_mb": deferred_available_memory_mb,
+            "required_memory_mb": deferred_required_memory_mb,
         }
     creators = load_creators()
     creator_count = len(creators)
@@ -5790,6 +5850,8 @@ async def _run_auto_generate_clip_pipeline(
             )
         )
         if not batch_memory_admitted:
+            deferred_available_memory_mb = available_memory_mb
+            deferred_required_memory_mb = required_memory_mb
             candidates_deferred_before_download += total_candidates
             for deferred_candidate in fresh_batch:
                 candidates_examined_count += 1
@@ -5961,6 +6023,13 @@ async def _run_auto_generate_clip_pipeline(
                     candidates_evaluated += 1
                 if not evaluation_result["success"]:
                     stream_retryable_failure = True
+                    if evaluation_result.get("memory_rejected_after_download"):
+                        deferred_available_memory_mb = evaluation_result.get(
+                            "available_memory_mb"
+                        )
+                        deferred_required_memory_mb = evaluation_result.get(
+                            "required_memory_mb"
+                        )
                     candidates_rejected_count += 1
                     failure_stage = str(
                         evaluation_result.get("failure_stage") or "unknown"

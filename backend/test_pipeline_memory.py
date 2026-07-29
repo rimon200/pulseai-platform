@@ -212,11 +212,20 @@ class WhisperAdmissionTests(unittest.TestCase):
             ],
         ) as admission:
             with patch.object(main.time, "sleep") as sleep:
-                admitted, _, _ = main._admit_candidate_batch_memory(3, 1)
+                with patch("builtins.print") as log:
+                    admitted, _, _ = main._admit_candidate_batch_memory(3, 1)
 
         self.assertFalse(admitted)
         self.assertEqual(admission.call_count, 2)
         sleep.assert_called_once_with(3.0)
+        output = "\n".join(
+            " ".join(str(argument) for argument in call.args)
+            for call in log.call_args_list
+        )
+        self.assertIn("stage=before_download", output)
+        self.assertIn("available_mb=110.0", output)
+        self.assertIn("required_mb=180.0", output)
+        self.assertIn("decision=defer", output)
 
     def test_recovered_memory_before_download_permits_download(self):
         with patch.object(
@@ -258,13 +267,14 @@ class WhisperAdmissionTests(unittest.TestCase):
                 ],
             ) as admission:
                 with patch.object(main.time, "sleep") as sleep:
-                    with patch.object(
-                        main,
-                        "_transcribe_video_with_segments_subprocess",
-                    ) as transcribe:
-                        result = main._fully_evaluate_candidate(
-                            **self._candidate_arguments()
-                        )
+                    with patch("builtins.print") as log:
+                        with patch.object(
+                            main,
+                            "_transcribe_video_with_segments_subprocess",
+                        ) as transcribe:
+                            result = main._fully_evaluate_candidate(
+                                **self._candidate_arguments()
+                            )
         self.assertFalse(result["success"])
         self.assertEqual(result["failure_stage"], "whisper_admission")
         self.assertTrue(result["memory_rejected_after_download"])
@@ -272,6 +282,14 @@ class WhisperAdmissionTests(unittest.TestCase):
         sleep.assert_called_once_with(3.0)
         transcribe.assert_not_called()
         self.assertFalse(video_path.exists())
+        output = "\n".join(
+            " ".join(str(argument) for argument in call.args)
+            for call in log.call_args_list
+        )
+        self.assertIn("stage=before_whisper", output)
+        self.assertIn("available_mb=110.0", output)
+        self.assertIn("required_mb=180.0", output)
+        self.assertIn("decision=defer", output)
 
     def test_recovered_memory_after_download_permits_whisper(self):
         video_path = self._download_file()

@@ -65,6 +65,43 @@ class EmbeddedWorkerTests(unittest.IsolatedAsyncioTestCase):
             clip_worker.NO_CLIP_FOUND_MESSAGE,
         )
 
+    async def test_pipeline_memory_measurements_reach_deferred_summary(self):
+        pipeline_result = {
+            "message": (
+                "Clip generation deferred because worker memory did not "
+                "recover."
+            ),
+            "outcome_reason": "memory_deferred_before_download",
+            "available_memory_mb": 154.0,
+            "required_memory_mb": 180.0,
+        }
+        with patch.object(main, "_ensure_clip_history_table", return_value=True):
+            with patch(
+                "stream_history.ensure_stream_history_tables",
+                return_value=True,
+            ):
+                with patch.object(
+                    main,
+                    "_run_auto_generate_clip_pipeline",
+                    new=AsyncMock(return_value=pipeline_result),
+                ):
+                    result = await clip_worker.evaluate_claimed_job(
+                        {"id": "job-memory"},
+                        "worker",
+                    )
+        with patch("builtins.print") as log:
+            clip_worker._log_generation_job_summary("job-memory", result)
+        output = " ".join(str(argument) for argument in log.call_args.args)
+        self.assertEqual(result["available_memory_mb"], 154.0)
+        self.assertEqual(result["required_memory_mb"], 180.0)
+        self.assertIn("final_outcome=deferred_memory", output)
+        self.assertIn(
+            "pipeline_reason=memory_deferred_before_download",
+            output,
+        )
+        self.assertIn("available_mb=154.0", output)
+        self.assertIn("required_mb=180.0", output)
+
     async def test_auto_endpoint_only_enqueues_and_returns_202(self):
         queued = {
             "id": "00000000-0000-0000-0000-000000000001",
@@ -107,24 +144,40 @@ class EmbeddedWorkerTests(unittest.IsolatedAsyncioTestCase):
                     "_child_memory_admitted",
                     return_value=(False, 120.0, 180.0),
                 ):
-                    with patch.object(
-                        clip_worker,
-                        "defer_generation_job",
-                        side_effect=defer,
-                    ) as deferred:
+                    with patch("builtins.print") as log:
                         with patch.object(
                             clip_worker,
-                            "_run_claimed_job_child",
-                            new=AsyncMock(),
-                        ) as child:
-                            await clip_worker._owned_worker_loop(
-                                stop_event,
-                                "worker",
-                                0.01,
-                                object(),
-                            )
+                            "defer_generation_job",
+                            side_effect=defer,
+                        ) as deferred:
+                            with patch.object(
+                                clip_worker,
+                                "_run_claimed_job_child",
+                                new=AsyncMock(),
+                            ) as child:
+                                await clip_worker._owned_worker_loop(
+                                    stop_event,
+                                    "worker",
+                                    0.01,
+                                    object(),
+                                )
         deferred.assert_called_once()
         child.assert_not_awaited()
+        output = "\n".join(
+            " ".join(str(argument) for argument in call.args)
+            for call in log.call_args_list
+        )
+        self.assertIn("stage=before_child_spawn", output)
+        self.assertIn("available_mb=120.0", output)
+        self.assertIn("required_mb=180.0", output)
+        self.assertIn("process_rss_mb=", output)
+        self.assertIn("cgroup_limit_mb=", output)
+        self.assertIn("decision=defer", output)
+        self.assertIn("final_outcome=deferred_memory", output)
+        self.assertIn(
+            "pipeline_reason=memory_deferred_before_child_spawn",
+            output,
+        )
 
     async def test_claimed_children_run_sequentially(self):
         stop_event = asyncio.Event()

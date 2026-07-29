@@ -9,6 +9,7 @@ import socket
 import sys
 import tempfile
 import uuid
+import resource
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +51,7 @@ def _worker_id() -> str:
     )
 
 
-def _cgroup_available_memory_mb() -> float | None:
+def _cgroup_memory_snapshot_mb() -> tuple[float | None, float | None]:
     pairs = (
         (
             Path("/sys/fs/cgroup/memory.current"),
@@ -69,9 +70,10 @@ def _cgroup_available_memory_mb() -> float | None:
                 continue
             limit_bytes = int(limit_text)
             if 0 < limit_bytes < (1 << 60):
-                return max(
-                    0.0,
-                    (limit_bytes - usage_bytes) / (1024 * 1024),
+                limit_mb = limit_bytes / (1024 * 1024)
+                return (
+                    max(0.0, limit_mb - usage_bytes / (1024 * 1024)),
+                    limit_mb,
                 )
         except (FileNotFoundError, OSError, ValueError):
             continue
@@ -80,16 +82,60 @@ def _cgroup_available_memory_mb() -> float | None:
             encoding="utf-8"
         ).splitlines():
             if line.startswith("MemAvailable:"):
-                return float(line.split()[1]) / 1024
+                return float(line.split()[1]) / 1024, None
     except (FileNotFoundError, OSError, ValueError, IndexError):
         pass
     try:
         import psutil
 
-        return psutil.virtual_memory().available / (1024 * 1024)
+        return psutil.virtual_memory().available / (1024 * 1024), None
     except (ImportError, OSError):
         pass
-    return None
+    return None, None
+
+
+def _cgroup_available_memory_mb() -> float | None:
+    available_mb, _ = _cgroup_memory_snapshot_mb()
+    return available_mb
+
+
+def _process_rss_mb() -> float:
+    try:
+        import psutil
+
+        return psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
+    except (ImportError, OSError):
+        rss_value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return (
+            rss_value / (1024 * 1024)
+            if sys.platform == "darwin"
+            else rss_value / 1024
+        )
+
+
+def _log_child_spawn_memory_admission(
+    admitted: bool,
+    available_mb: float | None,
+    required_mb: float,
+) -> None:
+    _, cgroup_limit_mb = _cgroup_memory_snapshot_mb()
+    available_label = (
+        f"{available_mb:.1f}" if available_mb is not None else "unknown"
+    )
+    limit_label = (
+        f"{cgroup_limit_mb:.1f}"
+        if cgroup_limit_mb is not None
+        else "unknown"
+    )
+    print(
+        "MEMORY CHECK | "
+        "stage=before_child_spawn | "
+        f"available_mb={available_label} | "
+        f"required_mb={required_mb:.1f} | "
+        f"process_rss_mb={_process_rss_mb():.1f} | "
+        f"cgroup_limit_mb={limit_label} | "
+        f"decision={'allow' if admitted else 'defer'}"
+    )
 
 
 def _whisper_memory_floor_mb() -> float:
@@ -153,6 +199,8 @@ async def evaluate_claimed_job(job: dict[str, Any], worker_id: str) -> dict[str,
                 "status": "deferred_memory",
                 "error_message": message,
                 "pipeline_reason": pipeline_outcome_reason,
+                "available_memory_mb": result.get("available_memory_mb"),
+                "required_memory_mb": result.get("required_memory_mb"),
                 **_pipeline_counts(result),
             }
             return terminal_result
@@ -228,6 +276,24 @@ def _log_generation_job_summary(
     )
     final_outcome = str(result.get("outcome") or inferred_outcome)
     pipeline_reason = str(result.get("pipeline_reason") or "none")
+    memory_suffix = ""
+    if status == "deferred_memory":
+        available_mb = result.get("available_memory_mb")
+        required_mb = result.get("required_memory_mb")
+        available_label = (
+            f"{float(available_mb):.1f}"
+            if available_mb is not None
+            else "unknown"
+        )
+        required_label = (
+            f"{float(required_mb):.1f}"
+            if required_mb is not None
+            else "unknown"
+        )
+        memory_suffix = (
+            f" | available_mb={available_label}"
+            f" | required_mb={required_label}"
+        )
     print(
         "GENERATION JOB FINAL SUMMARY | "
         f"job_id={job_id} | "
@@ -236,6 +302,7 @@ def _log_generation_job_summary(
         f"result_clip_id={result_clip_id or 'none'} | "
         f"final_outcome={final_outcome} | "
         f"pipeline_reason={pipeline_reason}"
+        f"{memory_suffix}"
     )
 
 
@@ -427,6 +494,11 @@ async def _owned_worker_loop(
         job_id = str(job["id"])
         print(f"EMBEDDED WORKER CLAIMED JOB | job_id={job_id}")
         admitted, available_mb, required_mb = _child_memory_admitted()
+        _log_child_spawn_memory_admission(
+            admitted,
+            available_mb,
+            required_mb,
+        )
         if not admitted:
             available_label = (
                 f"{available_mb:.1f}" if available_mb is not None else "unknown"
@@ -446,6 +518,9 @@ async def _owned_worker_loop(
                     "status": "deferred_memory",
                     "candidates_examined": 0,
                     "candidates_rejected": 0,
+                    "pipeline_reason": "memory_deferred_before_child_spawn",
+                    "available_memory_mb": available_mb,
+                    "required_memory_mb": required_mb,
                 },
             )
             defer_generation_job(job_id, worker_id, message)
