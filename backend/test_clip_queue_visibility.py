@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import contextlib
+import asyncio
 import io
 import os
 import sys
+import tempfile
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import main
 
@@ -16,12 +19,13 @@ class FrontendVisibilityContractTests(unittest.TestCase):
     def setUp(self):
         self.frontend_dir = Path(__file__).resolve().parents[1] / "frontend" / "src"
 
-    def test_ai_clips_refresh_is_filtered(self):
+    def test_ai_clips_uses_paginated_filter_owned_requests(self):
         source = (
             self.frontend_dir / "components" / "AIClips.jsx"
         ).read_text(encoding="utf-8")
-        self.assertIn('const AI_CLIPS_STATUS = "ready_for_review"', source)
-        self.assertIn("await loadClips(1)", source)
+        self.assertIn("buildClipListUrl(", source)
+        self.assertIn('useState("All")', source)
+        self.assertIn("Load More", source)
         self.assertNotIn("fetch(`${API_BASE_URL}/api/clips`)", source)
 
     def test_app_polling_cannot_overwrite_ai_clips_state(self):
@@ -31,13 +35,12 @@ class FrontendVisibilityContractTests(unittest.TestCase):
 
     def test_unknown_status_is_not_reviewable(self):
         source = (
-            self.frontend_dir / "components" / "AIClips.jsx"
+            self.frontend_dir / "components" / "aiClipsPagination.js"
         ).read_text(encoding="utf-8")
-        fallback_block = source[source.index("const isReviewableClip"):source.index(
-            "const clipsMatch"
-        )]
-        self.assertNotIn("return true", fallback_block)
-        self.assertIn('return normalized === "Ready to review"', fallback_block)
+        publishable_block = source[source.index(
+            "export const isPublishableClipStatus"
+        ):]
+        self.assertNotIn('"unknown"', publishable_block)
 
     def test_unpublished_queue_navigation_is_wired(self):
         source = (self.frontend_dir / "App.jsx").read_text(encoding="utf-8")
@@ -242,6 +245,149 @@ class PostgreSQLQueuePersistenceTests(unittest.TestCase):
                 )
                 row = cursor.fetchone()
         self.assertEqual(row, ("Database Owned Name", 77))
+
+    def _seed_paginated_clips(self, creator_name: str) -> list[str]:
+        newest = datetime.now(timezone.utc)
+        expected_ids = []
+        with self.psycopg.connect(self.schema_url) as connection:
+            with connection.cursor() as cursor:
+                for index in range(15):
+                    clip_id = f"FAKE_PAGE_{index:02d}"
+                    generated_id = f"generated-page-{index:02d}"
+                    expected_ids.append(generated_id)
+                    cursor.execute(
+                        """
+                        INSERT INTO twitch_clip_history (
+                            provider, clip_id, clip_url, creator_name,
+                            created_at, generated_at, generated_clip_id,
+                            status, object_key, durable_url
+                        ) VALUES (
+                            'twitch', %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            clip_id,
+                            f"https://clips.twitch.tv/{clip_id}",
+                            creator_name,
+                            newest - timedelta(minutes=index),
+                            newest - timedelta(minutes=index),
+                            generated_id,
+                            "published" if index in {2, 13} else "ready_for_review",
+                            f"clips/{clip_id}/fake.mp4",
+                            f"https://media.invalid/{clip_id}.mp4",
+                        ),
+                    )
+            connection.commit()
+        return expected_ids
+
+    def test_pagination_filters_and_display_limit_do_not_delete_clips(self):
+        creator_name = f"Pagination Creator {uuid.uuid4().hex}"
+        expected_ids = self._seed_paginated_clips(creator_name)
+        first_page = asyncio.run(main.get_clips(
+            limit=12,
+            page=1,
+            status_filter="all",
+            creator=creator_name,
+        ))
+        second_page = asyncio.run(main.get_clips(
+            limit=12,
+            page=2,
+            status_filter="all",
+            creator=creator_name,
+        ))
+        self.assertEqual(
+            [clip["id"] for clip in first_page["items"]],
+            expected_ids[:12],
+        )
+        self.assertTrue(first_page["has_more"])
+        self.assertEqual(
+            [clip["id"] for clip in second_page["items"]],
+            expected_ids[12:],
+        )
+        self.assertFalse(second_page["has_more"])
+        combined_ids = {
+            clip["id"]
+            for clip in first_page["items"] + second_page["items"]
+        }
+        self.assertEqual(combined_ids, set(expected_ids))
+
+        unpublished = asyncio.run(main.get_clips(
+            limit=100,
+            page=1,
+            status_filter="unpublished",
+            creator=creator_name,
+        ))
+        published = asyncio.run(main.get_clips(
+            limit=100,
+            page=1,
+            status_filter="published",
+            creator=creator_name,
+        ))
+        self.assertIn(expected_ids[14], {
+            clip["id"] for clip in unpublished["items"]
+        })
+        self.assertEqual(
+            {clip["id"] for clip in published["items"]},
+            {expected_ids[2], expected_ids[13]},
+        )
+        with self.psycopg.connect(self.schema_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*), COUNT(object_key), COUNT(durable_url)
+                    FROM twitch_clip_history
+                    WHERE creator_name = %s
+                    """,
+                    (creator_name,),
+                )
+                counts = cursor.fetchone()
+        self.assertEqual(counts, (15, 15, 15))
+
+    def test_old_unpublished_clip_uses_normal_publish_flow(self):
+        clip_id = f"FAKE_OLD_PUBLISH_{uuid.uuid4().hex}"
+        generated_id = f"generated-{clip_id}"
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as media:
+            media.write(b"fake-video")
+            media.flush()
+            with self.psycopg.connect(self.schema_url) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO twitch_clip_history (
+                            provider, clip_id, clip_url, creator_name,
+                            created_at, generated_at, generated_clip_id,
+                            status, local_video_path, actual_duration
+                        ) VALUES (
+                            'twitch', %s, %s, 'Old Creator',
+                            NOW() - INTERVAL '90 days',
+                            NOW() - INTERVAL '90 days',
+                            %s, 'ready_for_review', %s, 30
+                        )
+                        """,
+                        (
+                            clip_id,
+                            f"https://clips.twitch.tv/{clip_id}",
+                            generated_id,
+                            media.name,
+                        ),
+                    )
+                connection.commit()
+            with patch.object(main, "load_published", return_value=[]):
+                with patch.object(
+                    main,
+                    "get_publish_settings",
+                    new=AsyncMock(return_value={"post_mode": "draft"}),
+                ):
+                    with patch.object(
+                        main,
+                        "upload_tiktok_draft",
+                        new=AsyncMock(return_value={"publish_id": "fake-upload"}),
+                    ):
+                        result = asyncio.run(
+                            main.publish_clip_to_tiktok({"id": generated_id})
+                        )
+        self.assertEqual(result["publish_id"], "fake-upload")
+        self.assertEqual(self._status(clip_id), "uploaded_to_inbox")
 
 
 if __name__ == "__main__":

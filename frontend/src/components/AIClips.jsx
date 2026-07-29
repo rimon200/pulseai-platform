@@ -4,31 +4,15 @@ import {
   pollGenerationJob,
   requestClipGeneration,
 } from "./aiClipsGeneration";
+import {
+  AI_CLIP_FILTERS,
+  buildClipListUrl,
+  isPublishableClipStatus,
+  mergeClipPages,
+} from "./aiClipsPagination";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL;
 const TIKTOK_RECONNECT_REQUIRED_MESSAGE = "TikTok authorization expired. Reconnect TikTok in Settings.";
-const AI_CLIPS_PAGE_SIZE = 10;
-const AI_CLIPS_STATUS = "ready_for_review";
-
-const normalizeClipStatus = (status) => {
-  const value = String(status || "").trim().toLowerCase();
-  if (value === "published") {
-    return "Published";
-  }
-  if (value === "ready to review") {
-    return "Ready to review";
-  }
-  if (value === "ready_for_review") {
-    return "Ready to review";
-  }
-  return "";
-};
-
-const isReviewableClip = (clip) => {
-  const normalized = normalizeClipStatus(clip?.status);
-  return normalized === "Ready to review";
-};
-
 const clipsMatch = (left, right) => {
   if (!left || !right) {
     return false;
@@ -65,32 +49,74 @@ function AIClips({ styles }) {
   const [previewErrors, setPreviewErrors] = useState({});
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
+  const [activeFilter, setActiveFilter] = useState("All");
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationStatus, setGenerationStatus] = useState("");
   const generationRequestActive = useRef(false);
-  const reviewableClips = clips.filter(isReviewableClip);
-
-  const loadClips = useCallback(async (requestedPage) => {
-    const response = await fetch(
-      `${API_BASE_URL}/api/clips?limit=${AI_CLIPS_PAGE_SIZE}`
-      + `&page=${requestedPage}&status=${AI_CLIPS_STATUS}`,
-    );
+  const listRequestSequence = useRef(0);
+  const loadClips = useCallback(async (
+    requestedPage,
+    requestedFilter,
+    replace = false,
+  ) => {
+    const requestSequence = listRequestSequence.current + 1;
+    listRequestSequence.current = requestSequence;
+    const response = await fetch(buildClipListUrl(
+      API_BASE_URL,
+      requestedPage,
+      requestedFilter,
+    ));
     const data = await response.json();
     if (!response.ok) {
       throw new Error(data.detail || "Could not load AI Clips.");
     }
-    setClips(Array.isArray(data) ? data : (data.items || []));
+    if (requestSequence !== listRequestSequence.current) {
+      return;
+    }
+    const nextItems = Array.isArray(data) ? data : (data.items || []);
+    setClips((currentClips) => (
+      replace ? nextItems : mergeClipPages(currentClips, nextItems)
+    ));
+    setPage(requestedPage);
     setHasMore(Boolean(data.has_more));
     setLoadError("");
   }, []);
 
   useEffect(() => {
-    loadClips(page).catch((error) => {
+    loadClips(1, activeFilter, true).catch((error) => {
       console.error("Could not load AI Clips page", error);
       setLoadError(error.message);
     });
-  }, [loadClips, page]);
+  }, [activeFilter, loadClips]);
+
+  const changeFilter = (nextFilter) => {
+    if (nextFilter === activeFilter) {
+      return;
+    }
+    listRequestSequence.current += 1;
+    setClips([]);
+    setPage(1);
+    setHasMore(false);
+    setLoadError("");
+    setActiveFilter(nextFilter);
+  };
+
+  const loadMore = async () => {
+    if (!hasMore || isLoadingMore) {
+      return;
+    }
+    setIsLoadingMore(true);
+    try {
+      await loadClips(page + 1, activeFilter);
+    } catch (error) {
+      console.error("Could not load more AI Clips", error);
+      setLoadError(error.message);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
 
   const getClipVideoUrl = (clipId, download = false) =>
     `${API_BASE_URL}/api/clips/${encodeURIComponent(clipId)}/video${
@@ -149,8 +175,11 @@ function AIClips({ styles }) {
           && state.outcome !== "no_clip_found"
           && state.resultClipId
         ) {
-          setPage(1);
-          await loadClips(1);
+          if (activeFilter === "All") {
+            await loadClips(1, "All", true);
+          } else {
+            changeFilter("All");
+          }
           return;
         }
         if (state.outcome === "no_clip_found") {
@@ -168,8 +197,11 @@ function AIClips({ styles }) {
         return;
       }
       if (outcome.kind === "success") {
-        setPage(1);
-        await loadClips(1);
+        if (activeFilter === "All") {
+          await loadClips(1, "All", true);
+        } else {
+          changeFilter("All");
+        }
         return;
       }
       alert(outcome.message);
@@ -229,9 +261,17 @@ const publishClip = async (clip) => {
       throw new Error(detailMessage);
     }
 
-    setClips((currentClips) =>
-      currentClips.filter((currentClip) => !clipsMatch(currentClip, clip))
-    );
+    setClips((currentClips) => (
+      activeFilter === "Unpublished"
+        ? currentClips.filter(
+          (currentClip) => !clipsMatch(currentClip, clip),
+        )
+        : currentClips.map((currentClip) => (
+          clipsMatch(currentClip, clip)
+            ? { ...currentClip, status: "uploaded_to_inbox" }
+            : currentClip
+        ))
+    ));
 
     setPreviewClipId((currentPreviewClipId) =>
       currentPreviewClipId === clip.id ? null : currentPreviewClipId
@@ -278,15 +318,27 @@ return (
             </p>
           </div>
         </div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+          {Object.keys(AI_CLIP_FILTERS).map((filterName) => (
+            <button
+              key={filterName}
+              onClick={() => changeFilter(filterName)}
+              disabled={activeFilter === filterName}
+              style={styles.secondaryButton}
+            >
+              {filterName}
+            </button>
+          ))}
+        </div>
 
         <div style={styles.clipGrid}>
           {loadError && (
             <div style={styles.emptyState}>{loadError}</div>
           )}
-          {reviewableClips.length > 0 ? (
-            reviewableClips.map((clip, index) => (
+          {clips.length > 0 ? (
+            clips.map((clip) => (
               <div
-  key={`${clip.title}-${clip.started_at || "clip"}-${index}`}
+  key={clip.id || clip.twitch_clip_id || clip.public_url}
   style={styles.clipCard}
 >
                 <div
@@ -343,13 +395,13 @@ return (
                     </span>
 
                     <span style={styles.clipStatus}>{clip.status}</span>
-                    <button
+<button
   onClick={() => publishClip(clip)}
-  disabled={false}
+  disabled={!isPublishableClipStatus(clip.status)}
   style={{
     ...styles.secondaryButton,
-    opacity: 1,
-    cursor: "pointer",
+    opacity: isPublishableClipStatus(clip.status) ? 1 : 0.6,
+    cursor: isPublishableClipStatus(clip.status) ? "pointer" : "not-allowed",
   }}
 >
   Publish
@@ -420,18 +472,16 @@ return (
             ))
           ) : (
             <div style={styles.emptyState}>
-              No clips detected yet.
+              No {activeFilter.toLowerCase()} clips found.
             </div>
           )}
         </div>
         <div style={{ marginTop: 20 }}>
-          <button disabled={page === 1} onClick={() => setPage(page - 1)}>
-            Previous
-          </button>
-          <span style={{ margin: "0 12px" }}>Page {page}</span>
-          <button disabled={!hasMore} onClick={() => setPage(page + 1)}>
-            Next
-          </button>
+          {hasMore && (
+            <button disabled={isLoadingMore} onClick={loadMore}>
+              {isLoadingMore ? "Loading…" : "Load More"}
+            </button>
+          )}
         </div>
       </section>
     </div>

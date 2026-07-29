@@ -4456,6 +4456,32 @@ def _paginate_items(
     }
 
 
+UNPUBLISHED_CLIP_STATUSES = (
+    "ready_for_review",
+    "approved",
+    "scheduled",
+    "publish_failed",
+)
+
+
+def _clip_status_filter(
+    status_filter: str,
+) -> tuple[str, list[object]]:
+    requested = str(status_filter or "").strip().lower()
+    if not requested or requested == "all":
+        return "", []
+    if requested == "unpublished":
+        return "status = ANY(%s)", [list(UNPUBLISHED_CLIP_STATUSES)]
+    if requested == "published":
+        return "status = %s", ["published"]
+    statuses = [
+        item.strip().lower()
+        for item in requested.split(",")
+        if item.strip()
+    ]
+    return ("status = ANY(%s)", [statuses]) if statuses else ("", [])
+
+
 def _log_queue_persistence_recovery(
     clip_id: str,
     object_key: object,
@@ -4754,21 +4780,46 @@ async def get_clips(
             clips = json.loads(clips_file.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, json.JSONDecodeError):
             clips = []
-        filtered = [
-            clip for clip in clips
-            if (not status_filter or str(clip.get("status", "")).lower() == status_filter.lower())
-            and (not creator or str(clip.get("creator", "")).lower() == creator.lower())
-        ]
-        filtered.reverse()
+        status_clause, status_parameters = _clip_status_filter(status_filter)
+        del status_clause
+        requested_statuses = (
+            status_parameters[0]
+            if status_parameters and isinstance(status_parameters[0], list)
+            else status_parameters
+        )
+        filtered = []
+        for clip in clips:
+            normalized_status = str(clip.get("status", "")).strip().lower()
+            normalized_status = normalized_status.replace(" ", "_")
+            if requested_statuses and normalized_status not in requested_statuses:
+                continue
+            if (
+                creator
+                and str(clip.get("creator", "")).lower() != creator.lower()
+            ):
+                continue
+            filtered.append(clip)
+        filtered.sort(
+            key=lambda clip: (
+                str(
+                    clip.get("created_at")
+                    or clip.get("started_at")
+                    or clip.get("generated_at")
+                    or ""
+                ),
+                str(clip.get("id") or clip.get("twitch_clip_id") or ""),
+            ),
+            reverse=True,
+        )
         return _paginate_items(filtered, page, limit)
     if not getattr(app.state, "clip_history_ready", False):
         raise HTTPException(status_code=503, detail="Clip history is unavailable.")
     clauses = ["provider = 'twitch'", "generated_clip_id IS NOT NULL"]
     parameters: list[object] = []
-    if status_filter:
-        statuses = [item.strip() for item in status_filter.split(",") if item.strip()]
-        clauses.append("status = ANY(%s)")
-        parameters.append(statuses)
+    status_clause, status_parameters = _clip_status_filter(status_filter)
+    if status_clause:
+        clauses.append(status_clause)
+        parameters.extend(status_parameters)
     if creator:
         clauses.append("LOWER(creator_name) = LOWER(%s)")
         parameters.append(creator)
@@ -4801,7 +4852,8 @@ async def get_clips(
                     )
                     + sql.SQL(where_sql)
                     + sql.SQL(
-                        " ORDER BY generated_at DESC NULLS LAST, first_seen_at DESC "
+                        " ORDER BY "
+                        "created_at DESC NULLS LAST, clip_id DESC "
                         "LIMIT %s OFFSET %s"
                     ),
                     [*parameters, limit, (page - 1) * limit],

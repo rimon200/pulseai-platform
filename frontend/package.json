@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test:ai-clips": "node --test src/components/aiClipsGeneration.test.js",
+    "test:ai-clips": "node --test src/components/aiClipsGeneration.test.js src/components/aiClipsPagination.test.js",
     "lint": "eslint .",
     "preview": "vite preview"
   },
