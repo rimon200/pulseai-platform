@@ -8,6 +8,19 @@ export const MEMORY_DEFERRED_USER_MESSAGE =
 export const GENERATION_ALREADY_RUNNING_MESSAGE =
   "A clip generation job is already running.";
 
+export const JOB_STATUS_LABELS = {
+  queued: "Queued",
+  claimed: "Queued",
+  downloading: "Downloading",
+  transcribing: "Transcribing",
+  scoring: "Scoring",
+  rendering: "Rendering",
+  uploading: "Uploading",
+  completed: "Completed",
+  deferred_memory: "Safely deferred for memory",
+  failed: "Failed",
+};
+
 const responseMessage = (payload) => {
   if (!payload || typeof payload !== "object") {
     return "";
@@ -64,6 +77,19 @@ export const classifyGenerationResponse = (response, payload) => {
     };
   }
 
+  if (
+    response.status === 202
+    && payload
+    && typeof payload === "object"
+    && payload.id
+  ) {
+    return {
+      kind: "job",
+      job: payload,
+      message: JOB_STATUS_LABELS[payload.status] || "Queued",
+    };
+  }
+
   const generatedClip = generatedClipFromPayload(payload);
   if (generatedClip) {
     return {
@@ -93,6 +119,20 @@ export const classifyGenerationResponse = (response, payload) => {
   };
 };
 
+export const classifyGenerationJob = (job) => {
+  const status = String(job?.status || "").trim().toLowerCase();
+  const message = typeof job?.error_message === "string"
+    ? job.error_message.trim()
+    : "";
+  return {
+    status,
+    label: JOB_STATUS_LABELS[status] || status || "Queued",
+    terminal: ["completed", "deferred_memory", "failed"].includes(status),
+    resultClipId: job?.result_clip_id || "",
+    message,
+  };
+};
+
 export const requestClipGeneration = async (fetchImplementation, endpoint) => {
   const response = await fetchImplementation(endpoint, { method: "POST" });
   let payload = {};
@@ -102,6 +142,37 @@ export const requestClipGeneration = async (fetchImplementation, endpoint) => {
     payload = {};
   }
   return classifyGenerationResponse(response, payload);
+};
+
+export const pollGenerationJob = async ({
+  fetchImplementation,
+  endpoint,
+  onUpdate,
+  wait = (milliseconds) => new Promise(
+    (resolve) => setTimeout(resolve, milliseconds)
+  ),
+  intervalMilliseconds = 2000,
+  maximumPolls = 600,
+}) => {
+  for (let poll = 0; poll < maximumPolls; poll += 1) {
+    const response = await fetchImplementation(endpoint);
+    let payload = {};
+    try {
+      payload = await response.json();
+    } catch {
+      payload = {};
+    }
+    if (!response.ok) {
+      throw new Error(responseMessage(payload) || "Could not load generation status.");
+    }
+    const state = classifyGenerationJob(payload);
+    onUpdate?.(state, payload);
+    if (state.terminal) {
+      return { state, job: payload };
+    }
+    await wait(intervalMilliseconds);
+  }
+  throw new Error("Clip generation status timed out.");
 };
 
 export const isGenerateButtonDisabled = (

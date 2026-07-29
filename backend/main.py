@@ -41,6 +41,13 @@ from ai import (
 )
 from video_editing import create_tiktok_edited_video
 from storage_service import object_storage_enabled, upload_video
+from generation_jobs import (
+    enqueue_generation_job,
+    ensure_generation_jobs_table,
+    get_generation_job,
+    serialize_generation_job,
+    update_generation_job_stage,
+)
 
 load_dotenv()
 
@@ -896,6 +903,8 @@ def _fully_evaluate_candidate(
     stream_title: str,
     viewer_count: int,
     persisted_clips: list[dict[str, object]],
+    generation_job_id: str | None = None,
+    generation_worker_id: str | None = None,
 ) -> dict[str, object]:
     candidate_started_at = time.perf_counter()
     video_path = ""
@@ -925,6 +934,11 @@ def _fully_evaluate_candidate(
         }
 
         failure_stage = "download"
+        _set_generation_job_stage(
+            generation_job_id,
+            generation_worker_id,
+            "downloading",
+        )
         _log_memory_check(
             stage="before_ytdlp_download",
             candidate_number=candidate_number,
@@ -1013,6 +1027,11 @@ def _fully_evaluate_candidate(
         expensive_evaluation_started = True
         try:
             failure_stage = "whisper"
+            _set_generation_job_stage(
+                generation_job_id,
+                generation_worker_id,
+                "transcribing",
+            )
             _log_memory_check(
                 stage="before_whisper_transcription",
                 candidate_number=candidate_number,
@@ -1035,6 +1054,11 @@ def _fully_evaluate_candidate(
             clip["segments"] = transcription.get("segments", [])
 
             failure_stage = "multimodal_scoring"
+            _set_generation_job_stage(
+                generation_job_id,
+                generation_worker_id,
+                "scoring",
+            )
             _log_memory_check(
                 stage="before_multimodal_scoring",
                 candidate_number=candidate_number,
@@ -1262,17 +1286,14 @@ async def _auto_clip_loop():
 
     while True:
         print("AUTO CYCLE START")
-        started = await try_begin_clip_generation()
-        if not started:
-            print("AUTO CYCLE SKIPPED: generation already in progress")
-        else:
-            try:
-                result = await _run_auto_generate_clip_pipeline()
-                print("AUTO RESULT:", result)
-            except Exception as error:
-                print("AUTO ERROR:", repr(error))
-            finally:
-                await end_clip_generation()
+        try:
+            job, created = enqueue_generation_job("automatic")
+            print(
+                "AUTO GENERATION JOB | "
+                f"job_id={job['id']} | created={str(created).lower()}"
+            )
+        except Exception as error:
+            print("AUTO ERROR:", repr(error))
         try:
             await _run_auto_publish_once()
         except Exception as error:
@@ -1342,6 +1363,9 @@ async def _start_auto_clip_task():
     _ensure_oauth_tokens_table()
     if not _ensure_clip_history_table():
         print("CLIP HISTORY INITIALIZATION FAILED")
+        return
+    if not ensure_generation_jobs_table():
+        print("GENERATION JOB INITIALIZATION FAILED")
         return
     app.state.clip_history_ready = True
     print("CLIP HISTORY READY")
@@ -1459,6 +1483,8 @@ def _ensure_clip_history_table() -> bool:
                     "visual_layout_confidence": "DOUBLE PRECISION",
                     "visual_layout_reason": "TEXT",
                     "visual_layout_version": "TEXT",
+                    "reaction_region": "JSONB",
+                    "content_region": "JSONB",
                     "generated_title": "TEXT",
                     "title_event_summary": "TEXT",
                     "title_relevance_score": "DOUBLE PRECISION",
@@ -4035,6 +4061,7 @@ def _persist_generated_clip_record(
                         source_creator_id, source_platform, rights_status
                         , visual_layout_mode, visual_layout_confidence,
                         visual_layout_reason, visual_layout_version,
+                        reaction_region, content_region,
                         generated_title, title_event_summary,
                         title_relevance_score, title_generation_version,
                         title_fallback_used
@@ -4043,7 +4070,8 @@ def _persist_generated_clip_record(
                         'ready_for_review', %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s,
                         NOW(), 'title-v3', %s, 'twitch', %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s::jsonb, %s::jsonb,
+                        %s, %s, %s, %s, %s
                     )
                     ON CONFLICT (provider, clip_id) DO UPDATE SET
                         clip_url = COALESCE(
@@ -4171,6 +4199,14 @@ def _persist_generated_clip_record(
                             EXCLUDED.visual_layout_version,
                             twitch_clip_history.visual_layout_version
                         ),
+                        reaction_region = COALESCE(
+                            EXCLUDED.reaction_region,
+                            twitch_clip_history.reaction_region
+                        ),
+                        content_region = COALESCE(
+                            EXCLUDED.content_region,
+                            twitch_clip_history.content_region
+                        ),
                         generated_title = COALESCE(
                             EXCLUDED.generated_title,
                             twitch_clip_history.generated_title
@@ -4222,6 +4258,16 @@ def _persist_generated_clip_record(
                         clip.get("visual_layout_confidence"),
                         clip.get("visual_layout_reason"),
                         clip.get("visual_layout_version"),
+                        (
+                            json.dumps(clip.get("reaction_region"))
+                            if clip.get("reaction_region")
+                            else None
+                        ),
+                        (
+                            json.dumps(clip.get("content_region"))
+                            if clip.get("content_region")
+                            else None
+                        ),
                         clip.get("generated_title") or clip.get("ai_title"),
                         clip.get("title_event_summary"),
                         clip.get("title_relevance_score"),
@@ -4895,17 +4941,8 @@ def generate_demo_clip():
         "status": "Ready to review",
     }
 
-@app.post("/api/clips")
-async def create_clip(clip: dict):
-    clips_file = Path(__file__).resolve().parent / "clips.json"
-
-    try:
-        with clips_file.open("r", encoding="utf-8") as file:
-            clips = json.load(file)
-    except (FileNotFoundError, json.JSONDecodeError):
-        clips = []
-
-    new_clip = {
+def _build_generated_clip_record(clip: dict) -> dict:
+    return {
     "id": str(uuid.uuid4()),
     "title": clip.get("title", "Untitled clip"),
     "creator": clip.get("creator", "Unknown creator"),
@@ -4940,6 +4977,8 @@ async def create_clip(clip: dict):
     "visual_layout_confidence": clip.get("visual_layout_confidence", 0),
     "visual_layout_reason": clip.get("visual_layout_reason", ""),
     "visual_layout_version": clip.get("visual_layout_version", "layout-v1"),
+    "reaction_region": clip.get("reaction_region"),
+    "content_region": clip.get("content_region"),
     "generated_title": clip.get("generated_title", clip.get("ai_title", "")),
     "title_event_summary": clip.get("title_event_summary", ""),
     "title_relevance_score": clip.get("title_relevance_score", 0),
@@ -4947,6 +4986,18 @@ async def create_clip(clip: dict):
     "title_fallback_used": bool(clip.get("title_fallback_used", False)),
 }
 
+
+@app.post("/api/clips")
+async def create_clip(clip: dict):
+    clips_file = Path(__file__).resolve().parent / "clips.json"
+
+    try:
+        with clips_file.open("r", encoding="utf-8") as file:
+            clips = json.load(file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        clips = []
+
+    new_clip = _build_generated_clip_record(clip)
     clips.append(new_clip)
 
     with clips_file.open("w", encoding="utf-8") as file:
@@ -4979,20 +5030,55 @@ async def generate_clip():
 
 @app.post("/api/clips/auto")
 async def auto_generate_clip():
-    started = await try_begin_clip_generation()
-    if not started:
-        return JSONResponse(
-            status_code=409,
-            content={"message": "Clip generation already in progress."},
+    try:
+        job, created = enqueue_generation_job("manual")
+    except Exception as error:
+        print(f"GENERATION JOB ENQUEUE FAILED | error={error!r}")
+        raise HTTPException(
+            status_code=503,
+            detail="Clip generation queue is unavailable.",
+        ) from error
+    payload = serialize_generation_job(job)
+    payload["reused"] = not created
+    return JSONResponse(status_code=202, content=payload)
+
+
+@app.get("/api/clip-generation-jobs/{job_id}")
+async def get_clip_generation_job(job_id: str):
+    try:
+        job = get_generation_job(job_id)
+    except Exception as error:
+        print(f"GENERATION JOB LOAD FAILED | job_id={job_id} | error={error!r}")
+        raise HTTPException(
+            status_code=503,
+            detail="Clip generation status is unavailable.",
+        ) from error
+    if job is None:
+        raise HTTPException(status_code=404, detail="Generation job not found.")
+    return serialize_generation_job(job)
+
+
+def _set_generation_job_stage(
+    generation_job_id: str | None,
+    generation_worker_id: str | None,
+    stage: str,
+) -> None:
+    if not generation_job_id or not generation_worker_id:
+        return
+    if not update_generation_job_stage(
+        generation_job_id,
+        generation_worker_id,
+        stage,
+    ):
+        raise RuntimeError(
+            f"Generation job lease was lost before stage {stage}."
         )
 
-    try:
-        return await _run_auto_generate_clip_pipeline()
-    finally:
-        await end_clip_generation()
 
-
-async def _run_auto_generate_clip_pipeline():
+async def _run_auto_generate_clip_pipeline(
+    generation_job_id: str | None = None,
+    generation_worker_id: str | None = None,
+):
     if not getattr(app.state, "clip_history_ready", False):
         raise HTTPException(
             status_code=503,
@@ -5281,6 +5367,8 @@ async def _run_auto_generate_clip_pipeline():
                     stream_title=stream_title,
                     viewer_count=viewer_count,
                     persisted_clips=existing_clips,
+                    generation_job_id=generation_job_id,
+                    generation_worker_id=generation_worker_id,
                 )
                 if evaluation_result.get("memory_deferred_before_download"):
                     candidates_deferred_before_download += 1
@@ -5557,6 +5645,11 @@ async def _run_auto_generate_clip_pipeline():
     best_clip["raw_video_path"] = best_clip.get("video_path")
     best_candidate_number = int(best_clip.get("candidate_number", 0) or 0)
     total_candidates = len(candidates)
+    _set_generation_job_stage(
+        generation_job_id,
+        generation_worker_id,
+        "rendering",
+    )
     _log_memory_check(
         stage="before_visual_layout_detection",
         candidate_number=best_candidate_number,
@@ -5580,6 +5673,8 @@ async def _run_auto_generate_clip_pipeline():
     best_clip["visual_layout_confidence"] = visual_layout["confidence"]
     best_clip["visual_layout_reason"] = visual_layout["reason"]
     best_clip["visual_layout_version"] = visual_layout["version"]
+    best_clip["reaction_region"] = visual_layout.get("reaction_region")
+    best_clip["content_region"] = visual_layout.get("content_region")
 
     try:
         title_for_overlay = best_clip.get("ai_title") or best_clip.get("title", "")
@@ -5598,6 +5693,8 @@ async def _run_auto_generate_clip_pipeline():
             best_clip["visual_layout_confidence"] = visual_layout["confidence"]
             best_clip["visual_layout_reason"] = visual_layout["reason"]
             best_clip["visual_layout_version"] = visual_layout["version"]
+            best_clip["reaction_region"] = visual_layout.get("reaction_region")
+            best_clip["content_region"] = visual_layout.get("content_region")
             _log_memory_check(
                 stage="before_ffmpeg_edit",
                 candidate_number=best_candidate_number,
@@ -5642,6 +5739,11 @@ async def _run_auto_generate_clip_pipeline():
         _trim_native_memory("ffmpeg_completion")
 
     if object_storage_enabled():
+        _set_generation_job_stage(
+            generation_job_id,
+            generation_worker_id,
+            "uploading",
+        )
         try:
             storage_result = await asyncio.to_thread(
                 upload_video,
@@ -5664,7 +5766,13 @@ async def _run_auto_generate_clip_pipeline():
     )
     persistence_started_at = time.perf_counter()
     try:
-        result = await create_clip(best_clip)
+        # Background workers persist generated records in PostgreSQL. Avoid
+        # writing worker-local legacy JSON, which is neither shared nor durable
+        # across the web and worker services.
+        result = {
+            "success": True,
+            "clip": _build_generated_clip_record(best_clip),
+        }
     except Exception as error:
         print(
             "CLIP PERSISTENCE FAILED - MEDIA RETAINED FOR RECOVERY | "
@@ -5684,7 +5792,7 @@ async def _run_auto_generate_clip_pipeline():
     if not _persist_generated_clip_record(queue_clip):
         raise HTTPException(
             status_code=503,
-            detail="Clip was persisted, but its durable queue record could not be saved.",
+            detail="Rendered clip could not be saved to the durable queue.",
         )
     _log_performance_timing(
         stage="persistence",

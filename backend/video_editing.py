@@ -316,28 +316,43 @@ def _build_filter_chain(
     regions = layout.get("regions") if isinstance(layout.get("regions"), list) else []
     safe_overlay_ass_file = _escape_filter_path(overlay_ass_file_path)
 
-    if layout_mode in {"multi_person_split", "reaction_split"} and len(regions) >= 2:
+    if layout_mode in {
+        "multi_person_split",
+        "reaction_split",
+        "reaction_stream",
+    } and len(regions) >= 2:
         crop_filters = []
         output_labels = []
+        reaction_height = int(VIDEO_REGION_HEIGHT * 0.38)
+        content_height = VIDEO_REGION_HEIGHT - reaction_height
         for index, region in enumerate(regions[:2]):
             normalized = _normalized_layout_region(region)
             output_label = f"layout_region_{index}"
             output_labels.append(output_label)
+            branch_height = (
+                reaction_height if index == 0 else content_height
+            ) if layout_mode == "reaction_stream" else VIDEO_REGION_HEIGHT // 2
             crop_filters.append(
                 f"[layout_input_{index}]"
                 f"crop=w='iw*{normalized['width']:.5f}':"
                 f"h='ih*{normalized['height']:.5f}':"
                 f"x='iw*{normalized['x']:.5f}':"
                 f"y='ih*{normalized['y']:.5f}',"
-                f"scale={CANVAS_WIDTH}:{VIDEO_REGION_HEIGHT // 2}:"
+                f"scale={CANVAS_WIDTH}:{branch_height}:"
                 "force_original_aspect_ratio=increase,"
-                f"crop={CANVAS_WIDTH}:{VIDEO_REGION_HEIGHT // 2}"
+                f"crop={CANVAS_WIDTH}:{branch_height}"
                 f"[{output_label}]"
             )
+        stack_labels = list(output_labels)
+        if (
+            layout_mode == "reaction_stream"
+            and str(layout.get("reaction_placement") or "top") == "bottom"
+        ):
+            stack_labels.reverse()
         filters = [
             "fps=24,split=2[layout_input_0][layout_input_1]",
             *crop_filters,
-            f"[{output_labels[0]}][{output_labels[1]}]"
+            f"[{stack_labels[0]}][{stack_labels[1]}]"
             "vstack=inputs=2[video_region]",
             f"color=c=white:s={CANVAS_WIDTH}x{CANVAS_HEIGHT}[base]",
             f"[base][video_region]overlay=x=0:y={VIDEO_REGION_TOP}:"
@@ -475,6 +490,7 @@ def detect_visual_layout(video_path: str) -> Dict[str, object]:
         two_face_sample_count = 0
         edge_face_sample_count = 0
         left_edge_face_count = 0
+        persistent_webcam_regions: List[Dict[str, float]] = []
         for sample_index in range(sample_count):
             frame_index = int(
                 round(
@@ -517,8 +533,11 @@ def detect_visual_layout(video_path: str) -> Dict[str, object]:
                         faces[0]["center_x"] <= 0.32
                         or faces[0]["center_x"] >= 0.68
                     )
+                    and faces[0]["width"] <= 0.35
+                    and faces[0]["height"] <= 0.45
                 ):
                     edge_face_sample_count += 1
+                    persistent_webcam_regions.append(dict(faces[0]))
                     if faces[0]["center_x"] < 0.5:
                         left_edge_face_count += 1
             finally:
@@ -559,26 +578,74 @@ def detect_visual_layout(video_path: str) -> Dict[str, object]:
 
     wide_source = source_width / source_height >= 1.45
     if wide_source and reaction_confidence >= minimum_confidence:
-        face_region = (
-            {"x": 0.0, "y": 0.0, "width": 0.42, "height": 1.0}
-            if face_on_left
-            else {"x": 0.58, "y": 0.0, "width": 0.42, "height": 1.0}
-        )
-        content_region = (
-            {"x": 0.32, "y": 0.0, "width": 0.68, "height": 1.0}
-            if face_on_left
-            else {"x": 0.0, "y": 0.0, "width": 0.68, "height": 1.0}
-        )
-        result = {
-            "mode": "reaction_split",
-            "confidence": round(reaction_confidence, 3),
-            "reason": "persistent edge webcam face with wide reacted-content area",
-            "version": "layout-v1",
-            "sample_count": usable_samples,
-            "regions": [face_region, content_region],
+        average_face = {
+            key: sum(region[key] for region in persistent_webcam_regions)
+            / len(persistent_webcam_regions)
+            for key in ("x", "y", "width", "height")
         }
-        print(f"VISUAL LAYOUT SELECTED | mode=reaction_split | confidence={reaction_confidence:.3f}")
-        print(f"VISUAL LAYOUT REGIONS | regions={result['regions']}")
+        reaction_width = min(
+            0.42,
+            max(0.24, average_face["width"] * 2.2),
+        )
+        reaction_height = min(
+            0.58,
+            max(0.28, average_face["height"] * 2.0),
+        )
+        reaction_x = min(
+            1.0 - reaction_width,
+            max(0.0, average_face["x"] - average_face["width"] * 0.55),
+        )
+        reaction_y = min(
+            1.0 - reaction_height,
+            max(0.0, average_face["y"] - average_face["height"] * 0.65),
+        )
+        reaction_region = {
+            "x": reaction_x,
+            "y": reaction_y,
+            "width": reaction_width,
+            "height": reaction_height,
+        }
+        webcam_is_bottom = reaction_y + reaction_height >= 0.82
+        if webcam_is_bottom and reaction_y >= 0.42:
+            content_region = {
+                "x": 0.0,
+                "y": 0.0,
+                "width": 1.0,
+                "height": max(0.42, reaction_y),
+            }
+            reaction_placement = "bottom"
+        else:
+            content_y = min(0.42, reaction_y + reaction_height)
+            content_region = {
+                "x": 0.0,
+                "y": content_y,
+                "width": 1.0,
+                "height": 1.0 - content_y,
+            }
+            reaction_placement = "top"
+        result = {
+            "mode": "reaction_stream",
+            "confidence": round(reaction_confidence, 3),
+            "reason": (
+                "persistent small edge webcam region separated from watched "
+                "content"
+            ),
+            "version": "layout-v2",
+            "sample_count": usable_samples,
+            "reaction_region": reaction_region,
+            "content_region": content_region,
+            "reaction_placement": reaction_placement,
+            "regions": [reaction_region, content_region],
+        }
+        print(
+            "VISUAL LAYOUT SELECTED | "
+            f"mode=reaction_stream | confidence={reaction_confidence:.3f}"
+        )
+        print(
+            "VISUAL LAYOUT REGIONS | "
+            f"reaction_region={reaction_region} | "
+            f"content_region={content_region}"
+        )
         return result
     return _single_subject_layout(
         "layout evidence below confidence threshold",

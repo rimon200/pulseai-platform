@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   isGenerateButtonDisabled,
+  pollGenerationJob,
   requestClipGeneration,
 } from "./aiClipsGeneration";
 
@@ -66,6 +67,7 @@ function AIClips({ styles }) {
   const [hasMore, setHasMore] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [isGenerating, setIsGenerating] = useState(false);
+  const [generationStatus, setGenerationStatus] = useState("");
   const generationRequestActive = useRef(false);
   const reviewableClips = clips.filter(isReviewableClip);
 
@@ -135,6 +137,28 @@ function AIClips({ styles }) {
         fetch,
         `${API_BASE_URL}/api/clips/auto`,
       );
+      if (outcome.kind === "job") {
+        setGenerationStatus(outcome.message);
+        const { state } = await pollGenerationJob({
+          fetchImplementation: fetch,
+          endpoint: `${API_BASE_URL}/api/clip-generation-jobs/${outcome.job.id}`,
+          onUpdate: (jobState) => setGenerationStatus(jobState.label),
+        });
+        if (state.status === "completed") {
+          setPage(1);
+          await loadClips(1);
+          return;
+        }
+        if (state.status === "deferred_memory") {
+          alert(
+            "Generation was safely deferred because the server was low on "
+            + "memory. Please try again in a few minutes."
+          );
+          return;
+        }
+        alert(state.message || "Clip generation failed.");
+        return;
+      }
       if (outcome.kind === "success") {
         setPage(1);
         await loadClips(1);
@@ -230,6 +254,11 @@ return (
   >
     {isGenerating ? "Generating…" : "Generate Clip"}
   </button>
+  {generationStatus && (
+    <span style={{ marginLeft: 12, opacity: 0.8 }}>
+      {generationStatus}
+    </span>
+  )}
 </div>
 
       <section style={styles.panel}>

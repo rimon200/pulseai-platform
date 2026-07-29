@@ -111,7 +111,10 @@ class SpeechCaptionAndLayoutTests(unittest.TestCase):
         self.assertIn("shortest=1:eof_action=endall", graph)
 
     def test_edge_webcam_evidence_selects_reaction_layout(self):
-        faces = [{"center_x": 0.15, "width": 0.1, "height": 0.2}]
+        faces = [{
+            "x": 0.05, "y": 0.04, "center_x": 0.15,
+            "width": 0.1, "height": 0.2,
+        }]
         with patch.object(
             video_editing.cv2,
             "VideoCapture",
@@ -123,8 +126,73 @@ class SpeechCaptionAndLayoutTests(unittest.TestCase):
                 return_value=faces,
             ):
                 layout = video_editing.detect_visual_layout("fake.mp4")
-        self.assertEqual(layout["mode"], "reaction_split")
+        self.assertEqual(layout["mode"], "reaction_stream")
         self.assertEqual(len(layout["regions"]), 2)
+        self.assertEqual(layout["reaction_region"], layout["regions"][0])
+        self.assertEqual(layout["content_region"], layout["regions"][1])
+
+    def test_top_right_webcam_selects_reaction_stream(self):
+        faces = [{
+            "x": 0.84, "y": 0.05, "center_x": 0.9,
+            "width": 0.1, "height": 0.18,
+        }]
+        with patch.object(
+            video_editing.cv2,
+            "VideoCapture",
+            return_value=self._ReadableCapture(),
+        ):
+            with patch.object(
+                video_editing,
+                "_detect_face_like_regions",
+                return_value=faces,
+            ):
+                layout = video_editing.detect_visual_layout("fake.mp4")
+        self.assertEqual(layout["mode"], "reaction_stream")
+        self.assertGreater(layout["reaction_region"]["x"], 0.5)
+        self.assertEqual(layout["reaction_placement"], "top")
+
+    def test_bottom_corner_webcam_uses_safe_bottom_placement(self):
+        faces = [{
+            "x": 0.04, "y": 0.78, "center_x": 0.1,
+            "width": 0.12, "height": 0.18,
+        }]
+        with patch.object(
+            video_editing.cv2,
+            "VideoCapture",
+            return_value=self._ReadableCapture(),
+        ):
+            with patch.object(
+                video_editing,
+                "_detect_face_like_regions",
+                return_value=faces,
+            ):
+                layout = video_editing.detect_visual_layout("fake.mp4")
+        self.assertEqual(layout["mode"], "reaction_stream")
+        self.assertEqual(layout["reaction_placement"], "bottom")
+        self.assertLessEqual(
+            layout["content_region"]["y"]
+            + layout["content_region"]["height"],
+            layout["reaction_region"]["y"],
+        )
+
+    def test_reaction_stream_graph_preserves_two_regions(self):
+        with tempfile.NamedTemporaryFile(suffix=".ass") as overlay:
+            graph = video_editing._build_filter_chain(
+                Path(overlay.name),
+                visual_layout={
+                    "mode": "reaction_stream",
+                    "reaction_placement": "top",
+                    "regions": [
+                        {"x": 0, "y": 0, "width": 0.32, "height": 0.35},
+                        {"x": 0, "y": 0.3, "width": 1, "height": 0.7},
+                    ],
+                },
+            )
+        self.assertEqual(graph.count("split=2"), 1)
+        self.assertNotIn("split=3", graph)
+        self.assertIn("scale=720:395", graph)
+        self.assertIn("scale=720:645", graph)
+        self.assertIn("vstack=inputs=2", graph)
 
     def test_layout_sample_count_is_capped(self):
         class FakeCapture:
@@ -249,15 +317,28 @@ class SpeechCaptionAndLayoutTests(unittest.TestCase):
                     )
                     overlay_path = Path(directory) / "overlay.ass"
                     overlay_path.write_text("", encoding="utf-8")
-                    graph = video_editing._build_filter_chain(
-                        overlay_path,
-                        visual_layout={
+                    if duration == 2:
+                        visual_layout = {
+                            "mode": "reaction_stream",
+                            "reaction_region": {
+                                "x": 0, "y": 0, "width": 0.32, "height": 0.35,
+                            },
+                            "content_region": {
+                                "x": 0, "y": 0, "width": 1, "height": 1,
+                            },
+                            "reaction_placement": "top",
+                        }
+                    else:
+                        visual_layout = {
                             "mode": "multi_person_split",
                             "regions": [
                                 {"x": 0, "y": 0, "width": 0.52, "height": 1},
                                 {"x": 0.48, "y": 0, "width": 0.52, "height": 1},
                             ],
-                        },
+                        }
+                    graph = video_editing._build_filter_chain(
+                        overlay_path,
+                        visual_layout=visual_layout,
                     )
                     graph = graph.rsplit(";", 1)[0] + ";[composed]null"
                     subprocess.run(
@@ -283,11 +364,21 @@ class SpeechCaptionAndLayoutTests(unittest.TestCase):
                     metadata = json.loads(probe.stdout)
                     output_duration = float(metadata["format"]["duration"])
                     self.assertAlmostEqual(output_duration, duration, delta=0.25)
-                    self.assertTrue(
-                        any(
-                            stream.get("codec_type") == "audio"
-                            for stream in metadata["streams"]
-                        )
+                    video_streams = [
+                        stream for stream in metadata["streams"]
+                        if stream.get("codec_type") == "video"
+                    ]
+                    audio_streams = [
+                        stream for stream in metadata["streams"]
+                        if stream.get("codec_type") == "audio"
+                    ]
+                    self.assertEqual(len(video_streams), 1)
+                    self.assertEqual(video_streams[0]["width"], 720)
+                    self.assertEqual(video_streams[0]["height"], 1280)
+                    self.assertEqual(
+                        len(audio_streams),
+                        1,
+                        "split layouts must preserve source audio exactly once",
                     )
 
 

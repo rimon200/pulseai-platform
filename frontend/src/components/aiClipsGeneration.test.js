@@ -4,7 +4,9 @@ import test from "node:test";
 import {
   GENERATION_ALREADY_RUNNING_MESSAGE,
   MEMORY_DEFERRED_USER_MESSAGE,
+  classifyGenerationJob,
   isGenerateButtonDisabled,
+  pollGenerationJob,
   requestClipGeneration,
 } from "./aiClipsGeneration.js";
 
@@ -64,4 +66,48 @@ test("Generate Clip button is disabled during an active request", () => {
   assert.equal(isGenerateButtonDisabled(true, false), true);
   assert.equal(isGenerateButtonDisabled(false, true), true);
   assert.equal(isGenerateButtonDisabled(false, false), false);
+});
+
+test("202 response returns a durable queued job", async () => {
+  const outcome = await requestClipGeneration(
+    async () => response(202, { id: "job-1", status: "queued" }),
+    "/api/clips/auto",
+  );
+  assert.equal(outcome.kind, "job");
+  assert.equal(outcome.job.id, "job-1");
+});
+
+test("job polling reports stages and completed result", async () => {
+  const jobs = [
+    { id: "job-1", status: "queued" },
+    { id: "job-1", status: "transcribing" },
+    {
+      id: "job-1",
+      status: "completed",
+      result_clip_id: "clip-1",
+    },
+  ];
+  const labels = [];
+  const result = await pollGenerationJob({
+    fetchImplementation: async () => response(200, jobs.shift()),
+    endpoint: "/api/clip-generation-jobs/job-1",
+    onUpdate: (state) => labels.push(state.label),
+    wait: async () => {},
+  });
+  assert.deepEqual(labels, ["Queued", "Transcribing", "Completed"]);
+  assert.equal(result.state.resultClipId, "clip-1");
+});
+
+test("deferred and failed jobs retain real terminal messages", () => {
+  const deferred = classifyGenerationJob({
+    status: "deferred_memory",
+    error_message: "Worker memory did not recover.",
+  });
+  const failed = classifyGenerationJob({
+    status: "failed",
+    error_message: "R2 upload failed.",
+  });
+  assert.equal(deferred.label, "Safely deferred for memory");
+  assert.equal(deferred.terminal, true);
+  assert.equal(failed.message, "R2 upload failed.");
 });
