@@ -17,6 +17,7 @@ ACTIVE_JOB_STATUSES = {
 }
 TERMINAL_JOB_STATUSES = {"completed", "deferred_memory", "failed"}
 JOB_ADVISORY_LOCK_ID = 22616960936427851
+EMBEDDED_WORKER_ADVISORY_LOCK_ID = 22616960936427852
 
 
 def _database_url() -> str:
@@ -154,6 +155,52 @@ def get_generation_job(job_id: str) -> dict[str, Any] | None:
                 (job_id,),
             )
             return _row_to_job(cursor.fetchone())
+
+
+def try_acquire_embedded_worker_ownership() -> object | None:
+    """Hold a PostgreSQL session lock for one worker loop across web processes."""
+    database_url = _database_url()
+    if not database_url:
+        return None
+    import psycopg
+
+    connection = psycopg.connect(database_url, autocommit=True)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_try_advisory_lock(%s)",
+                (EMBEDDED_WORKER_ADVISORY_LOCK_ID,),
+            )
+            acquired = bool(cursor.fetchone()[0])
+        if acquired:
+            return connection
+    except Exception:
+        connection.close()
+        raise
+    connection.close()
+    return None
+
+
+def embedded_worker_ownership_is_alive(connection: object) -> bool:
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            return cursor.fetchone()[0] == 1
+    except Exception:
+        return False
+
+
+def release_embedded_worker_ownership(connection: object | None) -> None:
+    if connection is None:
+        return
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_unlock(%s)",
+                (EMBEDDED_WORKER_ADVISORY_LOCK_ID,),
+            )
+    finally:
+        connection.close()
 
 
 def claim_generation_job(

@@ -1208,6 +1208,8 @@ TWITCH_REDIRECT_URI = os.getenv(
 )
 
 app.state.auto_clip_task = None
+app.state.embedded_clip_worker_task = None
+app.state.embedded_clip_worker_stop_event = None
 app.state.clip_generation_admission_lock = asyncio.Lock()
 app.state.clip_generation_busy = False
 app.state.clip_generation_db_lease = None
@@ -1371,10 +1373,42 @@ async def _start_auto_clip_task():
     print("CLIP HISTORY READY")
     if app.state.auto_clip_task is None or app.state.auto_clip_task.done():
         app.state.auto_clip_task = asyncio.create_task(_auto_clip_loop())
+    embedded_worker_enabled = (
+        os.getenv("EMBEDDED_CLIP_WORKER_ENABLED", "true").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    if (
+        embedded_worker_enabled
+        and (
+            app.state.embedded_clip_worker_task is None
+            or app.state.embedded_clip_worker_task.done()
+        )
+    ):
+        import clip_worker
+
+        stop_event = asyncio.Event()
+        app.state.embedded_clip_worker_stop_event = stop_event
+        app.state.embedded_clip_worker_task = asyncio.create_task(
+            clip_worker.run_worker_loop(stop_event, embedded=True)
+        )
 
 
 @app.on_event("shutdown")
 async def _stop_auto_clip_task():
+    embedded_stop_event = app.state.embedded_clip_worker_stop_event
+    embedded_task = app.state.embedded_clip_worker_task
+    if embedded_stop_event is not None:
+        embedded_stop_event.set()
+    if embedded_task is not None:
+        embedded_task.cancel()
+        try:
+            await embedded_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            app.state.embedded_clip_worker_task = None
+            app.state.embedded_clip_worker_stop_event = None
+
     task = app.state.auto_clip_task
     if task is None:
         return

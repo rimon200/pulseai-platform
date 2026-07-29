@@ -82,6 +82,18 @@ class PostgreSQLGenerationJobTests(unittest.TestCase):
         self.assertFalse(reused_created)
         self.assertEqual(first["id"], second["id"])
 
+    def test_only_one_embedded_worker_owns_the_loop(self):
+        first = generation_jobs.try_acquire_embedded_worker_ownership()
+        self.assertIsNotNone(first)
+        try:
+            second = generation_jobs.try_acquire_embedded_worker_ownership()
+            self.assertIsNone(second)
+        finally:
+            generation_jobs.release_embedded_worker_ownership(first)
+        replacement = generation_jobs.try_acquire_embedded_worker_ownership()
+        self.assertIsNotNone(replacement)
+        generation_jobs.release_embedded_worker_ownership(replacement)
+
     def test_only_one_worker_claims_and_stale_lease_recovers(self):
         job, _ = generation_jobs.enqueue_generation_job("manual")
         results = []
