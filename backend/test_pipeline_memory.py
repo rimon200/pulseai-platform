@@ -149,7 +149,104 @@ class WhisperAdmissionTests(unittest.TestCase):
         handle.close()
         return Path(handle.name)
 
-    def test_low_memory_rejects_whisper_and_cleans_download(self):
+    def _successful_score(self):
+        return {
+            "score": 80,
+            "reason": "fake",
+            "hook": "fake",
+            "visual_score": 80,
+            "transcript_score": 80,
+            "context_score": 80,
+            "confidence": 80,
+            "decision": "accept",
+        }
+
+    def _evaluate_successfully(self, video_path, memory_results):
+        with contextlib.ExitStack() as stack:
+            download = stack.enter_context(
+                patch.object(
+                    main,
+                    "download_twitch_clip",
+                    return_value=str(video_path),
+                )
+            )
+            admission = stack.enter_context(
+                patch.object(
+                    main,
+                    "_whisper_memory_admitted",
+                    side_effect=memory_results,
+                )
+            )
+            sleep = stack.enter_context(patch.object(main.time, "sleep"))
+            transcribe = stack.enter_context(
+                patch.object(
+                    main,
+                    "_transcribe_video_with_segments_subprocess",
+                    return_value={
+                        "transcript": "fake transcript",
+                        "segments": [],
+                    },
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    main,
+                    "score_multimodal_clip",
+                    return_value=self._successful_score(),
+                )
+            )
+            stack.enter_context(patch.object(main, "release_whisper_model"))
+            result = main._fully_evaluate_candidate(
+                **self._candidate_arguments()
+            )
+        return result, download, admission, sleep, transcribe
+
+    def test_low_memory_before_download_triggers_one_bounded_recheck(self):
+        with patch.object(
+            main,
+            "_whisper_memory_admitted",
+            side_effect=[
+                (False, 100.0, 180.0),
+                (False, 110.0, 180.0),
+            ],
+        ) as admission:
+            with patch.object(main.time, "sleep") as sleep:
+                with patch.object(
+                    main, "download_twitch_clip"
+                ) as download:
+                    result = main._fully_evaluate_candidate(
+                        **self._candidate_arguments()
+                    )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["memory_deferred_before_download"])
+        self.assertEqual(result["failure_stage"], "whisper_admission")
+        self.assertEqual(admission.call_count, 2)
+        sleep.assert_called_once_with(3.0)
+        download.assert_not_called()
+
+    def test_recovered_memory_before_download_permits_download(self):
+        video_path = self._download_file()
+        try:
+            result, download, admission, sleep, transcribe = (
+                self._evaluate_successfully(
+                    video_path,
+                    [
+                        (False, 100.0, 180.0),
+                        (True, 190.0, 180.0),
+                        (True, 190.0, 180.0),
+                    ],
+                )
+            )
+            self.assertTrue(result["success"])
+            self.assertEqual(admission.call_count, 3)
+            sleep.assert_called_once_with(3.0)
+            download.assert_called_once()
+            transcribe.assert_called_once()
+        finally:
+            video_path.unlink(missing_ok=True)
+
+    def test_low_memory_after_download_gets_one_recheck_and_cleans_file(self):
         video_path = self._download_file()
         with patch.object(
             main,
@@ -159,60 +256,115 @@ class WhisperAdmissionTests(unittest.TestCase):
             with patch.object(
                 main,
                 "_whisper_memory_admitted",
-                return_value=(False, 100.0, 180.0),
-            ):
-                with patch.object(
-                    main,
-                    "_transcribe_video_with_segments_subprocess",
-                ) as transcribe:
+                side_effect=[
+                    (True, 220.0, 180.0),
+                    (False, 100.0, 180.0),
+                    (False, 110.0, 180.0),
+                ],
+            ) as admission:
+                with patch.object(main.time, "sleep") as sleep:
+                    with patch.object(
+                        main,
+                        "_transcribe_video_with_segments_subprocess",
+                    ) as transcribe:
+                        result = main._fully_evaluate_candidate(
+                            **self._candidate_arguments()
+                        )
+        self.assertFalse(result["success"])
+        self.assertEqual(result["failure_stage"], "whisper_admission")
+        self.assertTrue(result["memory_rejected_after_download"])
+        self.assertEqual(admission.call_count, 3)
+        sleep.assert_called_once_with(3.0)
+        transcribe.assert_not_called()
+        self.assertFalse(video_path.exists())
+
+    def test_recovered_memory_after_download_permits_whisper(self):
+        video_path = self._download_file()
+        try:
+            result, download, admission, sleep, transcribe = (
+                self._evaluate_successfully(
+                    video_path,
+                    [
+                        (True, 220.0, 180.0),
+                        (False, 100.0, 180.0),
+                        (True, 190.7, 180.0),
+                    ],
+                )
+            )
+            self.assertTrue(result["success"])
+            self.assertEqual(admission.call_count, 3)
+            sleep.assert_called_once_with(3.0)
+            download.assert_called_once()
+            transcribe.assert_called_once_with(str(video_path))
+        finally:
+            video_path.unlink(missing_ok=True)
+
+    def test_recheck_cooldown_is_bounded_and_not_repeated(self):
+        with patch.dict(
+            os.environ,
+            {"WHISPER_MEMORY_RECHECK_SECONDS": "999"},
+        ):
+            with patch.object(
+                main,
+                "_whisper_memory_admitted",
+                side_effect=[
+                    (False, 100.0, 180.0),
+                    (False, 100.0, 180.0),
+                ],
+            ) as admission:
+                with patch.object(main.time, "sleep") as sleep:
                     result = main._fully_evaluate_candidate(
                         **self._candidate_arguments()
                     )
+
         self.assertFalse(result["success"])
-        self.assertEqual(result["failure_stage"], "whisper_admission")
-        transcribe.assert_not_called()
+        self.assertEqual(admission.call_count, 2)
+        sleep.assert_called_once_with(30.0)
+
+    def test_persistent_low_memory_continues_rescue_contract(self):
+        video_path = self._download_file()
+        with patch.object(
+            main,
+            "download_twitch_clip",
+            return_value=str(video_path),
+        ):
+            with patch.object(
+                main,
+                "_whisper_memory_admitted",
+                side_effect=[
+                    (True, 220.0, 180.0),
+                    (False, 100.0, 180.0),
+                    (False, 100.0, 180.0),
+                ],
+            ):
+                with patch.object(main.time, "sleep"):
+                    result = main._fully_evaluate_candidate(
+                        **self._candidate_arguments()
+                    )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["memory_rejected_after_download"])
         self.assertFalse(video_path.exists())
+        source = Path(main.__file__).read_text(encoding="utf-8")
+        self.assertIn('("rescue", rescue_candidate_numbers)', source)
+        self.assertIn('if not evaluation_result["success"]:', source)
 
     def test_sufficient_memory_proceeds_to_isolated_whisper(self):
         video_path = self._download_file()
         try:
-            with patch.object(
-                main,
-                "download_twitch_clip",
-                return_value=str(video_path),
-            ):
-                with patch.object(
-                    main,
-                    "_whisper_memory_admitted",
-                    return_value=(True, 250.0, 180.0),
-                ):
-                    with patch.object(
-                        main,
-                        "_transcribe_video_with_segments_subprocess",
-                        return_value={
-                            "transcript": "fake transcript",
-                            "segments": [],
-                        },
-                    ) as transcribe:
-                        with patch.object(
-                            main,
-                            "score_multimodal_clip",
-                            return_value={
-                                "score": 80,
-                                "reason": "fake",
-                                "hook": "fake",
-                                "visual_score": 80,
-                                "transcript_score": 80,
-                                "context_score": 80,
-                                "confidence": 80,
-                                "decision": "accept",
-                            },
-                        ):
-                            with patch.object(main, "release_whisper_model"):
-                                result = main._fully_evaluate_candidate(
-                                    **self._candidate_arguments()
-                                )
+            result, download, admission, sleep, transcribe = (
+                self._evaluate_successfully(
+                    video_path,
+                    [
+                        (True, 250.0, 180.0),
+                        (True, 250.0, 180.0),
+                    ],
+                )
+            )
             self.assertTrue(result["success"])
+            self.assertEqual(admission.call_count, 2)
+            sleep.assert_not_called()
+            download.assert_called_once()
             transcribe.assert_called_once_with(str(video_path))
         finally:
             video_path.unlink(missing_ok=True)

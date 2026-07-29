@@ -166,6 +166,49 @@ def _whisper_memory_admitted(
     return admitted, available_memory_mb, required_memory_mb
 
 
+def _whisper_memory_recheck_seconds() -> float:
+    try:
+        configured_seconds = float(
+            os.getenv("WHISPER_MEMORY_RECHECK_SECONDS", "3")
+        )
+    except ValueError:
+        configured_seconds = 3.0
+    return max(0.0, min(configured_seconds, 30.0))
+
+
+def _recheck_whisper_memory_once(
+    candidate_number: int,
+    total_candidates: int,
+    admission_point: str,
+) -> tuple[bool, float | None, float]:
+    cooldown_seconds = _whisper_memory_recheck_seconds()
+    gc.collect()
+    print(
+        "WHISPER MEMORY COOLDOWN START | "
+        f"candidate={candidate_number}/{total_candidates} | "
+        f"admission_point={admission_point} | "
+        f"cooldown_seconds={cooldown_seconds:.1f}"
+    )
+    time.sleep(cooldown_seconds)
+    admitted, available_memory_mb, required_memory_mb = (
+        _whisper_memory_admitted()
+    )
+    available_label = (
+        f"{available_memory_mb:.1f}"
+        if available_memory_mb is not None
+        else "unknown"
+    )
+    result_label = "PASSED" if admitted else "FAILED"
+    print(
+        f"WHISPER MEMORY RECHECK {result_label} | "
+        f"candidate={candidate_number}/{total_candidates} | "
+        f"admission_point={admission_point} | "
+        f"available_mb={available_label} | "
+        f"required_mb={required_memory_mb:.1f}"
+    )
+    return admitted, available_memory_mb, required_memory_mb
+
+
 def _log_performance_timing(
     stage: str,
     elapsed_seconds: float,
@@ -667,6 +710,7 @@ def _fully_evaluate_candidate(
     candidate_started_at = time.perf_counter()
     video_path = ""
     failure_stage = "candidate_construction"
+    expensive_evaluation_started = False
 
     try:
         twitch_clip_id = str(twitch_clip.get("id", "")).strip()
@@ -691,6 +735,42 @@ def _fully_evaluate_candidate(
         }
 
         failure_stage = "download"
+        _log_memory_check(
+            stage="before_candidate_download_admission",
+            candidate_number=candidate_number,
+            total_candidates=total_candidates,
+        )
+        admitted, available_memory_mb, required_memory_mb = (
+            _whisper_memory_admitted()
+        )
+        if not admitted:
+            admitted, available_memory_mb, required_memory_mb = (
+                _recheck_whisper_memory_once(
+                    candidate_number,
+                    total_candidates,
+                    "before_download",
+                )
+            )
+        if not admitted:
+            available_label = (
+                f"{available_memory_mb:.1f}"
+                if available_memory_mb is not None
+                else "unknown"
+            )
+            return {
+                "success": False,
+                "clip": None,
+                "video_path": "",
+                "failure_stage": "whisper_admission",
+                "error": (
+                    "insufficient memory before candidate download: "
+                    f"available={available_label} MB, "
+                    f"required={required_memory_mb:.1f} MB"
+                ),
+                "memory_deferred_before_download": True,
+                "memory_rejected_after_download": False,
+                "expensive_evaluation_started": False,
+            }
         _log_memory_check(
             stage="before_ytdlp_download",
             candidate_number=candidate_number,
@@ -717,6 +797,9 @@ def _fully_evaluate_candidate(
                 "video_path": "",
                 "failure_stage": "download",
                 "error": "download failed",
+                "memory_deferred_before_download": False,
+                "memory_rejected_after_download": False,
+                "expensive_evaluation_started": False,
             }
 
         clip["video_path"] = video_path
@@ -728,6 +811,14 @@ def _fully_evaluate_candidate(
         admitted, available_memory_mb, required_memory_mb = (
             _whisper_memory_admitted()
         )
+        if not admitted:
+            admitted, available_memory_mb, required_memory_mb = (
+                _recheck_whisper_memory_once(
+                    candidate_number,
+                    total_candidates,
+                    "after_download",
+                )
+            )
         if not admitted:
             failure_stage = "whisper_admission"
             available_label = (
@@ -757,9 +848,13 @@ def _fully_evaluate_candidate(
                     f"available={available_label} MB, "
                     f"required={required_memory_mb:.1f} MB"
                 ),
+                "memory_deferred_before_download": False,
+                "memory_rejected_after_download": True,
+                "expensive_evaluation_started": False,
             }
         processing_error: Exception | None = None
         release_error: Exception | None = None
+        expensive_evaluation_started = True
         try:
             failure_stage = "whisper"
             _log_memory_check(
@@ -854,6 +949,9 @@ def _fully_evaluate_candidate(
             "video_path": video_path,
             "failure_stage": None,
             "error": None,
+            "memory_deferred_before_download": False,
+            "memory_rejected_after_download": False,
+            "expensive_evaluation_started": True,
         }
     except Exception as error:
         if video_path:
@@ -868,6 +966,9 @@ def _fully_evaluate_candidate(
             "video_path": video_path,
             "failure_stage": failure_stage,
             "error": repr(error),
+            "memory_deferred_before_download": False,
+            "memory_rejected_after_download": False,
+            "expensive_evaluation_started": expensive_evaluation_started,
         }
     finally:
         _log_performance_timing(
@@ -4744,6 +4845,9 @@ async def _run_auto_generate_clip_pipeline():
     generation_started_at = time.perf_counter()
     processed_candidates_count = 0
     fully_evaluated_candidates_count = 0
+    candidates_deferred_before_download = 0
+    candidates_rejected_after_download = 0
+    candidates_evaluated = 0
     creators = load_creators()
     creator_count = len(creators)
     start_index = _load_creator_cursor(creator_count)
@@ -5000,6 +5104,12 @@ async def _run_auto_generate_clip_pipeline():
                     viewer_count=viewer_count,
                     persisted_clips=existing_clips,
                 )
+                if evaluation_result.get("memory_deferred_before_download"):
+                    candidates_deferred_before_download += 1
+                if evaluation_result.get("memory_rejected_after_download"):
+                    candidates_rejected_after_download += 1
+                if evaluation_result.get("expensive_evaluation_started"):
+                    candidates_evaluated += 1
                 if not evaluation_result["success"]:
                     _write_terminal_clip_history(
                         twitch_clip,
@@ -5059,7 +5169,10 @@ async def _run_auto_generate_clip_pipeline():
             "FULL EVALUATION SUMMARY | "
             f"batch={batch_attempt}/2 | "
             f"batch_full_evaluated_candidates={batch_full_evaluated_candidates} | "
-            f"total_fully_evaluated_candidates={fully_evaluated_candidates_count}"
+            f"total_fully_evaluated_candidates={fully_evaluated_candidates_count} | "
+            f"candidates_deferred_before_download={candidates_deferred_before_download} | "
+            f"candidates_rejected_after_download={candidates_rejected_after_download} | "
+            f"candidates_evaluated={candidates_evaluated}"
         )
 
         if candidates:
@@ -5071,9 +5184,30 @@ async def _run_auto_generate_clip_pipeline():
         )
 
     if not candidates:
+        all_processed_candidates_deferred_for_memory = (
+            processed_candidates_count > 0
+            and candidates_evaluated == 0
+            and (
+                candidates_deferred_before_download
+                + candidates_rejected_after_download
+            )
+            == processed_candidates_count
+        )
         return {
-            "message": "No viral clips found.",
+            "message": (
+                "Clip generation deferred because available memory remained "
+                "below the Whisper safety floor."
+                if all_processed_candidates_deferred_for_memory
+                else "No viral clips found."
+            ),
             "best_score": 0,
+            "candidates_deferred_before_download": (
+                candidates_deferred_before_download
+            ),
+            "candidates_rejected_after_download": (
+                candidates_rejected_after_download
+            ),
+            "candidates_evaluated": candidates_evaluated,
         }
 
     print("------------------------")
