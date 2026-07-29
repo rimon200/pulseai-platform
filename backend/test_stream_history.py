@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import threading
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import main
 import stream_history
@@ -253,6 +255,263 @@ class StreamDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(complete)
 
 
+class StreamTraversalTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.now = datetime.now(timezone.utc)
+        self.creator = {
+            "name": "Fake Streamer",
+            "channel": "fake_streamer",
+        }
+        self.channel = {
+            "is_live": True,
+            "stream_id": "live-newest",
+            "user_id": "fake-creator",
+            "started_at": (self.now - timedelta(hours=1)).isoformat(),
+            "title": "Current live stream",
+            "completed_streams": [
+                {
+                    "stream_id": "vod-newer",
+                    "video_id": "video-newer",
+                    "started_at": self.now - timedelta(days=1),
+                    "ended_at": self.now - timedelta(hours=22),
+                    "is_live": False,
+                },
+                {
+                    "stream_id": "vod-older",
+                    "video_id": "video-older",
+                    "started_at": self.now - timedelta(days=2),
+                    "ended_at": self.now - timedelta(hours=46),
+                    "is_live": False,
+                },
+            ],
+        }
+
+    def _pipeline_patches(self, fetch_side_effect):
+        stack = contextlib.ExitStack()
+        cursor = {"value": None}
+        exhausted = set()
+
+        def get_cursor(_creator_id):
+            return (
+                {
+                    "next_before_timestamp": cursor["value"],
+                    "last_stream_id": "saved",
+                }
+                if cursor["value"] is not None
+                else {}
+            )
+
+        def update_progress(_creator_id, stream_id, **values):
+            if values.get("processing_state") == "exhausted":
+                exhausted.add(stream_id)
+            return True
+
+        def save_cursor(
+            _creator_id,
+            *,
+            next_before_timestamp,
+            last_stream_id,
+        ):
+            del last_stream_id
+            cursor["value"] = next_before_timestamp
+
+        stack.enter_context(
+            patch.object(main, "load_creators", return_value=[self.creator])
+        )
+        stack.enter_context(
+            patch.object(
+                main,
+                "get_twitch_channel_data",
+                new=AsyncMock(return_value=self.channel),
+            )
+        )
+        stack.enter_context(patch.object(main, "_load_creator_cursor", return_value=0))
+        stack.enter_context(patch.object(main, "_save_creator_cursor"))
+        stack.enter_context(
+            patch.object(main, "register_newest_stream", return_value={})
+        )
+        stack.enter_context(
+            patch.object(
+                main,
+                "register_historical_stream",
+                return_value={"processing_state": "pending"},
+            )
+        )
+        stack.enter_context(patch.object(main, "get_stream_state", return_value=None))
+        stack.enter_context(
+            patch.object(
+                main,
+                "get_exhausted_stream_ids",
+                side_effect=lambda _creator_id: set(exhausted),
+            )
+        )
+        stack.enter_context(
+            patch.object(main, "get_historical_cursor", side_effect=get_cursor)
+        )
+        stack.enter_context(
+            patch.object(main, "update_stream_progress", side_effect=update_progress)
+        )
+        stack.enter_context(
+            patch.object(main, "save_historical_cursor", side_effect=save_cursor)
+        )
+        stack.enter_context(
+            patch.object(
+                main,
+                "_load_clip_history_exclusions",
+                return_value=(set(), set(), True),
+            )
+        )
+        fetch = stack.enter_context(
+            patch.object(
+                main,
+                "fetch_twitch_clips_for_stream",
+                new=AsyncMock(side_effect=fetch_side_effect),
+            )
+        )
+        stack.enter_context(
+            patch.object(main, "_log_memory_check")
+        )
+        stack.enter_context(
+            patch.object(main, "_log_performance_timing")
+        )
+        main.app.state.clip_history_ready = True
+        main.app.state.current_stream_grace_active = False
+        return stack, fetch, exhausted, cursor
+
+    async def test_current_failure_traverses_multiple_historical_streams(self):
+        searched_streams = []
+
+        async def fetch(broadcaster_id, stream_target, **_kwargs):
+            del broadcaster_id
+            searched_streams.append(stream_target["stream_id"])
+            main.app.state.current_stream_grace_active = False
+            return [], True, ""
+
+        stack, _, exhausted, cursor = self._pipeline_patches(fetch)
+        captured = io.StringIO()
+        with stack:
+            with contextlib.redirect_stdout(captured):
+                result = await main._run_auto_generate_clip_pipeline()
+
+        self.assertEqual(
+            searched_streams,
+            ["live-newest", "vod-newer", "vod-older"],
+        )
+        self.assertEqual(exhausted, {"vod-newer", "vod-older"})
+        self.assertEqual(
+            cursor["value"],
+            self.channel["completed_streams"][1]["started_at"],
+        )
+        self.assertEqual(result["outcome_reason"], "no_more_streams")
+        output = captured.getvalue()
+        self.assertIn("mode=current", output)
+        self.assertEqual(output.count("mode=historical"), 2)
+        self.assertIn(
+            "STREAM SEARCH COMPLETE | streams_checked=3 | "
+            "clip_created=false | reason=no_more_streams",
+            output,
+        )
+
+    async def test_current_failure_stops_after_recursive_clip_creation(self):
+        async def fetch(broadcaster_id, stream_target, **_kwargs):
+            del broadcaster_id
+            self.assertEqual(stream_target["stream_id"], "live-newest")
+            return [], True, ""
+
+        stack, _, _, _ = self._pipeline_patches(fetch)
+        original_pipeline = main._run_auto_generate_clip_pipeline
+        recursive_result = {"id": "generated-from-history"}
+        with stack:
+            with patch.object(
+                main,
+                "_run_auto_generate_clip_pipeline",
+                new=AsyncMock(return_value=recursive_result),
+            ) as recursive_call:
+                result = await original_pipeline()
+        self.assertEqual(result, recursive_result)
+        recursive_call.assert_awaited_once()
+        self.assertTrue(
+            recursive_call.await_args.kwargs["_historical_only"]
+        )
+
+    async def test_incomplete_current_discovery_still_enters_history(self):
+        searched_streams = []
+
+        async def fetch(broadcaster_id, stream_target, **_kwargs):
+            del broadcaster_id
+            searched_streams.append(stream_target["stream_id"])
+            return [], stream_target["stream_id"] != "live-newest", ""
+
+        stack, _, exhausted, _ = self._pipeline_patches(fetch)
+        with stack:
+            result = await main._run_auto_generate_clip_pipeline()
+        self.assertEqual(
+            searched_streams,
+            [
+                "live-newest",
+                "live-newest",
+                "vod-newer",
+                "vod-older",
+            ],
+        )
+        self.assertEqual(exhausted, {"vod-newer", "vod-older"})
+        self.assertEqual(
+            result["outcome_reason"],
+            "partial_streams_remaining",
+        )
+        self.assertNotIn("No suitable clip", result["message"])
+
+    async def test_exhausted_historical_stream_is_skipped_forever(self):
+        searched_streams = []
+        exhausted = {"vod-newer"}
+
+        async def fetch(broadcaster_id, stream_target, **_kwargs):
+            del broadcaster_id
+            searched_streams.append(stream_target["stream_id"])
+            return [], True, ""
+
+        stack, _, _, _ = self._pipeline_patches(fetch)
+        stack.enter_context(
+            patch.object(
+                main,
+                "get_exhausted_stream_ids",
+                side_effect=lambda _creator_id: set(exhausted),
+            )
+        )
+        with stack:
+            await main._run_auto_generate_clip_pipeline()
+        self.assertEqual(searched_streams, ["live-newest", "vod-older"])
+
+    async def test_partial_historical_stream_holds_durable_cursor(self):
+        searched_streams = []
+
+        async def fetch(broadcaster_id, stream_target, **_kwargs):
+            del broadcaster_id
+            stream_id = stream_target["stream_id"]
+            searched_streams.append(stream_id)
+            return [], stream_id != "vod-newer", ""
+
+        stack, _, exhausted, cursor = self._pipeline_patches(fetch)
+        with stack:
+            result = await main._run_auto_generate_clip_pipeline()
+        self.assertEqual(
+            searched_streams,
+            [
+                "live-newest",
+                "vod-newer",
+                "vod-newer",
+                "vod-older",
+            ],
+        )
+        self.assertNotIn("vod-newer", exhausted)
+        self.assertIn("vod-older", exhausted)
+        self.assertIsNone(cursor["value"])
+        self.assertEqual(
+            result["outcome_reason"],
+            "partial_streams_remaining",
+        )
+
+
 @unittest.skipUnless(
     os.getenv("TEST_DATABASE_URL", "").strip(),
     "TEST_DATABASE_URL is required for stream-history integration tests",
@@ -426,6 +685,25 @@ class PostgreSQLStreamHistoryTests(unittest.TestCase):
         cursor = stream_history.get_historical_cursor("fake-creator")
         self.assertEqual(cursor["next_before_timestamp"], older)
         self.assertEqual(cursor["last_stream_id"], "older")
+
+    def test_historical_cursor_survives_worker_restart_connections(self):
+        saved_timestamp = self.now - timedelta(days=3)
+        stream_history.save_historical_cursor(
+            "fake-restarted-creator",
+            next_before_timestamp=saved_timestamp,
+            last_stream_id="fake-restart-stream",
+        )
+        first_worker_view = stream_history.get_historical_cursor(
+            "fake-restarted-creator"
+        )
+        second_worker_view = stream_history.get_historical_cursor(
+            "fake-restarted-creator"
+        )
+        self.assertEqual(
+            first_worker_view["next_before_timestamp"],
+            saved_timestamp,
+        )
+        self.assertEqual(second_worker_view, first_worker_view)
 
 
 if __name__ == "__main__":
