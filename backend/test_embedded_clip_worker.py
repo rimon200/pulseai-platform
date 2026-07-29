@@ -12,43 +12,51 @@ import main
 class EmbeddedWorkerTests(unittest.IsolatedAsyncioTestCase):
     async def test_completed_result_requires_a_real_clip_id(self):
         with patch.object(main, "_ensure_clip_history_table", return_value=True):
-            with patch.object(
-                main,
-                "_run_auto_generate_clip_pipeline",
-                new=AsyncMock(
-                    return_value={
-                        "id": "generated-clip-1",
-                        "_job_candidates_examined": 2,
-                        "_job_candidates_rejected": 1,
-                    }
-                ),
+            with patch(
+                "stream_history.ensure_stream_history_tables",
+                return_value=True,
             ):
-                result = await clip_worker.evaluate_claimed_job(
-                    {"id": "job-success"},
-                    "worker",
-                )
+                with patch.object(
+                    main,
+                    "_run_auto_generate_clip_pipeline",
+                    new=AsyncMock(
+                        return_value={
+                            "id": "generated-clip-1",
+                            "_job_candidates_examined": 2,
+                            "_job_candidates_rejected": 1,
+                        }
+                    ),
+                ):
+                    result = await clip_worker.evaluate_claimed_job(
+                        {"id": "job-success"},
+                        "worker",
+                    )
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["outcome"], "clip_created")
         self.assertEqual(result["result_clip_id"], "generated-clip-1")
 
     async def test_no_clip_pipeline_result_is_not_clip_created(self):
         with patch.object(main, "_ensure_clip_history_table", return_value=True):
-            with patch.object(
-                main,
-                "_run_auto_generate_clip_pipeline",
-                new=AsyncMock(
-                    return_value={
-                        "message": "No viral clips found.",
-                        "outcome_reason": "score_threshold",
-                        "_job_candidates_examined": 2,
-                        "_job_candidates_rejected": 2,
-                    }
-                ),
+            with patch(
+                "stream_history.ensure_stream_history_tables",
+                return_value=True,
             ):
-                result = await clip_worker.evaluate_claimed_job(
-                    {"id": "job-no-clip"},
-                    "worker",
-                )
+                with patch.object(
+                    main,
+                    "_run_auto_generate_clip_pipeline",
+                    new=AsyncMock(
+                        return_value={
+                            "message": "No viral clips found.",
+                            "outcome_reason": "score_threshold",
+                            "_job_candidates_examined": 2,
+                            "_job_candidates_rejected": 2,
+                        }
+                    ),
+                ):
+                    result = await clip_worker.evaluate_claimed_job(
+                        {"id": "job-no-clip"},
+                        "worker",
+                    )
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["outcome"], "no_clip_found")
         self.assertIsNone(result["result_clip_id"])

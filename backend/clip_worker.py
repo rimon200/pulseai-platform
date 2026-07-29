@@ -115,6 +115,7 @@ def _child_memory_admitted() -> tuple[bool, float | None, float]:
 async def evaluate_claimed_job(job: dict[str, Any], worker_id: str) -> dict[str, Any]:
     """Execute one claimed job without applying its terminal database state."""
     import main
+    from stream_history import ensure_stream_history_tables
 
     job_id = str(job["id"])
     if not main._ensure_clip_history_table():
@@ -123,6 +124,11 @@ async def evaluate_claimed_job(job: dict[str, Any], worker_id: str) -> dict[str,
             "error_message": "Clip history initialization failed in the worker.",
         }
         return result
+    if not ensure_stream_history_tables():
+        return {
+            "status": "failed",
+            "error_message": "Stream history initialization failed in the worker.",
+        }
     main.app.state.clip_history_ready = True
     try:
         result = await main._run_auto_generate_clip_pipeline(

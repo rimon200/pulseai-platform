@@ -48,6 +48,16 @@ from generation_jobs import (
     serialize_generation_job,
     update_generation_job_stage,
 )
+from stream_history import (
+    ensure_stream_history_tables,
+    get_exhausted_stream_ids,
+    get_historical_cursor,
+    get_stream_state,
+    register_historical_stream,
+    register_newest_stream,
+    save_historical_cursor,
+    update_stream_progress,
+)
 
 load_dotenv()
 
@@ -510,6 +520,22 @@ def _parse_twitch_created_at(value: object) -> datetime | None:
         return None
 
 
+def _parse_twitch_duration_seconds(value: object) -> int:
+    text = str(value or "").strip().lower()
+    if not text:
+        return 0
+    match = re.fullmatch(
+        r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?",
+        text,
+    )
+    if not match:
+        return 0
+    hours, minutes, seconds = (
+        int(component or 0) for component in match.groups()
+    )
+    return hours * 3600 + minutes * 60 + seconds
+
+
 def _nonnegative_int(value: object) -> int:
     try:
         return max(0, int(value or 0))
@@ -970,6 +996,7 @@ def _fully_evaluate_candidate(
             "public_url": public_url,
             "candidate_number": candidate_number,
             "_search_tier": int(twitch_clip.get("_search_tier", 1)),
+            "source_stream_id": twitch_clip.get("_stream_id"),
             "duration": float(twitch_clip.get("duration") or 0),
         }
 
@@ -1409,6 +1436,9 @@ async def _start_auto_clip_task():
     if not ensure_generation_jobs_table():
         print("GENERATION JOB INITIALIZATION FAILED")
         return
+    if not ensure_stream_history_tables():
+        print("AUTO CLIP STREAM HISTORY INITIALIZATION FAILED")
+        return
     app.state.clip_history_ready = True
     print("CLIP HISTORY READY")
     if app.state.auto_clip_task is None or app.state.auto_clip_task.done():
@@ -1549,6 +1579,7 @@ def _ensure_clip_history_table() -> bool:
                     "shares": "BIGINT",
                     "last_metrics_sync": "TIMESTAMPTZ",
                     "source_creator_id": "TEXT",
+                    "source_stream_id": "TEXT",
                     "source_platform": "TEXT",
                     "rights_status": "TEXT",
                     "authorization_reference": "TEXT",
@@ -1833,13 +1864,14 @@ def _clip_history_upsert(
                     INSERT INTO twitch_clip_history (
                         provider, clip_id, clip_url, creator_id, creator_name,
                         created_at, status, viral_score, last_processed_at,
-                        published_at, failure_stage, retry_count
+                        published_at, failure_stage, retry_count,
+                        source_stream_id
                     )
                     VALUES (
                         'twitch', %s, %s, %s, %s, %s, %s, %s,
                         CASE WHEN %s = 'discovered' THEN NULL ELSE NOW() END,
                         CASE WHEN %s = 'published' THEN NOW() ELSE NULL END,
-                        %s, CASE WHEN %s THEN 1 ELSE 0 END
+                        %s, CASE WHEN %s THEN 1 ELSE 0 END, %s
                     )
                     ON CONFLICT (provider, clip_id) DO UPDATE SET
                         clip_url = COALESCE(EXCLUDED.clip_url, twitch_clip_history.clip_url),
@@ -1860,7 +1892,11 @@ def _clip_history_upsert(
                         published_at = COALESCE(EXCLUDED.published_at, twitch_clip_history.published_at),
                         failure_stage = EXCLUDED.failure_stage,
                         retry_count = twitch_clip_history.retry_count
-                            + CASE WHEN %s THEN 1 ELSE 0 END
+                            + CASE WHEN %s THEN 1 ELSE 0 END,
+                        source_stream_id = COALESCE(
+                            EXCLUDED.source_stream_id,
+                            twitch_clip_history.source_stream_id
+                        )
                     """,
                     (
                         clip_id,
@@ -1875,6 +1911,7 @@ def _clip_history_upsert(
                         failure_stage,
                         increment_retry,
                         increment_retry,
+                        clip.get("_stream_id") or clip.get("source_stream_id"),
                     ),
                 )
             connection.commit()
@@ -3278,7 +3315,52 @@ async def get_twitch_channel_data(channel_name: str) -> dict[str, Any]:
                     detail=f"Twitch stream request failed: {stream_response.text}",
                 )
 
+            videos_response = await client.get(
+                "https://api.twitch.tv/helix/videos",
+                headers=headers,
+                params={
+                    "user_id": user["id"],
+                    "type": "archive",
+                    "first": 100,
+                },
+            )
+            if videos_response.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Twitch videos request failed: {videos_response.text}",
+                )
+
         streams = stream_response.json().get("data", [])
+        completed_streams = []
+        for video in videos_response.json().get("data", []):
+            started_at = _parse_twitch_created_at(
+                video.get("streamed_at") or video.get("created_at")
+            )
+            if started_at is None:
+                continue
+            duration_seconds = _parse_twitch_duration_seconds(
+                video.get("duration")
+            )
+            completed_streams.append(
+                {
+                    "stream_id": str(video.get("stream_id") or video.get("id") or ""),
+                    "video_id": str(video.get("id") or ""),
+                    "started_at": started_at,
+                    "ended_at": (
+                        started_at + timedelta(seconds=duration_seconds)
+                        if duration_seconds
+                        else started_at
+                    ),
+                    "title": video.get("title"),
+                    "game_name": None,
+                    "thumbnail_url": video.get("thumbnail_url"),
+                    "is_live": False,
+                }
+            )
+        completed_streams.sort(
+            key=lambda item: item["started_at"],
+            reverse=True,
+        )
 
         print("Checking channel:", clean_channel)
         print("Streams returned:", streams)
@@ -3297,6 +3379,10 @@ async def get_twitch_channel_data(channel_name: str) -> dict[str, Any]:
                 "viewer_count": 0,
                 "started_at": None,
                 "thumbnail_url": None,
+                "completed_streams": completed_streams,
+                "newest_completed_stream": (
+                    completed_streams[0] if completed_streams else None
+                ),
             }
 
         stream = streams[0]
@@ -3321,6 +3407,10 @@ async def get_twitch_channel_data(channel_name: str) -> dict[str, Any]:
             "viewer_count": stream.get("viewer_count", 0),
             "started_at": stream.get("started_at"),
             "thumbnail_url": thumbnail_url,
+            "completed_streams": completed_streams,
+            "newest_completed_stream": (
+                completed_streams[0] if completed_streams else None
+            ),
         }
 
     except httpx.RequestError as error:
@@ -3440,6 +3530,227 @@ async def wait_for_twitch_clip(clip_id: str) -> dict:
         f"TWITCH CLIP UNAVAILABLE after 15 seconds; skipping candidate {clip_id}"
     )
     return None
+
+
+def _auto_clip_max_streams_to_search() -> int:
+    return _bounded_environment_int(
+        "AUTO_CLIP_MAX_STREAMS_TO_SEARCH",
+        default=10,
+        minimum=1,
+        maximum=100,
+    )
+
+
+def _auto_clip_lookback_days() -> int:
+    return _bounded_environment_int(
+        "AUTO_CLIP_LOOKBACK_DAYS",
+        default=30,
+        minimum=1,
+        maximum=365,
+    )
+
+
+def _select_stream_search_target(
+    creator_id: str,
+    channel_data: dict[str, Any],
+    *,
+    historical_only: bool,
+) -> dict[str, Any] | None:
+    now = datetime.now(timezone.utc)
+    completed_streams = [
+        dict(stream)
+        for stream in channel_data.get("completed_streams", [])
+        if isinstance(stream, dict)
+        and isinstance(stream.get("started_at"), datetime)
+        and str(stream.get("stream_id") or "")
+    ]
+    if channel_data.get("is_live") and channel_data.get("stream_id"):
+        newest = {
+            "stream_id": str(channel_data["stream_id"]),
+            "video_id": "",
+            "started_at": _parse_twitch_created_at(channel_data.get("started_at")),
+            "ended_at": None,
+            "title": channel_data.get("title"),
+            "game_name": channel_data.get("game_name"),
+            "thumbnail_url": channel_data.get("thumbnail_url"),
+            "is_live": True,
+        }
+    else:
+        newest = (
+            dict(completed_streams[0])
+            if completed_streams
+            else None
+        )
+    if not newest or not isinstance(newest.get("started_at"), datetime):
+        return None
+
+    newest_state = register_newest_stream(creator_id, newest)
+    if not historical_only:
+        print(
+            "AUTO CLIP NEWEST STREAM REFRESH | "
+            f"creator_id={creator_id} | stream_id={newest['stream_id']} | "
+            f"is_live={str(bool(newest.get('is_live'))).lower()}"
+        )
+        newest["_stream_state"] = newest_state
+        newest["_is_newest"] = True
+        return newest
+
+    cursor = get_historical_cursor(creator_id)
+    before_timestamp = cursor.get("next_before_timestamp") or newest["started_at"]
+    exhausted_ids = get_exhausted_stream_ids(creator_id)
+    lookback_cutoff = now - timedelta(days=_auto_clip_lookback_days())
+    print(
+        "AUTO CLIP HISTORICAL RESUME | "
+        f"creator_id={creator_id} | "
+        f"before={before_timestamp.isoformat()} | "
+        f"last_stream_id={cursor.get('last_stream_id') or 'none'}"
+    )
+    for stream in completed_streams:
+        stream_id = str(stream["stream_id"])
+        started_at = stream["started_at"]
+        if started_at >= before_timestamp or started_at < lookback_cutoff:
+            continue
+        if stream_id == str(newest["stream_id"]):
+            continue
+        if stream_id in exhausted_ids:
+            print(
+                "AUTO CLIP EXHAUSTED STREAM SKIPPED | "
+                f"creator_id={creator_id} | stream_id={stream_id}"
+            )
+            continue
+        state = get_stream_state(creator_id, stream_id)
+        if state is None:
+            state = register_historical_stream(creator_id, stream)
+        stream["_stream_state"] = state
+        stream["_is_newest"] = False
+        return stream
+    return None
+
+
+def _stream_discovery_start(
+    stream_target: dict[str, Any],
+) -> datetime:
+    state = stream_target.get("_stream_state") or {}
+    stream_started_at = stream_target["started_at"]
+    prior_checked_at = state.get("last_checked_at")
+    return (
+        max(stream_started_at, prior_checked_at - timedelta(seconds=1))
+        if stream_target.get("_is_newest")
+        and isinstance(prior_checked_at, datetime)
+        else stream_started_at
+    )
+
+
+async def fetch_twitch_clips_for_stream(
+    broadcaster_id: str,
+    stream_target: dict[str, Any],
+    ignored_clip_ids: set[str],
+    ignored_clip_urls: set[str],
+    limit: int,
+) -> tuple[list[dict[str, Any]], bool, str]:
+    app.state.current_stream_grace_active = False
+    try:
+        access_token = await get_twitch_access_token()
+    except Exception as error:
+        print(
+            f"TWITCH CLIP FETCH FAILED for broadcaster {broadcaster_id}:",
+            repr(error),
+        )
+        return [], False, ""
+    headers = {
+        "Client-Id": TWITCH_CLIENT_ID,
+        "Authorization": f"Bearer {access_token}",
+    }
+    now = datetime.now(timezone.utc)
+    stream_started_at = stream_target["started_at"]
+    discovery_start = _stream_discovery_start(stream_target)
+    params: dict[str, object] = {
+        "broadcaster_id": broadcaster_id,
+        "first": 100,
+        "started_at": discovery_start.isoformat().replace("+00:00", "Z"),
+        "ended_at": now.isoformat().replace("+00:00", "Z"),
+    }
+    expected_video_id = str(stream_target.get("video_id") or "")
+    seen_ids = {_canonical_twitch_clip_id(value) for value in ignored_clip_ids}
+    seen_urls = {_canonical_twitch_clip_url(value) for value in ignored_clip_urls}
+    fresh_clips: list[dict[str, Any]] = []
+    cursor_value = ""
+    pagination_complete = False
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for page_number in range(1, _twitch_max_pages() + 1):
+            page_params = dict(params)
+            if cursor_value:
+                page_params["after"] = cursor_value
+            try:
+                response = await client.get(
+                    "https://api.twitch.tv/helix/clips",
+                    headers=headers,
+                    params=page_params,
+                )
+            except httpx.RequestError as error:
+                print(
+                    f"TWITCH CLIP FETCH FAILED for broadcaster {broadcaster_id}:",
+                    repr(error),
+                )
+                return fresh_clips, False, cursor_value
+            if response.status_code != 200:
+                print(
+                    "TWITCH CLIP FETCH FAILED:",
+                    response.status_code,
+                    response.text,
+                )
+                return fresh_clips, False, cursor_value
+            payload = response.json()
+            for twitch_clip in sorted(
+                payload.get("data", []),
+                key=lambda clip: (
+                    _parse_twitch_created_at(clip.get("created_at"))
+                    or datetime.min.replace(tzinfo=timezone.utc)
+                ),
+                reverse=True,
+            ):
+                clip_video_id = str(twitch_clip.get("video_id") or "")
+                if expected_video_id and clip_video_id != expected_video_id:
+                    continue
+                if stream_target.get("is_live") and clip_video_id:
+                    continue
+                clip_id, canonical_url = _normalized_twitch_identifiers(twitch_clip)
+                if (
+                    not clip_id
+                    or clip_id in seen_ids
+                    or canonical_url in seen_urls
+                ):
+                    continue
+                twitch_clip["_search_tier"] = (
+                    1 if stream_target.get("_is_newest") else 2
+                )
+                twitch_clip["_stream_id"] = stream_target["stream_id"]
+                twitch_clip["_canonical_clip_id"] = clip_id
+                twitch_clip["_canonical_clip_url"] = canonical_url
+                _clip_history_upsert(twitch_clip, "discovered")
+                fresh_clips.append(twitch_clip)
+                seen_ids.add(clip_id)
+                seen_urls.add(canonical_url)
+                if len(fresh_clips) >= limit:
+                    return fresh_clips, False, cursor_value
+            cursor_value = str(
+                payload.get("pagination", {}).get("cursor") or ""
+            ).strip()
+            if not cursor_value:
+                pagination_complete = True
+                break
+    if (
+        not fresh_clips
+        and stream_target.get("is_live")
+        and (
+            now - stream_started_at
+        ).total_seconds() / 60.0
+        < _nonnegative_int(
+            os.getenv("AUTO_CLIP_CURRENT_STREAM_GRACE_MINUTES", "20")
+        )
+    ):
+        app.state.current_stream_grace_active = True
+    return fresh_clips, pagination_complete, cursor_value
 
 
 async def fetch_fresh_twitch_clips(
@@ -5152,6 +5463,12 @@ def _set_generation_job_stage(
 async def _run_auto_generate_clip_pipeline(
     generation_job_id: str | None = None,
     generation_worker_id: str | None = None,
+    _historical_only: bool = False,
+    _forced_creator: dict[str, Any] | None = None,
+    _forced_channel_data: dict[str, Any] | None = None,
+    _streams_examined: int = 0,
+    _prior_candidates_examined: int = 0,
+    _prior_candidates_rejected: int = 0,
 ):
     if not getattr(app.state, "clip_history_ready", False):
         raise HTTPException(
@@ -5184,8 +5501,12 @@ async def _run_auto_generate_clip_pipeline(
                 candidates_rejected_after_download
             ),
             "candidates_evaluated": candidates_evaluated,
-            "_job_candidates_examined": candidates_examined_count,
-            "_job_candidates_rejected": candidates_rejected_count,
+            "_job_candidates_examined": (
+                _prior_candidates_examined + candidates_examined_count
+            ),
+            "_job_candidates_rejected": (
+                _prior_candidates_rejected + candidates_rejected_count
+            ),
         }
     creators = load_creators()
     creator_count = len(creators)
@@ -5194,25 +5515,33 @@ async def _run_auto_generate_clip_pipeline(
     selected_stream = None
     selected_index = None
 
-    for offset in range(creator_count):
-        creator_index = (start_index + offset) % creator_count
-        creator = creators[creator_index]
-        try:
-            stream = await get_twitch_channel_data(creator["channel"])
-        except Exception as error:
-            print(
-                f"TWITCH CHECK FAILED for {creator['channel']}:",
-                repr(error),
-            )
-            continue
+    if _forced_creator is not None and _forced_channel_data is not None:
+        selected_creator = _forced_creator
+        selected_stream = _forced_channel_data
+        selected_index = start_index
+    else:
+        for offset in range(creator_count):
+            creator_index = (start_index + offset) % creator_count
+            creator = creators[creator_index]
+            try:
+                stream = await get_twitch_channel_data(creator["channel"])
+            except Exception as error:
+                print(
+                    f"TWITCH CHECK FAILED for {creator['channel']}:",
+                    repr(error),
+                )
+                continue
 
-        if not stream.get("is_live"):
-            continue
+            if (
+                not stream.get("is_live")
+                and not stream.get("newest_completed_stream")
+            ):
+                continue
 
-        selected_creator = creator
-        selected_stream = stream
-        selected_index = creator_index
-        break
+            selected_creator = creator
+            selected_stream = stream
+            selected_index = creator_index
+            break
 
     if selected_creator is None or selected_stream is None or selected_index is None:
         print(
@@ -5231,12 +5560,13 @@ async def _run_auto_generate_clip_pipeline(
             f"fully_evaluated_candidates={fully_evaluated_candidates_count}"
         )
         return pipeline_result(
-            "No monitored creators are currently live.",
-            outcome_reason="no_live_creators",
+            "No live or completed Twitch streams were available.",
+            outcome_reason="no_available_streams",
         )
 
     next_index = (selected_index + 1) % creator_count
-    _save_creator_cursor(next_index, creator_count)
+    if _forced_creator is None:
+        _save_creator_cursor(next_index, creator_count)
     print(
         "ROUND ROBIN | "
         f"selected_creator={selected_creator['name']} | "
@@ -5247,12 +5577,120 @@ async def _run_auto_generate_clip_pipeline(
     creator = selected_creator
     stream = selected_stream
     broadcaster_id = stream.get("user_id")
+    stream_target = _select_stream_search_target(
+        str(broadcaster_id or ""),
+        stream,
+        historical_only=_historical_only,
+    )
+    if stream_target is None:
+        return pipeline_result(
+            "No suitable clip was found. Try again later.",
+            outcome_reason=(
+                "historical_search_exhausted"
+                if _historical_only
+                else "no_newest_stream"
+            ),
+        )
+    streams_examined = _streams_examined + 1
+    stream_state = stream_target.get("_stream_state") or {}
+    stream_id = str(stream_target["stream_id"])
+    stream_range_start = stream_target["started_at"]
+    stream_range_end = (
+        stream_target.get("ended_at")
+        or datetime.now(timezone.utc)
+    )
+    stream_retryable_failure = False
+    stream_discovery_complete = False
+
+    async def continue_historical_search(
+        *,
+        outcome_reason: str,
+        retryable_failure: bool,
+        discovery_complete: bool,
+        message: str = "No suitable clip was found. Try again later.",
+    ) -> dict[str, object]:
+        is_newest = bool(stream_target.get("_is_newest"))
+        if retryable_failure or not discovery_complete:
+            update_stream_progress(
+                str(broadcaster_id),
+                stream_id,
+                processing_state="partial",
+                range_start=stream_range_start,
+                range_end=None,
+                retryable_failure_state=outcome_reason,
+            )
+            return pipeline_result(
+                message,
+                outcome_reason=outcome_reason,
+            )
+        if is_newest:
+            update_stream_progress(
+                str(broadcaster_id),
+                stream_id,
+                processing_state="partial",
+                range_start=stream_range_start,
+                range_end=stream_range_end,
+                retryable_failure_state=None,
+                checked_complete=True,
+            )
+        else:
+            update_stream_progress(
+                str(broadcaster_id),
+                stream_id,
+                processing_state="exhausted",
+                range_start=stream_range_start,
+                range_end=stream_range_end,
+                retryable_failure_state=None,
+                checked_complete=True,
+            )
+            print(
+                "AUTO CLIP STREAM PERMANENTLY EXHAUSTED | "
+                f"creator_id={broadcaster_id} | stream_id={stream_id}"
+            )
+            save_historical_cursor(
+                str(broadcaster_id),
+                next_before_timestamp=stream_range_start,
+                last_stream_id=stream_id,
+            )
+            print(
+                "AUTO CLIP HISTORICAL CURSOR SAVED | "
+                f"creator_id={broadcaster_id} | stream_id={stream_id} | "
+                f"next_before={stream_range_start.isoformat()}"
+            )
+        if streams_examined >= _auto_clip_max_streams_to_search():
+            return pipeline_result(
+                message,
+                outcome_reason="per_job_stream_limit_reached",
+            )
+        return await _run_auto_generate_clip_pipeline(
+            generation_job_id=generation_job_id,
+            generation_worker_id=generation_worker_id,
+            _historical_only=True,
+            _forced_creator=creator,
+            _forced_channel_data=stream,
+            _streams_examined=streams_examined,
+            _prior_candidates_examined=(
+                _prior_candidates_examined + candidates_examined_count
+            ),
+            _prior_candidates_rejected=(
+                _prior_candidates_rejected + candidates_rejected_count
+            ),
+        )
 
     viewer_count = stream.get("viewer_count", 0)
     stream_title = (
-        stream.get("title")
+        stream_target.get("title")
+        or stream.get("title")
         or f"{creator['name']} Live Moment"
     )
+    evaluation_stream = {
+        **stream,
+        "started_at": stream_target.get("started_at"),
+        "title": stream_title,
+        "game_name": (
+            stream_target.get("game_name") or stream.get("game_name")
+        ),
+    }
 
     clips_file = Path(__file__).resolve().parent / "clips.json"
 
@@ -5266,9 +5704,10 @@ async def _run_auto_generate_clip_pipeline(
         _load_clip_history_exclusions()
     )
     if not history_available:
-        return pipeline_result(
-            "Clip history is temporarily unavailable; generation skipped.",
+        return await continue_historical_search(
             outcome_reason="history_unavailable",
+            retryable_failure=True,
+            discovery_complete=False,
         )
 
     attempted_clip_ids: set[str] = set()
@@ -5286,12 +5725,17 @@ async def _run_auto_generate_clip_pipeline(
             total_candidates=target_candidate_count,
         )
         fetch_started_at = time.perf_counter()
-        fresh_batch = await fetch_fresh_twitch_clips(
-            broadcaster_id=broadcaster_id,
-            stream_started_at=stream.get("started_at"),
-            ignored_clip_ids=ignored_ids,
-            ignored_clip_urls=ignored_urls,
-            limit=AUTO_CLIP_CANDIDATE_COUNT,
+        fresh_batch, batch_discovery_complete, discovered_cursor = (
+            await fetch_twitch_clips_for_stream(
+                broadcaster_id=broadcaster_id,
+                stream_target=stream_target,
+                ignored_clip_ids=ignored_ids,
+                ignored_clip_urls=ignored_urls,
+                limit=AUTO_CLIP_CANDIDATE_COUNT,
+            )
+        )
+        stream_discovery_complete = (
+            stream_discovery_complete or batch_discovery_complete
         )
         _log_performance_timing(
             stage="twitch_clip_fetch",
@@ -5304,7 +5748,10 @@ async def _run_auto_generate_clip_pipeline(
         )
 
         if not fresh_batch:
-            if getattr(app.state, "current_stream_grace_active", False):
+            if (
+                stream_target.get("is_live")
+                and getattr(app.state, "current_stream_grace_active", False)
+            ):
                 return pipeline_result(
                     "No fresh current-stream clips yet.",
                     outcome_reason="current_stream_grace",
@@ -5313,7 +5760,27 @@ async def _run_auto_generate_clip_pipeline(
                 f"No fresh Twitch clips available for {creator['channel']} "
                 f"(batch {batch_attempt}/2)."
             )
+            if batch_discovery_complete:
+                if stream_target.get("_is_newest"):
+                    print(
+                        "AUTO CLIP NEWEST STREAM UNCHANGED | "
+                        f"creator_id={broadcaster_id} | stream_id={stream_id}"
+                    )
+                break
             continue
+
+        print(
+            "AUTO CLIP NEW MATERIAL FOUND | "
+            f"creator_id={broadcaster_id} | stream_id={stream_id} | "
+            f"candidate_count={len(fresh_batch)}"
+        )
+        update_stream_progress(
+            str(broadcaster_id),
+            stream_id,
+            processing_state="partial",
+            candidate_cursor=discovered_cursor or None,
+            retryable_failure_state=None,
+        )
 
         total_candidates = len(fresh_batch)
         batch_memory_admitted, available_memory_mb, required_memory_mb = (
@@ -5332,12 +5799,14 @@ async def _run_auto_generate_clip_pipeline(
                     "memory_deferral_before_download",
                     streamer=str(creator.get("channel") or creator.get("name") or ""),
                 )
-            return pipeline_result(
-                (
+            return await continue_historical_search(
+                outcome_reason="memory_deferred_before_download",
+                retryable_failure=True,
+                discovery_complete=False,
+                message=(
                     "Clip generation deferred because worker memory did not "
                     "recover."
                 ),
-                outcome_reason="memory_deferred_before_download",
             )
         stage_one_started_at = time.perf_counter()
         preranked_candidates, has_sufficient_prerank_metadata = _fast_prerank_candidates(
@@ -5477,7 +5946,7 @@ async def _run_auto_generate_clip_pipeline(
                     candidate_number=candidate_index,
                     total_candidates=total_candidates,
                     creator=creator,
-                    stream=stream,
+                    stream=evaluation_stream,
                     stream_title=stream_title,
                     viewer_count=viewer_count,
                     persisted_clips=existing_clips,
@@ -5491,6 +5960,7 @@ async def _run_auto_generate_clip_pipeline(
                 if evaluation_result.get("expensive_evaluation_started"):
                     candidates_evaluated += 1
                 if not evaluation_result["success"]:
+                    stream_retryable_failure = True
                     candidates_rejected_count += 1
                     failure_stage = str(
                         evaluation_result.get("failure_stage") or "unknown"
@@ -5532,10 +6002,14 @@ async def _run_auto_generate_clip_pipeline(
                             f"batch={batch_attempt}/2 | "
                             "stage=after_download_cleanup"
                         )
-                        return pipeline_result(
-                            "Clip generation deferred because worker memory "
-                            "did not recover.",
+                        return await continue_historical_search(
                             outcome_reason="memory_deferred_after_download",
+                            retryable_failure=True,
+                            discovery_complete=False,
+                            message=(
+                                "Clip generation deferred because worker "
+                                "memory did not recover."
+                            ),
                         )
                     continue
 
@@ -5628,17 +6102,22 @@ async def _run_auto_generate_clip_pipeline(
             )
             == processed_candidates_count
         )
-        return pipeline_result(
-            (
-                "Clip generation deferred because available memory remained "
-                "below the Whisper safety floor."
-                if all_processed_candidates_deferred_for_memory
-                else "No viral clips found."
-            ),
+        return await continue_historical_search(
             outcome_reason=(
                 "memory_deferred"
                 if all_processed_candidates_deferred_for_memory
                 else "no_fully_evaluated_candidates"
+            ),
+            retryable_failure=(
+                all_processed_candidates_deferred_for_memory
+                or stream_retryable_failure
+            ),
+            discovery_complete=stream_discovery_complete,
+            message=(
+                "Clip generation deferred because worker memory did not "
+                "recover."
+                if all_processed_candidates_deferred_for_memory
+                else "No suitable clip was found. Try again later."
             ),
         )
 
@@ -5717,10 +6196,10 @@ async def _run_auto_generate_clip_pipeline(
             f"processed_candidates={processed_candidates_count} | "
             f"fully_evaluated_candidates={fully_evaluated_candidates_count}"
         )
-        return pipeline_result(
-            "No viral clips found.",
-            best_score=best_clip["score"],
+        return await continue_historical_search(
             outcome_reason="score_threshold",
+            retryable_failure=stream_retryable_failure,
+            discovery_complete=stream_discovery_complete,
         )
 
     is_duplicate = any(
@@ -5753,10 +6232,10 @@ async def _run_auto_generate_clip_pipeline(
             f"processed_candidates={processed_candidates_count} | "
             f"fully_evaluated_candidates={fully_evaluated_candidates_count}"
         )
-        return pipeline_result(
-            "No viral clips found.",
-            best_score=best_clip["score"],
+        return await continue_historical_search(
             outcome_reason="duplicate",
+            retryable_failure=stream_retryable_failure,
+            discovery_complete=stream_discovery_complete,
         )
 
     best_clip.update(_select_duration_profile(best_clip))
@@ -5987,8 +6466,21 @@ async def _run_auto_generate_clip_pipeline(
         f"processed_candidates={processed_candidates_count} | "
         f"fully_evaluated_candidates={fully_evaluated_candidates_count}"
     )
-    result["clip"]["_job_candidates_examined"] = candidates_examined_count
-    result["clip"]["_job_candidates_rejected"] = candidates_rejected_count
+    update_stream_progress(
+        str(broadcaster_id),
+        stream_id,
+        processing_state="succeeded",
+        range_start=stream_range_start,
+        range_end=stream_range_end,
+        retryable_failure_state=None,
+        checked_complete=stream_discovery_complete,
+    )
+    result["clip"]["_job_candidates_examined"] = (
+        _prior_candidates_examined + candidates_examined_count
+    )
+    result["clip"]["_job_candidates_rejected"] = (
+        _prior_candidates_rejected + candidates_rejected_count
+    )
     return result["clip"]
 
 @app.post("/api/clips/{clip_id}/publish")

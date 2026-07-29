@@ -36,6 +36,14 @@ class PostgreSQLGenerationJobTests(unittest.TestCase):
             },
         )
         cls.environment.start()
+        import main
+
+        cls.main_database_url = patch.object(
+            main,
+            "DATABASE_URL",
+            cls.database_url,
+        )
+        cls.main_database_url.start()
         cls.embedded_lock_id = patch.object(
             generation_jobs,
             "EMBEDDED_WORKER_ADVISORY_LOCK_ID",
@@ -59,6 +67,7 @@ class PostgreSQLGenerationJobTests(unittest.TestCase):
         from psycopg import sql
 
         cls.embedded_lock_id.stop()
+        cls.main_database_url.stop()
         cls.environment.stop()
         with psycopg.connect(cls.database_url, autocommit=True) as connection:
             with connection.cursor() as cursor:
