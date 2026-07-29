@@ -36,6 +36,12 @@ class PostgreSQLGenerationJobTests(unittest.TestCase):
             },
         )
         cls.environment.start()
+        cls.embedded_lock_id = patch.object(
+            generation_jobs,
+            "EMBEDDED_WORKER_ADVISORY_LOCK_ID",
+            int(uuid.uuid4().int % 2_000_000_000),
+        )
+        cls.embedded_lock_id.start()
         with psycopg.connect(cls.database_url) as connection:
             with connection.cursor() as cursor:
                 cursor.execute("SHOW search_path")
@@ -52,6 +58,7 @@ class PostgreSQLGenerationJobTests(unittest.TestCase):
         import psycopg
         from psycopg import sql
 
+        cls.embedded_lock_id.stop()
         cls.environment.stop()
         with psycopg.connect(cls.database_url, autocommit=True) as connection:
             with connection.cursor() as cursor:
@@ -171,6 +178,24 @@ class PostgreSQLGenerationJobTests(unittest.TestCase):
         saved = generation_jobs.get_generation_job(str(job["id"]))
         self.assertEqual(saved["status"], "completed")
         self.assertEqual(saved["result_clip_id"], "clip-123")
+        self.assertEqual(saved["outcome"], "clip_created")
+
+        no_clip_job, _ = generation_jobs.enqueue_generation_job("manual")
+        no_clip_claim = generation_jobs.claim_generation_job("worker-c")
+        self.assertTrue(
+            generation_jobs.complete_generation_job(
+                str(no_clip_claim["id"]),
+                "worker-c",
+                None,
+                "No suitable clip was found. Try again later.",
+            )
+        )
+        no_clip_saved = generation_jobs.get_generation_job(
+            str(no_clip_job["id"])
+        )
+        self.assertEqual(no_clip_saved["status"], "completed")
+        self.assertIsNone(no_clip_saved["result_clip_id"])
+        self.assertEqual(no_clip_saved["outcome"], "no_clip_found")
 
     def test_reaction_regions_persist_with_generated_clip(self):
         import main

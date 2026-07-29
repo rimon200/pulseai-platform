@@ -40,6 +40,7 @@ DEFERRED_RETRY_SECONDS = max(
     int(os.getenv("CLIP_JOB_DEFERRED_RETRY_SECONDS", "300")),
 )
 CHILD_RESULT_PREFIX = "pulseai-generation-result-"
+NO_CLIP_FOUND_MESSAGE = "No suitable clip was found. Try again later."
 
 
 def _worker_id() -> str:
@@ -117,10 +118,11 @@ async def evaluate_claimed_job(job: dict[str, Any], worker_id: str) -> dict[str,
 
     job_id = str(job["id"])
     if not main._ensure_clip_history_table():
-        return {
+        result = {
             "status": "failed",
             "error_message": "Clip history initialization failed in the worker.",
         }
+        return result
     main.app.state.clip_history_ready = True
     try:
         result = await main._run_auto_generate_clip_pipeline(
@@ -132,11 +134,22 @@ async def evaluate_claimed_job(job: dict[str, Any], worker_id: str) -> dict[str,
             if isinstance(result, dict)
             else ""
         )
-        if "worker memory did not recover" in message.lower():
-            return {
+        pipeline_outcome_reason = (
+            str(result.get("outcome_reason") or "")
+            if isinstance(result, dict)
+            else ""
+        )
+        if (
+            "worker memory did not recover" in message.lower()
+            or pipeline_outcome_reason.startswith("memory_deferred")
+        ):
+            terminal_result = {
                 "status": "deferred_memory",
                 "error_message": message,
+                "pipeline_reason": pipeline_outcome_reason,
+                **_pipeline_counts(result),
             }
+            return terminal_result
         result_clip_id = None
         if isinstance(result, dict):
             result_clip_id = str(
@@ -144,16 +157,80 @@ async def evaluate_claimed_job(job: dict[str, Any], worker_id: str) -> dict[str,
                 or result.get("generated_clip_id")
                 or ""
             ).strip() or None
-        return {
-            "status": "completed",
-            "result_clip_id": result_clip_id,
-            "error_message": message or None,
-        }
+        if result_clip_id:
+            terminal_result = {
+                "status": "completed",
+                "outcome": "clip_created",
+                "result_clip_id": result_clip_id,
+                "error_message": message or None,
+                "pipeline_reason": result.get("outcome_reason"),
+                **_pipeline_counts(result),
+            }
+        else:
+            terminal_result = {
+                "status": "completed",
+                "outcome": "no_clip_found",
+                "result_clip_id": None,
+                "error_message": NO_CLIP_FOUND_MESSAGE,
+                "pipeline_reason": (
+                    (
+                        result.get("outcome_reason")
+                        if isinstance(result, dict)
+                        else None
+                    )
+                    or message
+                    or "no_clip_found"
+                ),
+                **_pipeline_counts(result),
+            }
+        return terminal_result
     except BaseException as error:
-        return {
+        terminal_result = {
             "status": "failed",
             "error_message": repr(error),
         }
+        return terminal_result
+
+
+def _pipeline_counts(result: object) -> dict[str, int]:
+    if not isinstance(result, dict):
+        return {"candidates_examined": 0, "candidates_rejected": 0}
+    return {
+        "candidates_examined": int(
+            result.get("_job_candidates_examined")
+            or result.get("candidates_examined")
+            or 0
+        ),
+        "candidates_rejected": int(
+            result.get("_job_candidates_rejected")
+            or result.get("candidates_rejected")
+            or 0
+        ),
+    }
+
+
+def _log_generation_job_summary(
+    job_id: str,
+    result: dict[str, Any],
+) -> None:
+    result_clip_id = str(result.get("result_clip_id") or "").strip()
+    status = str(result.get("status") or "failed")
+    inferred_outcome = (
+        ("clip_created" if result_clip_id else "no_clip_found")
+        if status == "completed"
+        else status
+    )
+    final_outcome = str(result.get("outcome") or inferred_outcome)
+    pipeline_reason = str(result.get("pipeline_reason") or "none")
+    print(
+        "GENERATION JOB FINAL SUMMARY | "
+        f"job_id={job_id} | "
+        f"candidates_examined={int(result.get('candidates_examined') or 0)} | "
+        f"candidates_rejected={int(result.get('candidates_rejected') or 0)} | "
+        f"result_clip_id={result_clip_id or 'none'} | "
+        f"final_outcome={final_outcome} | "
+        f"pipeline_reason={pipeline_reason}"
+    )
 
 
 def _apply_terminal_result(
@@ -169,6 +246,7 @@ def _apply_terminal_result(
             worker_id,
             result.get("result_clip_id"),
             message or None,
+            result.get("outcome"),
         )
     if status == "deferred_memory":
         return defer_generation_job(
@@ -356,6 +434,14 @@ async def _owned_worker_loop(
                 f"job_id={job_id} | available_mb={available_label} | "
                 f"required_mb={required_mb:.1f}"
             )
+            _log_generation_job_summary(
+                job_id,
+                {
+                    "status": "deferred_memory",
+                    "candidates_examined": 0,
+                    "candidates_rejected": 0,
+                },
+            )
             defer_generation_job(job_id, worker_id, message)
             continue
         try:
@@ -370,6 +456,7 @@ async def _owned_worker_loop(
                     f"{error!r}"
                 ),
             }
+        _log_generation_job_summary(job_id, result)
         _apply_terminal_result(job_id, worker_id, result)
 
 

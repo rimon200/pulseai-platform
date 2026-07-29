@@ -10,6 +10,53 @@ import main
 
 
 class EmbeddedWorkerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_completed_result_requires_a_real_clip_id(self):
+        with patch.object(main, "_ensure_clip_history_table", return_value=True):
+            with patch.object(
+                main,
+                "_run_auto_generate_clip_pipeline",
+                new=AsyncMock(
+                    return_value={
+                        "id": "generated-clip-1",
+                        "_job_candidates_examined": 2,
+                        "_job_candidates_rejected": 1,
+                    }
+                ),
+            ):
+                result = await clip_worker.evaluate_claimed_job(
+                    {"id": "job-success"},
+                    "worker",
+                )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["outcome"], "clip_created")
+        self.assertEqual(result["result_clip_id"], "generated-clip-1")
+
+    async def test_no_clip_pipeline_result_is_not_clip_created(self):
+        with patch.object(main, "_ensure_clip_history_table", return_value=True):
+            with patch.object(
+                main,
+                "_run_auto_generate_clip_pipeline",
+                new=AsyncMock(
+                    return_value={
+                        "message": "No viral clips found.",
+                        "outcome_reason": "score_threshold",
+                        "_job_candidates_examined": 2,
+                        "_job_candidates_rejected": 2,
+                    }
+                ),
+            ):
+                result = await clip_worker.evaluate_claimed_job(
+                    {"id": "job-no-clip"},
+                    "worker",
+                )
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["outcome"], "no_clip_found")
+        self.assertIsNone(result["result_clip_id"])
+        self.assertEqual(
+            result["error_message"],
+            clip_worker.NO_CLIP_FOUND_MESSAGE,
+        )
+
     async def test_auto_endpoint_only_enqueues_and_returns_202(self):
         queued = {
             "id": "00000000-0000-0000-0000-000000000001",
@@ -200,6 +247,22 @@ class EmbeddedWorkerTests(unittest.IsolatedAsyncioTestCase):
                     )
         await waiter
         owned_loop.assert_not_awaited()
+
+    def test_candidate_rejection_log_has_structured_reason(self):
+        with patch("builtins.print") as log:
+            main._log_candidate_rejection(
+                {
+                    "twitch_clip_id": "FakeCandidate",
+                    "creator": "FakeStreamer",
+                    "score": 32,
+                },
+                "score_threshold",
+            )
+        output = log.call_args.args[0]
+        self.assertIn("streamer=FakeStreamer", output)
+        self.assertIn("candidate_identifier=FakeCandidate", output)
+        self.assertIn("viral_score=32.00", output)
+        self.assertIn("rejection_reason=score_threshold", output)
 
 
 if __name__ == "__main__":

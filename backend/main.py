@@ -138,6 +138,46 @@ def _log_memory_check(stage: str, candidate_number: int, total_candidates: int) 
     )
 
 
+def _log_candidate_rejection(
+    candidate: dict[str, object] | None,
+    rejection_reason: str,
+    *,
+    streamer: str = "",
+    viral_score: object = None,
+) -> None:
+    clip = candidate or {}
+    candidate_identifier = str(
+        clip.get("twitch_clip_id")
+        or clip.get("id")
+        or clip.get("created_at")
+        or clip.get("timestamp")
+        or "unknown"
+    )
+    source = str(
+        streamer
+        or clip.get("creator")
+        or clip.get("creator_name")
+        or clip.get("broadcaster_name")
+        or "unknown"
+    )
+    score = viral_score
+    if score is None:
+        score = clip.get("score")
+    score_label = "unknown"
+    try:
+        if score is not None:
+            score_label = f"{float(score):.2f}"
+    except (TypeError, ValueError):
+        score_label = str(score)
+    print(
+        "CANDIDATE REJECTION | "
+        f"streamer={source} | "
+        f"candidate_identifier={candidate_identifier} | "
+        f"viral_score={score_label} | "
+        f"rejection_reason={rejection_reason}"
+    )
+
+
 def _apply_visual_layout_memory_fallback(
     visual_layout: dict[str, object],
     available_memory_mb: float | None,
@@ -5124,6 +5164,29 @@ async def _run_auto_generate_clip_pipeline(
     candidates_deferred_before_download = 0
     candidates_rejected_after_download = 0
     candidates_evaluated = 0
+    candidates_examined_count = 0
+    candidates_rejected_count = 0
+
+    def pipeline_result(
+        message: str,
+        *,
+        best_score: object = 0,
+        outcome_reason: str,
+    ) -> dict[str, object]:
+        return {
+            "message": message,
+            "best_score": best_score,
+            "outcome_reason": outcome_reason,
+            "candidates_deferred_before_download": (
+                candidates_deferred_before_download
+            ),
+            "candidates_rejected_after_download": (
+                candidates_rejected_after_download
+            ),
+            "candidates_evaluated": candidates_evaluated,
+            "_job_candidates_examined": candidates_examined_count,
+            "_job_candidates_rejected": candidates_rejected_count,
+        }
     creators = load_creators()
     creator_count = len(creators)
     start_index = _load_creator_cursor(creator_count)
@@ -5167,9 +5230,10 @@ async def _run_auto_generate_clip_pipeline(
             f"processed_candidates={processed_candidates_count} | "
             f"fully_evaluated_candidates={fully_evaluated_candidates_count}"
         )
-        return {
-            "message": "No monitored creators are currently live."
-        }
+        return pipeline_result(
+            "No monitored creators are currently live.",
+            outcome_reason="no_live_creators",
+        )
 
     next_index = (selected_index + 1) % creator_count
     _save_creator_cursor(next_index, creator_count)
@@ -5202,9 +5266,10 @@ async def _run_auto_generate_clip_pipeline(
         _load_clip_history_exclusions()
     )
     if not history_available:
-        return {
-            "message": "Clip history is temporarily unavailable; generation skipped."
-        }
+        return pipeline_result(
+            "Clip history is temporarily unavailable; generation skipped.",
+            outcome_reason="history_unavailable",
+        )
 
     attempted_clip_ids: set[str] = set()
     attempted_clip_urls: set[str] = set()
@@ -5240,9 +5305,10 @@ async def _run_auto_generate_clip_pipeline(
 
         if not fresh_batch:
             if getattr(app.state, "current_stream_grace_active", False):
-                return {
-                    "message": "No fresh current-stream clips yet."
-                }
+                return pipeline_result(
+                    "No fresh current-stream clips yet.",
+                    outcome_reason="current_stream_grace",
+                )
             print(
                 f"No fresh Twitch clips available for {creator['channel']} "
                 f"(batch {batch_attempt}/2)."
@@ -5258,20 +5324,21 @@ async def _run_auto_generate_clip_pipeline(
         )
         if not batch_memory_admitted:
             candidates_deferred_before_download += total_candidates
-            return {
-                "message": (
+            for deferred_candidate in fresh_batch:
+                candidates_examined_count += 1
+                candidates_rejected_count += 1
+                _log_candidate_rejection(
+                    deferred_candidate,
+                    "memory_deferral_before_download",
+                    streamer=str(creator.get("channel") or creator.get("name") or ""),
+                )
+            return pipeline_result(
+                (
                     "Clip generation deferred because worker memory did not "
                     "recover."
                 ),
-                "best_score": 0,
-                "candidates_deferred_before_download": (
-                    candidates_deferred_before_download
-                ),
-                "candidates_rejected_after_download": (
-                    candidates_rejected_after_download
-                ),
-                "candidates_evaluated": candidates_evaluated,
-            }
+                outcome_reason="memory_deferred_before_download",
+            )
         stage_one_started_at = time.perf_counter()
         preranked_candidates, has_sufficient_prerank_metadata = _fast_prerank_candidates(
             fresh_batch,
@@ -5376,13 +5443,26 @@ async def _run_auto_generate_clip_pipeline(
 
             for candidate_index in candidate_numbers:
                 twitch_clip = fresh_batch[candidate_index - 1]
+                candidates_examined_count += 1
                 twitch_clip_id, public_url = _normalized_twitch_identifiers(twitch_clip)
                 if not twitch_clip_id:
+                    candidates_rejected_count += 1
+                    _log_candidate_rejection(
+                        twitch_clip,
+                        "invalid_candidate_identifier",
+                        streamer=str(creator.get("channel") or creator.get("name") or ""),
+                    )
                     continue
                 attempted_clip_ids.add(twitch_clip_id)
                 attempted_clip_urls.add(public_url)
                 evaluated_candidate_numbers.add(candidate_index)
                 if not _claim_clip_for_processing(twitch_clip):
+                    candidates_rejected_count += 1
+                    _log_candidate_rejection(
+                        twitch_clip,
+                        "duplicate_or_processing_claim_unavailable",
+                        streamer=str(creator.get("channel") or creator.get("name") or ""),
+                    )
                     continue
                 processed_candidates_count += 1
 
@@ -5411,6 +5491,23 @@ async def _run_auto_generate_clip_pipeline(
                 if evaluation_result.get("expensive_evaluation_started"):
                     candidates_evaluated += 1
                 if not evaluation_result["success"]:
+                    candidates_rejected_count += 1
+                    failure_stage = str(
+                        evaluation_result.get("failure_stage") or "unknown"
+                    )
+                    rejection_reason = {
+                        "download": "download_failure",
+                        "whisper_admission": "memory_deferral_after_download",
+                        "whisper": "transcription_failure",
+                        "multimodal_scoring": "multimodal_scoring_failure",
+                        "model_release": "model_release_failure",
+                        "candidate_construction": "candidate_construction_failure",
+                    }.get(failure_stage, f"{failure_stage}_failure")
+                    _log_candidate_rejection(
+                        twitch_clip,
+                        rejection_reason,
+                        streamer=str(creator.get("channel") or creator.get("name") or ""),
+                    )
                     _write_terminal_clip_history(
                         twitch_clip,
                         "failed",
@@ -5435,26 +5532,29 @@ async def _run_auto_generate_clip_pipeline(
                             f"batch={batch_attempt}/2 | "
                             "stage=after_download_cleanup"
                         )
-                        return {
-                            "message": (
-                                "Clip generation deferred because worker "
-                                "memory did not recover."
-                            ),
-                            "best_score": 0,
-                            "candidates_deferred_before_download": (
-                                candidates_deferred_before_download
-                            ),
-                            "candidates_rejected_after_download": (
-                                candidates_rejected_after_download
-                            ),
-                            "candidates_evaluated": candidates_evaluated,
-                        }
+                        return pipeline_result(
+                            "Clip generation deferred because worker memory "
+                            "did not recover.",
+                            outcome_reason="memory_deferred_after_download",
+                        )
                     continue
 
                 clip = evaluation_result["clip"]
                 if not isinstance(clip, dict):
+                    candidates_rejected_count += 1
+                    _log_candidate_rejection(
+                        twitch_clip,
+                        "candidate_construction_failure",
+                        streamer=str(creator.get("channel") or creator.get("name") or ""),
+                    )
                     continue
                 if not _write_terminal_clip_history(clip, "fully_evaluated"):
+                    candidates_rejected_count += 1
+                    _log_candidate_rejection(
+                        clip,
+                        "history_persistence_failure",
+                        streamer=str(creator.get("channel") or creator.get("name") or ""),
+                    )
                     _cleanup_candidate_video(
                         clip.get("video_path"),
                         candidate_index,
@@ -5488,6 +5588,13 @@ async def _run_auto_generate_clip_pipeline(
                 attempted_clip_ids.add(twitch_clip_id)
                 attempted_clip_urls.add(public_url)
                 _write_terminal_clip_history(twitch_clip, "intentionally_skipped")
+                candidates_examined_count += 1
+                candidates_rejected_count += 1
+                _log_candidate_rejection(
+                    twitch_clip,
+                    "pre_rank_not_advanced_after_success",
+                    streamer=str(creator.get("channel") or creator.get("name") or ""),
+                )
 
         _log_performance_timing(
             stage="candidate_full_evaluation_stage_2",
@@ -5521,22 +5628,19 @@ async def _run_auto_generate_clip_pipeline(
             )
             == processed_candidates_count
         )
-        return {
-            "message": (
+        return pipeline_result(
+            (
                 "Clip generation deferred because available memory remained "
                 "below the Whisper safety floor."
                 if all_processed_candidates_deferred_for_memory
                 else "No viral clips found."
             ),
-            "best_score": 0,
-            "candidates_deferred_before_download": (
-                candidates_deferred_before_download
+            outcome_reason=(
+                "memory_deferred"
+                if all_processed_candidates_deferred_for_memory
+                else "no_fully_evaluated_candidates"
             ),
-            "candidates_rejected_after_download": (
-                candidates_rejected_after_download
-            ),
-            "candidates_evaluated": candidates_evaluated,
-        }
+        )
 
     print("------------------------")
     for candidate in candidates:
@@ -5564,6 +5668,12 @@ async def _run_auto_generate_clip_pipeline(
     for candidate in candidates:
         if candidate is best_clip:
             continue
+        candidates_rejected_count += 1
+        _log_candidate_rejection(
+            candidate,
+            "lower_score_than_selected_winner",
+            streamer=str(candidate.get("creator") or ""),
+        )
         _cleanup_candidate_video(
             candidate.get("video_path"),
             int(candidate.get("candidate_number", 0) or 0),
@@ -5575,6 +5685,13 @@ async def _run_auto_generate_clip_pipeline(
     print("------------------------")
 
     if best_clip["decision"] == "reject" or best_clip["score"] < AUTO_CLIP_MIN_SCORE:
+        candidates_rejected_count += 1
+        _log_candidate_rejection(
+            best_clip,
+            "score_threshold",
+            streamer=str(best_clip.get("creator") or ""),
+            viral_score=best_clip.get("score"),
+        )
         rejection_recorded = _write_terminal_clip_history(
             best_clip,
             "rejected_low_score",
@@ -5600,10 +5717,11 @@ async def _run_auto_generate_clip_pipeline(
             f"processed_candidates={processed_candidates_count} | "
             f"fully_evaluated_candidates={fully_evaluated_candidates_count}"
         )
-        return {
-            "message": "No viral clips found.",
-            "best_score": best_clip["score"],
-        }
+        return pipeline_result(
+            "No viral clips found.",
+            best_score=best_clip["score"],
+            outcome_reason="score_threshold",
+        )
 
     is_duplicate = any(
         existing.get("twitch_clip_id") == best_clip["twitch_clip_id"]
@@ -5612,6 +5730,13 @@ async def _run_auto_generate_clip_pipeline(
     )
 
     if is_duplicate:
+        candidates_rejected_count += 1
+        _log_candidate_rejection(
+            best_clip,
+            "duplicate",
+            streamer=str(best_clip.get("creator") or ""),
+            viral_score=best_clip.get("score"),
+        )
         _cleanup_candidate_video(
             best_clip.get("video_path"),
             int(best_clip.get("candidate_number", 0) or 0),
@@ -5628,10 +5753,11 @@ async def _run_auto_generate_clip_pipeline(
             f"processed_candidates={processed_candidates_count} | "
             f"fully_evaluated_candidates={fully_evaluated_candidates_count}"
         )
-        return {
-            "message": "No viral clips found.",
-            "best_score": best_clip["score"],
-        }
+        return pipeline_result(
+            "No viral clips found.",
+            best_score=best_clip["score"],
+            outcome_reason="duplicate",
+        )
 
     best_clip.update(_select_duration_profile(best_clip))
     title_context = {
@@ -5767,6 +5893,12 @@ async def _run_auto_generate_clip_pipeline(
     except Exception as error:
         print("TIKTOK VIDEO EDIT FAILED:", repr(error))
         print(traceback.format_exc())
+        _log_candidate_rejection(
+            best_clip,
+            "editing_failure_raw_fallback",
+            streamer=str(best_clip.get("creator") or ""),
+            viral_score=best_clip.get("score"),
+        )
         best_clip["video_path"] = best_clip.get("raw_video_path")
     finally:
         gc.collect()
@@ -5786,6 +5918,12 @@ async def _run_auto_generate_clip_pipeline(
             )
             best_clip.update(storage_result)
         except Exception:
+            _log_candidate_rejection(
+                best_clip,
+                "object_storage_upload_failure",
+                streamer=str(best_clip.get("creator") or ""),
+                viral_score=best_clip.get("score"),
+            )
             # Keep local media and fail persistence closed when durable storage
             # was explicitly enabled but could not confirm the upload.
             raise HTTPException(
@@ -5849,6 +5987,8 @@ async def _run_auto_generate_clip_pipeline(
         f"processed_candidates={processed_candidates_count} | "
         f"fully_evaluated_candidates={fully_evaluated_candidates_count}"
     )
+    result["clip"]["_job_candidates_examined"] = candidates_examined_count
+    result["clip"]["_job_candidates_rejected"] = candidates_rejected_count
     return result["clip"]
 
 @app.post("/api/clips/{clip_id}/publish")

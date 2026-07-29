@@ -144,9 +144,17 @@ function AIClips({ styles }) {
           endpoint: `${API_BASE_URL}/api/clip-generation-jobs/${outcome.job.id}`,
           onUpdate: (jobState) => setGenerationStatus(jobState.label),
         });
-        if (state.status === "completed") {
+        if (
+          state.status === "completed"
+          && state.outcome !== "no_clip_found"
+          && state.resultClipId
+        ) {
           setPage(1);
           await loadClips(1);
+          return;
+        }
+        if (state.outcome === "no_clip_found") {
+          alert("No suitable clip was found. Try again later.");
           return;
         }
         if (state.status === "deferred_memory") {

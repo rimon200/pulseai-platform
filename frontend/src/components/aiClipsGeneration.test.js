@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   GENERATION_ALREADY_RUNNING_MESSAGE,
   MEMORY_DEFERRED_USER_MESSAGE,
+  NO_CLIP_FOUND_USER_MESSAGE,
   classifyGenerationJob,
   isGenerateButtonDisabled,
   pollGenerationJob,
@@ -84,6 +85,7 @@ test("job polling reports stages and completed result", async () => {
     {
       id: "job-1",
       status: "completed",
+      outcome: "clip_created",
       result_clip_id: "clip-1",
     },
   ];
@@ -96,6 +98,32 @@ test("job polling reports stages and completed result", async () => {
   });
   assert.deepEqual(labels, ["Queued", "Transcribing", "Completed"]);
   assert.equal(result.state.resultClipId, "clip-1");
+});
+
+test("completed job without a clip reports no suitable clip", async () => {
+  const result = await pollGenerationJob({
+    fetchImplementation: async () => response(200, {
+      id: "job-no-clip",
+      status: "completed",
+      outcome: "no_clip_found",
+      result_clip_id: null,
+    }),
+    endpoint: "/api/clip-generation-jobs/job-no-clip",
+    wait: async () => {},
+  });
+  assert.equal(result.state.outcome, "no_clip_found");
+  assert.equal(result.state.resultClipId, "");
+  assert.equal(result.state.label, NO_CLIP_FOUND_USER_MESSAGE);
+  assert.equal(result.state.message, NO_CLIP_FOUND_USER_MESSAGE);
+});
+
+test("legacy completed job without an ID cannot create a phantom clip", () => {
+  const state = classifyGenerationJob({
+    status: "completed",
+    result_clip_id: null,
+  });
+  assert.equal(state.outcome, "no_clip_found");
+  assert.equal(state.resultClipId, "");
 });
 
 test("deferred and failed jobs retain real terminal messages", () => {

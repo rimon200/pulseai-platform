@@ -45,6 +45,7 @@ def ensure_generation_jobs_table() -> bool:
                         trigger_type TEXT NOT NULL,
                         requested_creator TEXT,
                         result_clip_id TEXT,
+                        outcome TEXT,
                         error_message TEXT,
                         retry_count INTEGER NOT NULL DEFAULT 0,
                         claimed_by TEXT,
@@ -65,6 +66,12 @@ def ensure_generation_jobs_table() -> bool:
                             trigger_type IN ('manual', 'automatic')
                         )
                     )
+                    """
+                )
+                cursor.execute(
+                    """
+                    ALTER TABLE clip_generation_jobs
+                    ADD COLUMN IF NOT EXISTS outcome TEXT
                     """
                 )
                 cursor.execute(
@@ -276,6 +283,8 @@ def claim_generation_job(
                     lease_expires_at = NOW() + (%s * INTERVAL '1 second'),
                     started_at = COALESCE(started_at, NOW()),
                     completed_at = NULL,
+                    result_clip_id = NULL,
+                    outcome = NULL,
                     error_message = NULL,
                     retry_count = retry_count + %s,
                     updated_at = NOW()
@@ -348,24 +357,32 @@ def complete_generation_job(
     worker_id: str,
     result_clip_id: str | None,
     message: str | None = None,
+    outcome: str | None = None,
 ) -> bool:
+    normalized_clip_id = str(result_clip_id or "").strip() or None
+    normalized_outcome = (
+        str(outcome or "").strip()
+        or ("clip_created" if normalized_clip_id else "no_clip_found")
+    )
     updated = _update_owned_job(
         job_id,
         worker_id,
         """
         status = 'completed',
         result_clip_id = %s,
+        outcome = %s,
         error_message = %s,
         lease_expires_at = NULL,
         completed_at = NOW(),
         updated_at = NOW()
         """,
-        (result_clip_id, message),
+        (normalized_clip_id, normalized_outcome, message),
     )
     if updated:
         print(
             "GENERATION JOB COMPLETED | "
-            f"job_id={job_id} | result_clip_id={result_clip_id or 'none'}"
+            f"job_id={job_id} | result_clip_id={normalized_clip_id or 'none'} | "
+            f"outcome={normalized_outcome}"
         )
     return updated
 

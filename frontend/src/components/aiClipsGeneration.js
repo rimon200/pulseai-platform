@@ -8,6 +8,9 @@ export const MEMORY_DEFERRED_USER_MESSAGE =
 export const GENERATION_ALREADY_RUNNING_MESSAGE =
   "A clip generation job is already running.";
 
+export const NO_CLIP_FOUND_USER_MESSAGE =
+  "No suitable clip was found. Try again later.";
+
 export const JOB_STATUS_LABELS = {
   queued: "Queued",
   claimed: "Queued",
@@ -121,15 +124,24 @@ export const classifyGenerationResponse = (response, payload) => {
 
 export const classifyGenerationJob = (job) => {
   const status = String(job?.status || "").trim().toLowerCase();
+  const resultClipId = String(job?.result_clip_id || "").trim();
+  const outcome = String(job?.outcome || "").trim().toLowerCase();
+  const noClipFound = (
+    status === "completed"
+    && (outcome === "no_clip_found" || (!outcome && !resultClipId))
+  );
   const message = typeof job?.error_message === "string"
     ? job.error_message.trim()
     : "";
   return {
     status,
-    label: JOB_STATUS_LABELS[status] || status || "Queued",
+    outcome: noClipFound ? "no_clip_found" : outcome,
+    label: noClipFound
+      ? NO_CLIP_FOUND_USER_MESSAGE
+      : (JOB_STATUS_LABELS[status] || status || "Queued"),
     terminal: ["completed", "deferred_memory", "failed"].includes(status),
-    resultClipId: job?.result_clip_id || "",
-    message,
+    resultClipId,
+    message: noClipFound ? NO_CLIP_FOUND_USER_MESSAGE : message,
   };
 };
 
