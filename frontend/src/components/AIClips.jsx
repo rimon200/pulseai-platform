@@ -1,4 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  isGenerateButtonDisabled,
+  requestClipGeneration,
+} from "./aiClipsGeneration";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL;
 const TIKTOK_RECONNECT_REQUIRED_MESSAGE = "TikTok authorization expired. Reconnect TikTok in Settings.";
@@ -61,6 +65,8 @@ function AIClips({ styles }) {
   const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
   const [loadError, setLoadError] = useState("");
+  const [isGenerating, setIsGenerating] = useState(false);
+  const generationRequestActive = useRef(false);
   const reviewableClips = clips.filter(isReviewableClip);
 
   const loadClips = useCallback(async (requestedPage) => {
@@ -119,30 +125,30 @@ function AIClips({ styles }) {
   };
 
   const generateClip = async () => {
+    if (generationRequestActive.current) {
+      return;
+    }
+    generationRequestActive.current = true;
+    setIsGenerating(true);
     try {
-      const response = await fetch(
+      const outcome = await requestClipGeneration(
+        fetch,
         `${API_BASE_URL}/api/clips/auto`,
-        {
-          method: "POST",
-        }
       );
-
-      if (!response.ok) {
-        throw new Error("Clip generation failed");
+      if (outcome.kind === "success") {
+        setPage(1);
+        await loadClips(1);
+        return;
       }
-const result = await response.json();
-
-if (result.message) {
-  alert(result.message);
-  return;
-}
-      setPage(1);
-      await loadClips(1);
+      alert(outcome.message);
     } catch (error) {
-    console.error(error);
-    alert("Could not generate a clip.");
-}
-};
+      console.error(error);
+      alert(error.message || "Could not generate a clip.");
+    } finally {
+      generationRequestActive.current = false;
+      setIsGenerating(false);
+    }
+  };
 
 const publishClip = async (clip) => {
   try {
@@ -216,9 +222,13 @@ return (
 
   <button
     onClick={generateClip}
+    disabled={isGenerateButtonDisabled(
+      isGenerating,
+      generationRequestActive.current,
+    )}
     style={styles.addCreatorButton}
   >
-    Generate Clip
+    {isGenerating ? "Generating…" : "Generate Clip"}
   </button>
 </div>
 
