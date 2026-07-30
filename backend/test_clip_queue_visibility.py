@@ -162,6 +162,78 @@ class PostgreSQLQueuePersistenceTests(unittest.TestCase):
         saved = main._persist_generated_clip_record(self._clip(clip_id))
         self.assertEqual(saved["status"], "ready_for_review")
         self.assertEqual(self._status(clip_id), "ready_for_review")
+        self.assertEqual(saved["generated_clip_id"], f"generated-{clip_id}")
+        self.assertTrue(
+            main._verify_generated_clip_retrieval(
+                saved["generated_clip_id"],
+            )
+        )
+
+    def test_newly_persisted_clip_is_first_in_all_and_unpublished(self):
+        clip_id = f"FAKE_VISIBILITY_NEWEST_{uuid.uuid4().hex}"
+        clip = self._clip(clip_id)
+        clip["creator"] = f"Newest Creator {uuid.uuid4().hex}"
+        clip["created_at"] = datetime.now(timezone.utc) - timedelta(days=90)
+        with self.psycopg.connect(self.schema_url) as connection:
+            with connection.cursor() as cursor:
+                for index in range(13):
+                    older_id = f"FAKE_EXISTING_{uuid.uuid4().hex}_{index}"
+                    cursor.execute(
+                        """
+                        INSERT INTO twitch_clip_history (
+                            provider, clip_id, clip_url, creator_name,
+                            created_at, generated_at, generated_clip_id,
+                            status
+                        ) VALUES (
+                            'twitch', %s, %s, %s,
+                            NOW() - INTERVAL '1 day',
+                            NOW() - INTERVAL '1 day',
+                            %s, 'ready_for_review'
+                        )
+                        """,
+                        (
+                            older_id,
+                            f"https://clips.twitch.tv/{older_id}",
+                            clip["creator"],
+                            f"generated-{older_id}",
+                        ),
+                    )
+            connection.commit()
+        saved = main._persist_generated_clip_record(clip)
+        all_clips = asyncio.run(main.get_clips(
+            limit=12,
+            page=1,
+            status_filter="all",
+            creator=clip["creator"],
+        ))
+        unpublished = asyncio.run(main.get_clips(
+            limit=12,
+            page=1,
+            status_filter="unpublished",
+            creator=clip["creator"],
+        ))
+        published = asyncio.run(main.get_clips(
+            limit=12,
+            page=1,
+            status_filter="published",
+            creator=clip["creator"],
+        ))
+        self.assertEqual(all_clips["total"], 14)
+        self.assertEqual(len(all_clips["items"]), 12)
+        self.assertTrue(all_clips["has_more"])
+        self.assertEqual(all_clips["items"][0]["id"], saved["generated_clip_id"])
+        self.assertEqual(
+            unpublished["items"][0]["id"],
+            saved["generated_clip_id"],
+        )
+        self.assertNotIn(
+            saved["generated_clip_id"],
+            {clip["id"] for clip in published["items"]},
+        )
+        self.assertEqual(
+            all_clips["items"][0]["created_at"],
+            saved["created_at"],
+        )
 
     def test_nonterminal_rows_become_ready_for_review(self):
         for status in ("discovered", "processing", "fully_evaluated"):

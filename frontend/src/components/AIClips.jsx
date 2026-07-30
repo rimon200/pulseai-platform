@@ -7,8 +7,11 @@ import {
 import {
   AI_CLIP_FILTERS,
   buildClipListUrl,
+  generatedClipBelongsInFilter,
+  isLatestClipListRequest,
   isPublishableClipStatus,
   mergeClipPages,
+  refreshFirstClipPage,
 } from "./aiClipsPagination";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL;
@@ -55,11 +58,12 @@ function AIClips({ styles }) {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationStatus, setGenerationStatus] = useState("");
   const generationRequestActive = useRef(false);
+  const pendingRenderedClipId = useRef("");
   const listRequestSequence = useRef(0);
   const loadClips = useCallback(async (
     requestedPage,
     requestedFilter,
-    replace = false,
+    updateMode = "append",
   ) => {
     const requestSequence = listRequestSequence.current + 1;
     listRequestSequence.current = requestSequence;
@@ -72,12 +76,19 @@ function AIClips({ styles }) {
     if (!response.ok) {
       throw new Error(data.detail || "Could not load AI Clips.");
     }
-    if (requestSequence !== listRequestSequence.current) {
+    if (!isLatestClipListRequest(
+      requestSequence,
+      listRequestSequence.current,
+    )) {
       return;
     }
     const nextItems = Array.isArray(data) ? data : (data.items || []);
     setClips((currentClips) => (
-      replace ? nextItems : mergeClipPages(currentClips, nextItems)
+      updateMode === "replace"
+        ? mergeClipPages([], nextItems)
+        : updateMode === "refresh-first"
+          ? refreshFirstClipPage(currentClips, nextItems)
+          : mergeClipPages(currentClips, nextItems)
     ));
     setPage(requestedPage);
     setHasMore(Boolean(data.has_more));
@@ -85,11 +96,26 @@ function AIClips({ styles }) {
   }, []);
 
   useEffect(() => {
-    loadClips(1, activeFilter, true).catch((error) => {
+    loadClips(1, activeFilter, "replace").catch((error) => {
       console.error("Could not load AI Clips page", error);
       setLoadError(error.message);
     });
   }, [activeFilter, loadClips]);
+
+  useEffect(() => {
+    const firstClipId = String(
+      clips[0]?.id || clips[0]?.twitch_clip_id || "",
+    ).trim();
+    if (
+      pendingRenderedClipId.current
+      && firstClipId === pendingRenderedClipId.current
+    ) {
+      console.log(
+        `FRONTEND CLIP RENDERED | clip_id=${firstClipId} | position=0`,
+      );
+      pendingRenderedClipId.current = "";
+    }
+  }, [clips]);
 
   const changeFilter = (nextFilter) => {
     if (nextFilter === activeFilter) {
@@ -172,14 +198,25 @@ function AIClips({ styles }) {
         });
         if (
           state.status === "completed"
-          && state.outcome !== "no_clip_found"
+          && state.outcome === "clip_created"
           && state.resultClipId
         ) {
-          if (activeFilter === "All") {
-            await loadClips(1, "All", true);
-          } else {
-            changeFilter("All");
+          console.log(
+            "FRONTEND CLIP REFRESH | "
+            + `job_id=${outcome.job.id} | `
+            + `result_clip_id=${state.resultClipId} | `
+            + `active_filter=${activeFilter}`,
+          );
+          if (
+            generatedClipBelongsInFilter(
+              activeFilter,
+              "ready_for_review",
+            )
+          ) {
+            pendingRenderedClipId.current = state.resultClipId;
           }
+          await loadClips(1, activeFilter, "refresh-first");
+          setPage(1);
           return;
         }
         if (state.outcome === "no_clip_found") {
@@ -197,11 +234,22 @@ function AIClips({ styles }) {
         return;
       }
       if (outcome.kind === "success") {
-        if (activeFilter === "All") {
-          await loadClips(1, "All", true);
-        } else {
-          changeFilter("All");
+        const resultClipId = String(outcome.clip?.id || "").trim();
+        const resultStatus = outcome.clip?.status || "ready_for_review";
+        console.log(
+          "FRONTEND CLIP REFRESH | "
+          + "job_id=direct | "
+          + `result_clip_id=${resultClipId || "none"} | `
+          + `active_filter=${activeFilter}`,
+        );
+        if (
+          resultClipId
+          && generatedClipBelongsInFilter(activeFilter, resultStatus)
+        ) {
+          pendingRenderedClipId.current = resultClipId;
         }
+        await loadClips(1, activeFilter, "refresh-first");
+        setPage(1);
         return;
       }
       alert(outcome.message);

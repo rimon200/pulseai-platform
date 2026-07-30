@@ -204,6 +204,19 @@ async def evaluate_claimed_job(job: dict[str, Any], worker_id: str) -> dict[str,
                 **_pipeline_counts(result),
             }
             return terminal_result
+        if pipeline_outcome_reason == "persistence_verification_failed":
+            return {
+                "status": "failed",
+                "outcome": "retryable_persistence",
+                "retryable": True,
+                "result_clip_id": None,
+                "error_message": (
+                    message
+                    or "Generated clip persistence could not be verified."
+                ),
+                "pipeline_reason": pipeline_outcome_reason,
+                **_pipeline_counts(result),
+            }
         result_clip_id = None
         if isinstance(result, dict):
             result_clip_id = str(

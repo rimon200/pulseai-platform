@@ -1054,6 +1054,7 @@ def _fully_evaluate_candidate(
             "status": "Ready to review",
             "viewer_count": viewer_count,
             "game": stream.get("game_name"),
+            "created_at": twitch_clip.get("created_at"),
             "started_at": stream.get("started_at"),
             "thumbnail_url": stream.get("thumbnail_url"),
             "twitch_clip_id": twitch_clip_id,
@@ -4520,9 +4521,9 @@ def _queue_row_to_dict(row: tuple[object, ...]) -> dict[str, object]:
         "durable_url", "ai_post_caption", "ai_hashtags",
         "ai_tiktok_description", "caption_generation_version",
         "duration_profile", "requested_duration", "actual_duration",
-        "scheduled_for", "generated_at", "tiktok_publish_id",
-        "tiktok_publish_mode", "tiktok_post_status", "tiktok_failure_reason",
-        "rights_status",
+        "scheduled_for", "generated_at", "created_at", "tiktok_publish_id",
+        "tiktok_publish_mode",
+        "tiktok_post_status", "tiktok_failure_reason", "rights_status",
     )
     return dict(zip(keys, row))
 
@@ -4781,7 +4782,8 @@ def _persist_generated_clip_record(
                             twitch_clip_history.title_fallback_used
                         )
                     RETURNING clip_id, clip_url, generated_clip_id, status,
-                              object_key, durable_url, generated_at
+                              object_key, durable_url, generated_at,
+                              COALESCE(generated_at, created_at) AS created_at
                     """,
                     (
                         clip_id, clip_url,
@@ -4839,6 +4841,12 @@ def _persist_generated_clip_record(
             f"status={saved_result['status']} | "
             f"object_key={saved_result.get('object_key') or 'none'}"
         )
+        print(
+            "CLIP PERSISTED | "
+            f"clip_id={saved_result.get('generated_clip_id') or 'none'} | "
+            f"created_at={saved_result.get('created_at') or 'unknown'} | "
+            f"status={saved_result['status']}"
+        )
         return saved_result
     except Exception as error:
         print(
@@ -4851,6 +4859,53 @@ def _persist_generated_clip_record(
             error,
         )
         return None
+
+
+def _verify_generated_clip_retrieval(
+    generated_clip_id: object,
+    *,
+    page_limit: int = 12,
+) -> bool:
+    normalized_id = str(generated_clip_id or "").strip()
+    visible = False
+    if not DATABASE_URL or not normalized_id:
+        print(
+            "CLIP RETRIEVAL VERIFIED | "
+            f"clip_id={normalized_id or 'none'} | visible_on_page_one=false"
+        )
+        return False
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT generated_clip_id
+                    FROM twitch_clip_history
+                    WHERE provider = 'twitch'
+                      AND generated_clip_id IS NOT NULL
+                    ORDER BY COALESCE(generated_at, created_at) DESC NULLS LAST,
+                             clip_id DESC
+                    LIMIT %s
+                    """,
+                    (page_limit,),
+                )
+                visible = normalized_id in {
+                    str(row[0] or "").strip() for row in cursor.fetchall()
+                }
+    except Exception as error:
+        print(
+            "CLIP RETRIEVAL VERIFICATION FAILED | "
+            f"clip_id={normalized_id} | error={error!r}"
+        )
+        visible = False
+    print(
+        "CLIP RETRIEVAL VERIFIED | "
+        f"clip_id={normalized_id} | "
+        f"visible_on_page_one={str(visible).lower()}"
+    )
+    return visible
 
 
 @app.get("/api/clips")
@@ -4897,7 +4952,19 @@ async def get_clips(
             ),
             reverse=True,
         )
-        return _paginate_items(filtered, page, limit)
+        response = _paginate_items(filtered, page, limit)
+        first_clip_id = (
+            response["items"][0].get("id")
+            if response["items"]
+            else None
+        )
+        print(
+            "CLIP LIST RESPONSE | "
+            f"page={page} | status_filter={status_filter or 'all'} | "
+            f"first_clip_id={first_clip_id or 'none'} | "
+            f"returned_count={len(response['items'])}"
+        )
+        return response
     if not getattr(app.state, "clip_history_ready", False):
         raise HTTPException(status_code=503, detail="Clip history is unavailable.")
     clauses = ["provider = 'twitch'", "generated_clip_id IS NOT NULL"]
@@ -4931,7 +4998,9 @@ async def get_clips(
                                ai_post_caption, ai_hashtags, ai_tiktok_description,
                                caption_generation_version, duration_profile,
                                requested_duration, actual_duration, scheduled_for,
-                               generated_at, provider_publish_id, tiktok_publish_mode,
+                               generated_at,
+                               COALESCE(generated_at, created_at) AS created_at,
+                               provider_publish_id, tiktok_publish_mode,
                                tiktok_post_status, tiktok_failure_reason, rights_status
                         FROM twitch_clip_history WHERE
                         """
@@ -4939,19 +5008,32 @@ async def get_clips(
                     + sql.SQL(where_sql)
                     + sql.SQL(
                         " ORDER BY "
-                        "created_at DESC NULLS LAST, clip_id DESC "
+                        "COALESCE(generated_at, created_at) DESC NULLS LAST, "
+                        "clip_id DESC "
                         "LIMIT %s OFFSET %s"
                     ),
                     [*parameters, limit, (page - 1) * limit],
                 )
                 rows = cursor.fetchall()
-        return {
+        response = {
             "items": [_queue_row_to_dict(row) for row in rows],
             "total": total,
             "page": page,
             "limit": limit,
             "has_more": page * limit < total,
         }
+        first_clip_id = (
+            response["items"][0].get("id")
+            if response["items"]
+            else None
+        )
+        print(
+            "CLIP LIST RESPONSE | "
+            f"page={page} | status_filter={status_filter or 'all'} | "
+            f"first_clip_id={first_clip_id or 'none'} | "
+            f"returned_count={len(response['items'])}"
+        )
+        return response
     except Exception as error:
         print(f"CLIP QUEUE LOAD FAILED | error={error!r}")
         raise HTTPException(status_code=503, detail="Clip queue is unavailable.")
@@ -5529,6 +5611,7 @@ def _build_generated_clip_record(clip: dict) -> dict:
     "status": clip.get("status", "Ready to review"),
     "viewer_count": clip.get("viewer_count"),
     "game": clip.get("game"),
+    "created_at": clip.get("created_at"),
     "started_at": clip.get("started_at"),
     "thumbnail_url": clip.get("thumbnail_url"),
     "timestamp": clip.get("timestamp"),
@@ -6794,11 +6877,40 @@ async def _run_auto_generate_clip_pipeline(
         raise
     persisted_clip = result["clip"]
     queue_clip = {**best_clip, **persisted_clip}
-    if not _persist_generated_clip_record(queue_clip):
-        raise HTTPException(
-            status_code=503,
-            detail="Rendered clip could not be saved to the durable queue.",
+    saved_clip = _persist_generated_clip_record(queue_clip)
+    expected_result_clip_id = str(persisted_clip.get("id") or "").strip()
+    saved_result_clip_id = str(
+        (saved_clip or {}).get("generated_clip_id") or ""
+    ).strip()
+    if not saved_clip or saved_result_clip_id != expected_result_clip_id:
+        print(
+            "CLIP RETRIEVAL VERIFICATION FAILED | "
+            f"clip_id={expected_result_clip_id or 'none'} | "
+            "reason=persistence_result_mismatch"
         )
+        return {
+            "message": "Generated clip persistence could not be verified.",
+            "outcome_reason": "persistence_verification_failed",
+            "retryable": True,
+            "_job_candidates_examined": (
+                _prior_candidates_examined + candidates_examined_count
+            ),
+            "_job_candidates_rejected": (
+                _prior_candidates_rejected + candidates_rejected_count
+            ),
+        }
+    if not _verify_generated_clip_retrieval(saved_result_clip_id):
+        return {
+            "message": "Generated clip is not retrievable on page one yet.",
+            "outcome_reason": "persistence_verification_failed",
+            "retryable": True,
+            "_job_candidates_examined": (
+                _prior_candidates_examined + candidates_examined_count
+            ),
+            "_job_candidates_rejected": (
+                _prior_candidates_rejected + candidates_rejected_count
+            ),
+        }
     _log_performance_timing(
         stage="persistence",
         elapsed_seconds=time.perf_counter() - persistence_started_at,

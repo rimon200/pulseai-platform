@@ -15,6 +15,11 @@ export const buildClipListUrl = (apiBaseUrl, page, filter) => {
   return `${apiBaseUrl}/api/clips?${parameters.toString()}`;
 };
 
+export const isLatestClipListRequest = (
+  requestSequence,
+  latestRequestSequence,
+) => requestSequence === latestRequestSequence;
+
 export const clipStableKey = (clip) => String(
   clip?.id
   || clip?.twitch_clip_id
@@ -38,6 +43,10 @@ export const mergeClipPages = (currentClips, nextClips) => {
   return merged;
 };
 
+export const refreshFirstClipPage = (currentClips, freshFirstPage) => (
+  mergeClipPages(freshFirstPage, currentClips)
+);
+
 export const isPublishableClipStatus = (status) => [
   "ready_for_review",
   "ready to review",
@@ -46,3 +55,16 @@ export const isPublishableClipStatus = (status) => [
   "publish_failed",
 ].includes(String(status || "").trim().toLowerCase());
 
+export const generatedClipBelongsInFilter = (
+  filter,
+  status = "ready_for_review",
+) => {
+  const normalizedStatus = String(status || "").trim().toLowerCase();
+  if (filter === "Published") {
+    return normalizedStatus === "published";
+  }
+  if (filter === "Unpublished") {
+    return isPublishableClipStatus(normalizedStatus);
+  }
+  return true;
+};

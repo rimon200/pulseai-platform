@@ -65,6 +65,37 @@ class EmbeddedWorkerTests(unittest.IsolatedAsyncioTestCase):
             clip_worker.NO_CLIP_FOUND_MESSAGE,
         )
 
+    async def test_unverified_persistence_cannot_report_clip_created(self):
+        with patch.object(main, "_ensure_clip_history_table", return_value=True):
+            with patch(
+                "stream_history.ensure_stream_history_tables",
+                return_value=True,
+            ):
+                with patch.object(
+                    main,
+                    "_run_auto_generate_clip_pipeline",
+                    new=AsyncMock(
+                        return_value={
+                            "message": (
+                                "Generated clip is not retrievable on "
+                                "page one yet."
+                            ),
+                            "outcome_reason": (
+                                "persistence_verification_failed"
+                            ),
+                            "retryable": True,
+                        }
+                    ),
+                ):
+                    result = await clip_worker.evaluate_claimed_job(
+                        {"id": "job-persistence-failure"},
+                        "worker",
+                    )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["outcome"], "retryable_persistence")
+        self.assertTrue(result["retryable"])
+        self.assertIsNone(result["result_clip_id"])
+
     async def test_pipeline_memory_measurements_reach_deferred_summary(self):
         pipeline_result = {
             "message": (
