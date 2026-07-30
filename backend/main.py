@@ -41,7 +41,11 @@ from ai import (
     release_whisper_model,
 )
 from video_editing import create_tiktok_edited_video
-from storage_service import object_storage_enabled, upload_video
+from storage_service import (
+    get_video_preview_url,
+    object_storage_enabled,
+    upload_video,
+)
 from generation_jobs import (
     automatic_usage_snapshot,
     enqueue_generation_job,
@@ -4820,6 +4824,80 @@ def _queue_row_to_dict(row: tuple[object, ...]) -> dict[str, object]:
     return dict(zip(keys, row))
 
 
+async def _attach_clip_preview_urls(
+    clips: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    for clip in clips:
+        durable_url = str(clip.get("durable_url") or "").strip()
+        object_key = str(clip.get("object_key") or "").strip()
+        if durable_url:
+            clip["durable_url"] = durable_url
+            clip["preview_url"] = durable_url
+            clip["preview_available"] = True
+            continue
+        if not object_key:
+            clip["preview_url"] = ""
+            clip["preview_available"] = False
+            print(
+                "CLIP PREVIEW UNAVAILABLE | "
+                f"clip_id={clip.get('id') or 'unknown'} | "
+                "reason=missing_object_key"
+            )
+            continue
+        preview = await asyncio.to_thread(
+            get_video_preview_url,
+            object_key,
+            clip.get("id"),
+        )
+        permanent_url = str(preview.get("durable_url") or "").strip()
+        clip["durable_url"] = permanent_url
+        clip["preview_url"] = str(preview.get("preview_url") or "").strip()
+        clip["preview_available"] = bool(preview.get("preview_available"))
+        clip["_preview_source"] = str(preview.get("source") or "")
+    return clips
+
+
+def _persist_public_preview_urls(
+    clips: list[dict[str, object]],
+) -> None:
+    public_urls = [
+        (
+            str(clip.get("durable_url") or "").strip(),
+            str(clip.get("id") or "").strip(),
+            str(clip.get("object_key") or "").strip(),
+        )
+        for clip in clips
+        if clip.get("durable_url")
+        and clip.get("id")
+        and clip.get("object_key")
+        and clip.get("_preview_source") == "public_url"
+    ]
+    if not DATABASE_URL or not public_urls:
+        return
+    try:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.executemany(
+                    """
+                    UPDATE twitch_clip_history
+                    SET durable_url = %s
+                    WHERE generated_clip_id = %s
+                      AND object_key = %s
+                      AND NULLIF(durable_url, '') IS NULL
+                    """,
+                    public_urls,
+                )
+            connection.commit()
+    except Exception as error:
+        print(
+            "CLIP PREVIEW URL PERSISTENCE FAILED | "
+            f"clip_count={len(public_urls)} | error_type="
+            f"{error.__class__.__name__}"
+        )
+
+
 def _paginate_items(
     items: list[dict[str, object]],
     page: int,
@@ -5245,6 +5323,9 @@ async def get_clips(
             reverse=True,
         )
         response = _paginate_items(filtered, page, limit)
+        response["items"] = await _attach_clip_preview_urls(response["items"])
+        for response_item in response["items"]:
+            response_item.pop("_preview_source", None)
         first_clip_id = (
             response["items"][0].get("id")
             if response["items"]
@@ -5307,8 +5388,14 @@ async def get_clips(
                     [*parameters, limit, (page - 1) * limit],
                 )
                 rows = cursor.fetchall()
+        response_items = await _attach_clip_preview_urls(
+            [_queue_row_to_dict(row) for row in rows]
+        )
+        await asyncio.to_thread(_persist_public_preview_urls, response_items)
+        for response_item in response_items:
+            response_item.pop("_preview_source", None)
         response = {
-            "items": [_queue_row_to_dict(row) for row in rows],
+            "items": response_items,
             "total": total,
             "page": page,
             "limit": limit,

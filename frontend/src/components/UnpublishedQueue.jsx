@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { clipPreviewUrl } from "./aiClipsPagination";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL;
 const QUEUE_STATUSES = "ready_for_review,approved,scheduled,publish_failed";
@@ -83,13 +84,14 @@ function UnpublishedQueue({ styles }) {
         <div style={styles.clipGrid}>
           {items.map((clip) => {
             const draft = editing[clip.id] ?? clip.ai_tiktok_description ?? "";
+            const previewUrl = clipPreviewUrl(clip);
             return (
               <article key={clip.id} style={styles.clipCard}>
-                {previewClipId === clip.id && clip.durable_url ? (
+                {previewClipId === clip.id && previewUrl ? (
                   <video
                     controls
                     preload="none"
-                    src={clip.durable_url}
+                    src={previewUrl}
                     style={{
                       width: "100%",
                       aspectRatio: "9 / 16",
@@ -98,7 +100,7 @@ function UnpublishedQueue({ styles }) {
                   />
                 ) : (
                   <button
-                    disabled={!clip.durable_url}
+                    disabled={!previewUrl}
                     onClick={() => setPreviewClipId(clip.id)}
                     style={{
                       width: "100%",
@@ -107,7 +109,7 @@ function UnpublishedQueue({ styles }) {
                       color: "#fff",
                     }}
                   >
-                    {clip.durable_url ? "Load preview" : "Preview unavailable"}
+                    {previewUrl ? "Load preview" : "Preview unavailable"}
                   </button>
                 )}
                 <h3>{clip.title || "Untitled clip"}</h3>

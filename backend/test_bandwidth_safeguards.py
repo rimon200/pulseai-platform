@@ -96,7 +96,7 @@ class BandwidthSafeguardTests(unittest.TestCase):
             frontend_root / "components" / "UnpublishedQueue.jsx"
         ).read_text(encoding="utf-8")
         for source in (ai_clips, queue):
-            self.assertIn("clip.durable_url", source)
+            self.assertIn("clipPreviewUrl", source)
             self.assertNotIn("/api/clips/${clip.id}/video", source)
             self.assertNotIn('preload="metadata"', source)
         self.assertIn('preload="none"', ai_clips)

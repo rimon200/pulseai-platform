@@ -7,6 +7,7 @@ import {
 import {
   AI_CLIP_FILTERS,
   buildClipListUrl,
+  clipPreviewUrl,
   clipStableKey,
   generatedClipBelongsInFilter,
   isLatestClipListRequest,
@@ -271,7 +272,7 @@ function AIClips({ styles }) {
 
 const publishClip = async (clip) => {
   try {
-    if (!clip.video_path && !clip.durable_url) {
+    if (!clip.video_path && !clip.durable_url && !clip.object_key) {
       alert("This clip is missing its local video file path.");
       return;
     }
@@ -391,7 +392,9 @@ return (
             <div style={styles.emptyState}>{loadError}</div>
           )}
           {clips.length > 0 ? (
-            clips.map((clip) => (
+            clips.map((clip) => {
+              const previewUrl = clipPreviewUrl(clip);
+              return (
               <div
   key={clip.id}
   style={styles.clipCard}
@@ -405,9 +408,9 @@ return (
     overflow: "hidden",
   }}
 >
-  {previewClipId === clip.id && clip.durable_url ? (
+  {previewClipId === clip.id && previewUrl ? (
     <video
-      src={clip.durable_url}
+      src={previewUrl}
       controls
       preload="none"
       onError={() => handlePreviewError(clip.id)}
@@ -432,7 +435,7 @@ return (
     />
   ) : (
     <span style={{ opacity: 0.75 }}>
-      {clip.durable_url ? "▶" : "Preview unavailable"}
+      {previewUrl ? "▶" : "Preview unavailable"}
     </span>
   )}
 </div>
@@ -466,19 +469,19 @@ return (
 
 <button
   onClick={() => togglePreview(clip.id)}
-  disabled={!clip.id || !clip.durable_url}
+  disabled={!clip.id || !previewUrl}
   style={{
     ...styles.secondaryButton,
-    opacity: clip.id && clip.durable_url ? 1 : 0.6,
-    cursor: clip.id && clip.durable_url ? "pointer" : "not-allowed",
+    opacity: clip.id && previewUrl ? 1 : 0.6,
+    cursor: clip.id && previewUrl ? "pointer" : "not-allowed",
   }}
 >
   {previewClipId === clip.id ? "Hide Preview" : "Preview"}
 </button>
 
-{clip.durable_url ? (
+{previewUrl ? (
   <a
-    href={clip.durable_url}
+    href={previewUrl}
     target="_blank"
     rel="noreferrer"
     style={{ ...styles.secondaryButton, textDecoration: "none", display: "inline-block" }}
@@ -528,7 +531,8 @@ return (
                   </div>
                 </div>
               </div>
-            ))
+              );
+            })
           ) : (
             <div style={styles.emptyState}>
               No {activeFilter.toLowerCase()} clips found.

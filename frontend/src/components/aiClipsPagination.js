@@ -51,8 +51,21 @@ export const normalizeClip = (clip) => {
     id: generatedClipId,
     generated_clip_id: generatedClipId,
     status: normalizeStatus(clip.status),
+    durable_url: String(clip.durable_url || "").trim(),
+    preview_url: String(
+      clip.preview_url || clip.durable_url || "",
+    ).trim(),
+    preview_available: Boolean(
+      clip.preview_available
+      || clip.preview_url
+      || clip.durable_url,
+    ),
   };
 };
+
+export const clipPreviewUrl = (clip) => String(
+  clip?.preview_url || clip?.durable_url || "",
+).trim();
 
 export const clipStableKey = (clip) => String(
   clip?.generated_clip_id

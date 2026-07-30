@@ -7,6 +7,7 @@ import {
   AI_CLIPS_PAGE_SIZE,
   buildClipListUrl,
   clipBelongsInFilter,
+  clipPreviewUrl,
   clipStableKey,
   generatedClipBelongsInFilter,
   isLatestClipListRequest,
@@ -136,6 +137,29 @@ test("missing preview media does not remove the card", () => {
   assert.ok(clips[0].object_key);
 });
 
+test("a presigned preview URL makes a legacy object-key clip previewable", () => {
+  const normalized = normalizeClip({
+    id: "generated-legacy",
+    object_key: "clips/generated-legacy/video.mp4",
+    durable_url: null,
+    preview_url: "https://signed.invalid/video.mp4?token=fresh",
+    preview_available: true,
+  });
+  assert.equal(
+    clipPreviewUrl(normalized),
+    "https://signed.invalid/video.mp4?token=fresh",
+  );
+  assert.equal(normalized.preview_available, true);
+});
+
+test("a permanent URL is the preview fallback", () => {
+  const normalized = normalizeClip({
+    id: "generated-public",
+    durable_url: "https://media.invalid/clips/generated-public/video.mp4",
+  });
+  assert.equal(clipPreviewUrl(normalized), normalized.durable_url);
+});
+
 test("a Twitch source collision does not remove a new generated record", () => {
   const sourceCollision = {
     id: "older-generated-id",
@@ -190,4 +214,7 @@ test("React cards use only the generated clip ID as their key", () => {
     /key=\{clip\.id \|\| clip\.twitch_clip_id/,
   );
   assert.match(source, /Preview unavailable/);
+  assert.match(source, /const previewUrl = clipPreviewUrl\(clip\)/);
+  assert.match(source, /preload="none"/);
+  assert.equal(source.includes("/api/clips/${clip.id}/video"), false);
 });
