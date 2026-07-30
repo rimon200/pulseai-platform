@@ -7,43 +7,31 @@ import {
 import {
   AI_CLIP_FILTERS,
   buildClipListUrl,
+  clipStableKey,
   generatedClipBelongsInFilter,
   isLatestClipListRequest,
   isPublishableClipStatus,
   mergeClipPages,
+  normalizeAndFilterClips,
+  prioritizeClip,
   refreshFirstClipPage,
 } from "./aiClipsPagination";
 
 const API_BASE_URL = import.meta.env.VITE_API_URL;
 const TIKTOK_RECONNECT_REQUIRED_MESSAGE = "TikTok authorization expired. Reconnect TikTok in Settings.";
+const logClipDiagnostic = (event, fields) => {
+  if (!import.meta.env.DEV) {
+    return;
+  }
+  const details = Object.entries(fields)
+    .map(([name, value]) => `${name}=${value}`)
+    .join(" | ");
+  console.log(`FRONTEND CLIP ${event.toUpperCase()} | ${details}`);
+};
 const clipsMatch = (left, right) => {
-  if (!left || !right) {
-    return false;
-  }
-
-  const leftId = String(left.id || "").trim();
-  const rightId = String(right.id || "").trim();
-  if (leftId && rightId && leftId === rightId) {
-    return true;
-  }
-
-  const leftTwitchClipId = String(left.twitch_clip_id || "").trim();
-  const rightTwitchClipId = String(right.twitch_clip_id || "").trim();
-  if (
-    leftTwitchClipId
-    && rightTwitchClipId
-    && leftTwitchClipId === rightTwitchClipId
-  ) {
-    return true;
-  }
-
-  const leftPublicUrl = String(left.public_url || "").trim();
-  const rightPublicUrl = String(right.public_url || "").trim();
-  if (leftPublicUrl && rightPublicUrl && leftPublicUrl === rightPublicUrl) {
-    return true;
-  }
-
-  return false;
+  const leftId = clipStableKey(left);
+  const rightId = clipStableKey(right);
+  return Boolean(leftId && rightId && leftId === rightId);
 };
 
 function AIClips({ styles }) {
@@ -82,14 +70,32 @@ function AIClips({ styles }) {
     )) {
       return;
     }
-    const nextItems = Array.isArray(data) ? data : (data.items || []);
-    setClips((currentClips) => (
-      updateMode === "replace"
+    const rawItems = Array.isArray(data) ? data : (data.items || []);
+    const normalizedItems = normalizeAndFilterClips(
+      rawItems,
+      requestedFilter,
+      logClipDiagnostic,
+    );
+    const nextItems = updateMode === "refresh-first"
+      ? prioritizeClip(normalizedItems, pendingRenderedClipId.current)
+      : normalizedItems;
+    setClips((currentClips) => {
+      const merged = updateMode === "replace"
         ? mergeClipPages([], nextItems)
         : updateMode === "refresh-first"
           ? refreshFirstClipPage(currentClips, nextItems)
-          : mergeClipPages(currentClips, nextItems)
-    ));
+          : mergeClipPages(currentClips, nextItems);
+      nextItems.forEach((clip) => {
+        const position = merged.findIndex(
+          (item) => item.id === clip.id,
+        );
+        logClipDiagnostic("merged", {
+          clip_id: clip.id,
+          position,
+        });
+      });
+      return merged;
+    });
     setPage(requestedPage);
     setHasMore(Boolean(data.has_more));
     setLoadError("");
@@ -103,8 +109,14 @@ function AIClips({ styles }) {
   }, [activeFilter, loadClips]);
 
   useEffect(() => {
+    clips.forEach((clip, position) => {
+      logClipDiagnostic("rendered", {
+        clip_id: clip.id,
+        position,
+      });
+    });
     const firstClipId = String(
-      clips[0]?.id || clips[0]?.twitch_clip_id || "",
+      clips[0]?.id || "",
     ).trim();
     if (
       pendingRenderedClipId.current
@@ -381,7 +393,7 @@ return (
           {clips.length > 0 ? (
             clips.map((clip) => (
               <div
-  key={clip.id || clip.twitch_clip_id || clip.public_url}
+  key={clip.id}
   style={styles.clipCard}
 >
                 <div
@@ -419,7 +431,9 @@ return (
       }}
     />
   ) : (
-    <span style={styles.playButton}>▶</span>
+    <span style={{ opacity: 0.75 }}>
+      {clip.durable_url ? "▶" : "Preview unavailable"}
+    </span>
   )}
 </div>
                 {clip.id && previewErrors[clip.id] && (

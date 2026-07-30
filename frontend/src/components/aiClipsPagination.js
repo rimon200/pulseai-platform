@@ -2,7 +2,15 @@ export const AI_CLIPS_PAGE_SIZE = 12;
 
 export const AI_CLIP_FILTERS = {
   All: "all",
-  Unpublished: "unpublished",
+  Unpublished: [
+    "ready_for_review",
+    "ready_to_review",
+    "approved",
+    "scheduled",
+    "publish_failed",
+    "publishing",
+    "uploaded_to_inbox",
+  ].join(","),
   Published: "published",
 };
 
@@ -20,12 +28,109 @@ export const isLatestClipListRequest = (
   latestRequestSequence,
 ) => requestSequence === latestRequestSequence;
 
+const normalizeStatus = (status) => {
+  const normalized = String(status || "").trim().toLowerCase()
+    .replaceAll(" ", "_");
+  return normalized === "ready_to_review"
+    ? "ready_for_review"
+    : normalized;
+};
+
+export const normalizeClip = (clip) => {
+  if (!clip || typeof clip !== "object") {
+    return null;
+  }
+  const generatedClipId = String(
+    clip.generated_clip_id
+    || clip.clip_id
+    || clip.id
+    || "",
+  ).trim();
+  return {
+    ...clip,
+    id: generatedClipId,
+    generated_clip_id: generatedClipId,
+    status: normalizeStatus(clip.status),
+  };
+};
+
 export const clipStableKey = (clip) => String(
-  clip?.id
-  || clip?.twitch_clip_id
-  || clip?.public_url
+  clip?.generated_clip_id
+  || clip?.id
+  || clip?.clip_id
   || "",
 ).trim();
+
+export const UNPUBLISHED_CLIP_STATUSES = new Set([
+  "ready_for_review",
+  "approved",
+  "scheduled",
+  "publish_failed",
+  "publishing",
+  "uploaded_to_inbox",
+]);
+
+export const clipBelongsInFilter = (clip, filter) => {
+  const status = normalizeStatus(clip?.status);
+  if (filter === "Published") {
+    return status === "published";
+  }
+  if (filter === "Unpublished") {
+    return UNPUBLISHED_CLIP_STATUSES.has(status);
+  }
+  return true;
+};
+
+export const normalizeAndFilterClips = (
+  clips,
+  filter,
+  onDiagnostic = () => {},
+) => {
+  const accepted = [];
+  for (const rawClip of clips) {
+    const clip = normalizeClip(rawClip);
+    const clipId = clipStableKey(clip);
+    onDiagnostic("received", {
+      clip_id: clipId,
+      status: clip?.status || "unknown",
+      active_filter: filter,
+    });
+    if (!clipId) {
+      onDiagnostic("filtered", {
+        clip_id: "none",
+        reason: "missing_generated_clip_id",
+      });
+      continue;
+    }
+    if (!clipBelongsInFilter(clip, filter)) {
+      onDiagnostic("filtered", {
+        clip_id: clipId,
+        reason: `status_not_in_${String(filter).toLowerCase()}`,
+      });
+      continue;
+    }
+    accepted.push(clip);
+  }
+  return accepted;
+};
+
+export const prioritizeClip = (clips, preferredClipId) => {
+  const preferredKey = String(preferredClipId || "").trim();
+  if (!preferredKey) {
+    return clips;
+  }
+  const preferredIndex = clips.findIndex(
+    (clip) => clipStableKey(clip) === preferredKey,
+  );
+  if (preferredIndex <= 0) {
+    return clips;
+  }
+  return [
+    clips[preferredIndex],
+    ...clips.slice(0, preferredIndex),
+    ...clips.slice(preferredIndex + 1),
+  ];
+};
 
 export const mergeClipPages = (currentClips, nextClips) => {
   const merged = [];
@@ -58,13 +163,4 @@ export const isPublishableClipStatus = (status) => [
 export const generatedClipBelongsInFilter = (
   filter,
   status = "ready_for_review",
-) => {
-  const normalizedStatus = String(status || "").trim().toLowerCase();
-  if (filter === "Published") {
-    return normalizedStatus === "published";
-  }
-  if (filter === "Unpublished") {
-    return isPublishableClipStatus(normalizedStatus);
-  }
-  return true;
-};
+) => clipBelongsInFilter({ status }, filter);
