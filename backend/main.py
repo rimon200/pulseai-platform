@@ -7156,6 +7156,12 @@ async def _run_auto_generate_clip_pipeline(
                     best_clip.get("requested_duration") or 0
                 ),
                 visual_layout=visual_layout,
+                creator=str(best_clip.get("creator") or ""),
+                topic=str(
+                    best_clip.get("game")
+                    or best_clip.get("title_event_summary")
+                    or ""
+                )[:60],
             )
             _log_performance_timing(
                 stage="visual_layout_render",

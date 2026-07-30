@@ -290,10 +290,14 @@ def generate_ai_title_package(
     context_text = "\n".join(context_lines)
     evidence = f"{selected_transcript} {event_summary} {context_text}"
     prompt = (
-        "Write exactly one truthful TikTok-style title for the selected clip. "
-        "Describe the central action or reaction, using 5-10 words before one "
-        "relevant trailing emoji. Use only facts supported by the transcript and "
+        "Act as a professional reaction-video editor. Write exactly one truthful, "
+        "curiosity-driven title using 4-10 natural English words. Lead with the "
+        "creator when known and frame the visible reaction or concrete turning "
+        "point (for example: 'Kai instantly regrets watching this'). Never return "
+        "a transcript fragment or merely restate dialogue. Use at most one trailing "
+        "emoji. Use only facts supported by the transcript and "
         "event summary. No hashtags, profanity, invented people, motives, outcomes, "
+        "ALL CAPS, or unfinished ellipses. "
         "or generic phrases such as Crazy Stream Moment, You Won't Believe This, "
         "Streamer Goes Viral, Unexpected Stream Moment, or This Was Insane. "
         "Return only the title.\n\n"

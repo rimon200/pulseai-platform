@@ -112,6 +112,8 @@ def _build_overlay_ass_content(
     title_font_size: int,
     transcript_segments: List[Dict[str, object]],
     speech_captions_enabled: bool = False,
+    creator: str = "",
+    topic: str = "",
 ) -> str:
     header = [
         "[Script Info]",
@@ -122,7 +124,9 @@ def _build_overlay_ass_content(
         "",
         "[V4+ Styles]",
         "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
-        f"Style: TopTitle,Arial,{title_font_size},&H00000000,&H00000000,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,0,0,8,{TITLE_HORIZONTAL_PADDING},{TITLE_HORIZONTAL_PADDING},84,1",
+        f"Style: TopTitle,Arial,{title_font_size},&H00FFFFFF,&H00000000,&H00000000,&H880D1020,1,0,0,0,100,100,0,0,3,2,1.2,8,{TITLE_HORIZONTAL_PADDING},120,58,1",
+        "Style: Context,Arial,20,&H00E8E8EE,&H00000000,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,8,48,140,198,1",
+        "Style: Brand,Arial,18,&H99706060,&H00000000,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,0,0,7,24,0,207,1",
         "Style: Caption,Arial,40,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,1,0,0,0,100,100,0,0,3,2.8,0,2,52,52,210,1",
         "",
         "[Events]",
@@ -143,6 +147,19 @@ def _build_overlay_ass_content(
             "0,0:00:00.00,9:59:59.00,TopTitle,,0,0,0,,"
             f"{{\\q2}}{cleaned_title}"
         )
+    context_parts = []
+    if creator:
+        context_parts.append(f"Streamer: {_escape_ass_text(creator)}")
+    if topic:
+        context_parts.append(f"Topic: {_escape_ass_text(topic)}")
+    if context_parts:
+        events.append(
+            "Dialogue: 0,0:00:00.00,9:59:59.00,Context,,0,0,0,,"
+            + "  •  ".join(context_parts)
+        )
+    events.append(
+        "Dialogue: 0,0:00:00.00,9:59:59.00,Brand,,0,0,0,,PulseAI"
+    )
 
     for segment in transcript_segments[:120] if speech_captions_enabled else []:
         text = str(segment.get("text", "")).strip()
@@ -323,7 +340,7 @@ def _build_filter_chain(
     } and len(regions) >= 2:
         crop_filters = []
         output_labels = []
-        reaction_height = int(VIDEO_REGION_HEIGHT * 0.38)
+        reaction_height = int(VIDEO_REGION_HEIGHT * 0.45)
         content_height = VIDEO_REGION_HEIGHT - reaction_height
         for index, region in enumerate(regions[:2]):
             normalized = _normalized_layout_region(region)
@@ -332,23 +349,45 @@ def _build_filter_chain(
             branch_height = (
                 reaction_height if index == 0 else content_height
             ) if layout_mode == "reaction_stream" else VIDEO_REGION_HEIGHT // 2
-            crop_filters.append(
+            branch_filter = (
                 f"[layout_input_{index}]"
                 f"crop=w='iw*{normalized['width']:.5f}':"
                 f"h='ih*{normalized['height']:.5f}':"
                 f"x='iw*{normalized['x']:.5f}':"
                 f"y='ih*{normalized['y']:.5f}',"
-                f"scale={CANVAS_WIDTH}:{branch_height}:"
-                "force_original_aspect_ratio=increase,"
-                f"crop={CANVAS_WIDTH}:{branch_height}"
-                f"[{output_label}]"
             )
+            if layout_mode == "reaction_stream" and index == 0:
+                branch_filter += (
+                    f"scale={CANVAS_WIDTH}:{branch_height}:"
+                    "force_original_aspect_ratio=decrease,"
+                    f"pad={CANVAS_WIDTH}:{branch_height}:"
+                    "(ow-iw)/2:(oh-ih)/2:color=0x0D1020,"
+                    "eq=contrast=1.04,unsharp=3:3:0.25"
+                    f"[{output_label}]"
+                )
+            elif layout_mode == "reaction_stream":
+                branch_filter += (
+                    "trim=start=1,setpts=PTS-STARTPTS,"
+                    "select='eq(n,0)',"
+                    f"scale={CANVAS_WIDTH}:{branch_height}:"
+                    "force_original_aspect_ratio=increase,"
+                    f"crop={CANVAS_WIDTH}:{branch_height},"
+                    "eq=contrast=1.06,unsharp=3:3:0.35,"
+                    "zoompan=z='min(zoom+0.00035,1.08)':"
+                    "x='iw/2-(iw/zoom/2)+sin(on/90)*8':"
+                    "y='ih/2-(ih/zoom/2)':d=14400:s="
+                    f"{CANVAS_WIDTH}x{branch_height}:fps=24"
+                    f"[{output_label}]"
+                )
+            else:
+                branch_filter += (
+                    f"scale={CANVAS_WIDTH}:{branch_height}:"
+                    "force_original_aspect_ratio=increase,"
+                    f"crop={CANVAS_WIDTH}:{branch_height}"
+                    f"[{output_label}]"
+                )
+            crop_filters.append(branch_filter)
         stack_labels = list(output_labels)
-        if (
-            layout_mode == "reaction_stream"
-            and str(layout.get("reaction_placement") or "top") == "bottom"
-        ):
-            stack_labels.reverse()
         filters = [
             "fps=24,split=2[layout_input_0][layout_input_1]",
             *crop_filters,
@@ -470,10 +509,10 @@ def detect_visual_layout(video_path: str) -> Dict[str, object]:
     try:
         minimum_confidence = min(
             1.0,
-            max(0.0, float(os.getenv("VIDEO_LAYOUT_MIN_CONFIDENCE", "0.70"))),
+            max(0.0, float(os.getenv("VIDEO_LAYOUT_MIN_CONFIDENCE", "0.60"))),
         )
     except ValueError:
-        minimum_confidence = 0.70
+        minimum_confidence = 0.60
 
     capture = None
     try:
@@ -762,6 +801,8 @@ def create_tiktok_edited_video(
     emphasis_moments: Optional[List[Dict[str, object]]] = None,
     selected_duration_seconds: Optional[float] = None,
     visual_layout: Optional[Dict[str, object]] = None,
+    creator: str = "",
+    topic: str = "",
 ) -> str:
     ffmpeg_path = shutil.which("ffmpeg")
     ffprobe_path = shutil.which("ffprobe")
@@ -826,6 +867,8 @@ def create_tiktok_edited_video(
                             "false",
                         ).lower() == "true"
                     ),
+                    creator=creator,
+                    topic=topic,
                 )
             )
             overlay_temp_path = Path(overlay_temp.name)

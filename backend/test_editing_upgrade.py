@@ -190,8 +190,11 @@ class SpeechCaptionAndLayoutTests(unittest.TestCase):
             )
         self.assertEqual(graph.count("split=2"), 1)
         self.assertNotIn("split=3", graph)
-        self.assertIn("scale=720:395", graph)
-        self.assertIn("scale=720:645", graph)
+        self.assertIn("scale=720:468", graph)
+        self.assertIn("scale=720:572", graph)
+        self.assertIn("force_original_aspect_ratio=decrease,pad=720:468", graph)
+        self.assertIn("select='eq(n,0)'", graph)
+        self.assertIn("zoompan=", graph)
         self.assertIn("vstack=inputs=2", graph)
 
     def test_layout_sample_count_is_capped(self):
