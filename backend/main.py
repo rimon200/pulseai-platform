@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pathlib import Path
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 import subprocess
 import traceback
@@ -1445,14 +1445,27 @@ async def _auto_clip_loop():
 
     while True:
         print("AUTO CYCLE START")
-        try:
-            job, created = enqueue_generation_job("automatic")
+        automatic_generation_enabled = (
+            os.getenv(
+                "AUTO_CLIP_AUTOMATIC_GENERATION_ENABLED",
+                "false",
+            ).strip().lower()
+            == "true"
+        )
+        if automatic_generation_enabled:
+            try:
+                job, created = enqueue_generation_job("automatic")
+                print(
+                    "AUTO GENERATION JOB | "
+                    f"job_id={job['id']} | created={str(created).lower()}"
+                )
+            except Exception as error:
+                print("AUTO ERROR:", repr(error))
+        else:
             print(
-                "AUTO GENERATION JOB | "
-                f"job_id={job['id']} | created={str(created).lower()}"
+                "AUTO GENERATION SKIPPED | "
+                "reason=bandwidth_safeguard"
             )
-        except Exception as error:
-            print("AUTO ERROR:", repr(error))
         try:
             await _run_auto_publish_once()
         except Exception as error:
@@ -4076,7 +4089,15 @@ def download_twitch_clip(clip_url: str, output_name: str) -> str:
     return output_path or None
 
 
-async def upload_tiktok_draft(video_path: str) -> dict:
+class _TikTokPullFromUrlUnavailable(RuntimeError):
+    pass
+
+
+async def upload_tiktok_draft(
+    video_path: str,
+    durable_url: str = "",
+    clip_id: str = "",
+) -> dict:
     token_response = _load_provider_token_data("tiktok", TIKTOK_USER_TOKEN_FILE)
     if token_response is None:
         raise HTTPException(
@@ -4094,67 +4115,124 @@ async def upload_tiktok_draft(video_path: str) -> dict:
     if not access_token:
         raise _reconnect_tiktok_exception()
 
-    video_file = Path(video_path)
-    if not video_file.is_file():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Video file not found: {video_path}",
-        )
-
-    video_size = video_file.stat().st_size
-
-    async def stream_video():
-        with video_file.open("rb") as file:
-            while chunk := await asyncio.to_thread(file.read, 1024 * 1024):
-                yield chunk
-    if video_size == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Video file is empty.",
-        )
-
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json; charset=UTF-8",
     }
-    init_payload = {
-        "source_info": {
-            "source": "FILE_UPLOAD",
-            "video_size": video_size,
-            "chunk_size": video_size,
-            "total_chunk_count": 1,
-        }
-    }
 
     async with httpx.AsyncClient(timeout=60.0) as client:
-        init_response = await client.post(
-            "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
-            headers=headers,
-            json=init_payload,
-        )
-
-        if _response_contains_access_token_invalid(init_response):
-            token_response = _refresh_tiktok_user_access_token(token_response)
-            refreshed_access_token = _extract_tiktok_token_fields(token_response).get("access_token")
-            if not refreshed_access_token:
-                raise _reconnect_tiktok_exception()
-
-            headers["Authorization"] = f"Bearer {refreshed_access_token}"
-            init_response = await client.post(
+        async def initialize(payload: dict[str, object]):
+            nonlocal token_response
+            response = await client.post(
                 "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
                 headers=headers,
-                json=init_payload,
+                json=payload,
+            )
+            if _response_contains_access_token_invalid(response):
+                token_response = _refresh_tiktok_user_access_token(
+                    token_response
+                )
+                refreshed_access_token = _extract_tiktok_token_fields(
+                    token_response
+                ).get("access_token")
+                if not refreshed_access_token:
+                    raise _reconnect_tiktok_exception()
+                headers["Authorization"] = f"Bearer {refreshed_access_token}"
+                response = await client.post(
+                    "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/",
+                    headers=headers,
+                    json=payload,
+                )
+                if _response_contains_access_token_invalid(response):
+                    raise _reconnect_tiktok_exception()
+            return response
+
+        pull_url = str(durable_url or "").strip()
+        pull_enabled = (
+            os.getenv("TIKTOK_PULL_FROM_URL_ENABLED", "true")
+            .strip()
+            .lower()
+            == "true"
+        )
+        if pull_enabled and pull_url.startswith("https://"):
+            pull_response = await initialize(
+                {
+                    "source_info": {
+                        "source": "PULL_FROM_URL",
+                        "video_url": pull_url,
+                    }
+                }
+            )
+            try:
+                pull_result = pull_response.json()
+            except ValueError:
+                pull_result = {}
+            pull_error_code = str(
+                (pull_result.get("error") or {}).get("code") or ""
+            )
+            pull_data = pull_result.get("data") or {}
+            pull_publish_id = str(pull_data.get("publish_id") or "")
+            if (
+                pull_response.status_code == 200
+                and pull_error_code in {"", "ok"}
+                and pull_publish_id
+            ):
+                print(
+                    "MEDIA TRANSFER SKIPPED | "
+                    "reason=direct_r2_url | "
+                    f"clip_id={clip_id or 'unknown'}"
+                )
+                return {
+                    "publish_id": pull_publish_id,
+                    "upload_result": pull_result,
+                    "transfer_method": "PULL_FROM_URL",
+                }
+            if pull_error_code != "url_ownership_unverified":
+                raise HTTPException(
+                    status_code=502,
+                    detail="TikTok rejected the R2 draft initialization.",
+                )
+            print(
+                "MEDIA TRANSFER SKIPPED | "
+                "reason=direct_r2_url_unverified | "
+                "clip_id=unknown"
+            )
+            if not Path(video_path).is_file():
+                raise _TikTokPullFromUrlUnavailable(
+                    "TikTok requires a verified R2 URL or a local upload."
+                )
+        elif pull_url and not Path(video_path).is_file():
+            raise _TikTokPullFromUrlUnavailable(
+                "TikTok URL pulls are disabled and no local upload exists."
             )
 
-            if _response_contains_access_token_invalid(init_response):
-                raise _reconnect_tiktok_exception()
-
+        video_file = Path(video_path)
+        if not video_file.is_file():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Video file not found: {video_path}",
+            )
+        video_size = video_file.stat().st_size
+        if video_size == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Video file is empty.",
+            )
+        init_response = await initialize(
+            {
+                "source_info": {
+                    "source": "FILE_UPLOAD",
+                    "video_size": video_size,
+                    "chunk_size": video_size,
+                    "total_chunk_count": 1,
+                }
+            }
+        )
         if init_response.status_code != 200:
             raise HTTPException(
                 status_code=502,
                 detail="TikTok draft upload initialization failed.",
             )
-
         try:
             init_result = init_response.json()
         except ValueError as error:
@@ -4162,22 +4240,27 @@ async def upload_tiktok_draft(video_path: str) -> dict:
                 status_code=502,
                 detail="TikTok draft upload initialization returned an invalid response.",
             ) from error
-
         if not isinstance(init_result, dict):
             raise HTTPException(
                 status_code=502,
                 detail="TikTok draft upload initialization returned an invalid payload.",
             )
-
         upload_data = init_result.get("data", {})
         upload_url = upload_data.get("upload_url")
         publish_id = upload_data.get("publish_id")
-
         if not upload_url or not publish_id:
             raise HTTPException(
                 status_code=502,
                 detail="TikTok did not return an upload URL and publish ID.",
             )
+
+        async def stream_video():
+            with video_file.open("rb") as file:
+                while chunk := await asyncio.to_thread(
+                    file.read,
+                    1024 * 1024,
+                ):
+                    yield chunk
 
         upload_response = await client.put(
             upload_url,
@@ -4194,12 +4277,20 @@ async def upload_tiktok_draft(video_path: str) -> dict:
             status_code=502,
             detail="TikTok draft video upload failed.",
         )
+    print(
+        "MEDIA TRANSFER | "
+        "direction=outbound | destination=tiktok | "
+        "purpose=publish_upload | "
+        f"clip_id={clip_id or 'unknown'} | "
+        f"bytes={video_size} | duplicate=false"
+    )
 
     return {
         "publish_id": publish_id,
         "upload_result": upload_response.json()
         if upload_response.content
         else None,
+        "transfer_method": "FILE_UPLOAD",
     }
 
 
@@ -5302,6 +5393,7 @@ async def save_publish_settings(payload: dict):
 
 @app.get("/api/clips/{clip_id}/video")
 async def get_clip_video(clip_id: str, download: int = 0):
+    del download
     if DATABASE_URL:
         try:
             import psycopg
@@ -5310,7 +5402,7 @@ async def get_clip_video(clip_id: str, download: int = 0):
                 with connection.cursor() as cursor:
                     cursor.execute(
                         """
-                        SELECT durable_url, local_video_path
+                        SELECT durable_url
                         FROM twitch_clip_history
                         WHERE generated_clip_id = %s
                         """,
@@ -5318,16 +5410,18 @@ async def get_clip_video(clip_id: str, download: int = 0):
                     )
                     media_row = cursor.fetchone()
             if media_row:
-                durable_url, local_path = media_row
+                durable_url = media_row[0]
                 if durable_url:
-                    return RedirectResponse(str(durable_url))
-                if local_path:
-                    resolved_video_path = _resolve_allowed_video_path(local_path)
-                    return FileResponse(
-                        path=str(resolved_video_path),
-                        media_type="video/mp4",
-                        filename=f"{clip_id}.mp4" if download == 1 else None,
+                    print(
+                        "MEDIA TRANSFER SKIPPED | "
+                        "reason=direct_r2_url | "
+                        f"clip_id={clip_id}"
                     )
+                    return RedirectResponse(str(durable_url))
+                raise HTTPException(
+                    status_code=410,
+                    detail="This clip has no durable object-storage URL.",
+                )
         except HTTPException:
             raise
         except Exception as error:
@@ -5346,17 +5440,18 @@ async def get_clip_video(clip_id: str, download: int = 0):
     )
     if not clip:
         raise HTTPException(status_code=404, detail="Clip not found.")
-
-    resolved_video_path = _resolve_allowed_video_path(clip.get("video_path", ""))
-
-    if download == 1:
-        return FileResponse(
-            path=str(resolved_video_path),
-            media_type="video/mp4",
-            filename=_build_safe_download_filename(clip, clip_id),
+    durable_url = str(clip.get("durable_url") or "").strip()
+    if durable_url:
+        print(
+            "MEDIA TRANSFER SKIPPED | "
+            "reason=direct_r2_url | "
+            f"clip_id={clip_id}"
         )
-
-    return FileResponse(path=str(resolved_video_path), media_type="video/mp4")
+        return RedirectResponse(durable_url)
+    raise HTTPException(
+        status_code=410,
+        detail="This clip has no durable object-storage URL.",
+    )
 
 
 @app.post("/api/publish")
@@ -5465,7 +5560,13 @@ async def publish_clip_to_tiktok(clip: dict):
     print("TIKTOK DRAFT UPLOAD START | clip_id=" + str(matching_clip.get("id")))
     temporary_publish_path: Path | None = None
     try:
-        if not video_path or not Path(video_path).is_file():
+        try:
+            tiktok_result = await upload_tiktok_draft(
+                video_path if Path(video_path).is_file() else "",
+                durable_url,
+                str(matching_clip.get("id") or ""),
+            )
+        except _TikTokPullFromUrlUnavailable:
             downloads_dir = (BASE_DIR / "downloads").resolve()
             downloads_dir.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
@@ -5484,7 +5585,11 @@ async def publish_clip_to_tiktok(clip: dict):
             if temporary_publish_path.stat().st_size <= 0:
                 raise RuntimeError("Durable media download was empty.")
             video_path = str(temporary_publish_path)
-        tiktok_result = await upload_tiktok_draft(video_path)
+            tiktok_result = await upload_tiktok_draft(
+                video_path,
+                "",
+                str(matching_clip.get("id") or ""),
+            )
     except Exception as error:
         restored = _restore_clip_after_publish_failure(matching_clip)
         print(

@@ -10,6 +10,7 @@ function UnpublishedQueue({ styles }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [editing, setEditing] = useState({});
+  const [previewClipId, setPreviewClipId] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -84,12 +85,31 @@ function UnpublishedQueue({ styles }) {
             const draft = editing[clip.id] ?? clip.ai_tiktok_description ?? "";
             return (
               <article key={clip.id} style={styles.clipCard}>
-                <video
-                  controls
-                  preload="metadata"
-                  src={clip.durable_url || `${API_BASE_URL}/api/clips/${clip.id}/video`}
-                  style={{ width: "100%", aspectRatio: "9 / 16", background: "#000" }}
-                />
+                {previewClipId === clip.id && clip.durable_url ? (
+                  <video
+                    controls
+                    preload="none"
+                    src={clip.durable_url}
+                    style={{
+                      width: "100%",
+                      aspectRatio: "9 / 16",
+                      background: "#000",
+                    }}
+                  />
+                ) : (
+                  <button
+                    disabled={!clip.durable_url}
+                    onClick={() => setPreviewClipId(clip.id)}
+                    style={{
+                      width: "100%",
+                      aspectRatio: "9 / 16",
+                      background: "#000",
+                      color: "#fff",
+                    }}
+                  >
+                    {clip.durable_url ? "Load preview" : "Preview unavailable"}
+                  </button>
+                )}
                 <h3>{clip.title || "Untitled clip"}</h3>
                 <p>{clip.creator} · {clip.duration_profile || "short"} · {clip.status}</p>
                 <p>

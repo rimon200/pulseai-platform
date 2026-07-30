@@ -144,11 +144,6 @@ function AIClips({ styles }) {
     }
   };
 
-  const getClipVideoUrl = (clipId, download = false) =>
-    `${API_BASE_URL}/api/clips/${encodeURIComponent(clipId)}/video${
-      download ? "?download=1" : ""
-    }`;
-
   const togglePreview = (clipId) => {
     if (!clipId) {
       return;
@@ -398,11 +393,11 @@ return (
     overflow: "hidden",
   }}
 >
-  {previewClipId === clip.id && clip.id ? (
+  {previewClipId === clip.id && clip.durable_url ? (
     <video
-      src={getClipVideoUrl(clip.id)}
+      src={clip.durable_url}
       controls
-      preload="metadata"
+      preload="none"
       onError={() => handlePreviewError(clip.id)}
       style={{
         width: "100%",
@@ -457,19 +452,21 @@ return (
 
 <button
   onClick={() => togglePreview(clip.id)}
-  disabled={!clip.id}
+  disabled={!clip.id || !clip.durable_url}
   style={{
     ...styles.secondaryButton,
-    opacity: clip.id ? 1 : 0.6,
-    cursor: clip.id ? "pointer" : "not-allowed",
+    opacity: clip.id && clip.durable_url ? 1 : 0.6,
+    cursor: clip.id && clip.durable_url ? "pointer" : "not-allowed",
   }}
 >
   {previewClipId === clip.id ? "Hide Preview" : "Preview"}
 </button>
 
-{clip.id ? (
+{clip.durable_url ? (
   <a
-    href={getClipVideoUrl(clip.id, true)}
+    href={clip.durable_url}
+    target="_blank"
+    rel="noreferrer"
     style={{ ...styles.secondaryButton, textDecoration: "none", display: "inline-block" }}
   >
     Download

@@ -37,8 +37,16 @@ def upload_video(video_path: str, clip_id: str) -> dict[str, str]:
     safe_clip_id = "".join(
         character for character in clip_id if character.isalnum() or character in "_-"
     )
+    if not safe_clip_id:
+        raise ValueError("Object storage upload requires a safe clip identifier.")
     object_key = f"clips/{safe_clip_id}/{digest}.mp4"
-    print(f"OBJECT STORAGE UPLOAD START | clip_id={safe_clip_id} | key={object_key}")
+    video_size = path.stat().st_size
+    public_base_url = os.getenv("OBJECT_STORAGE_PUBLIC_BASE_URL", "").rstrip("/")
+    durable_url = (
+        f"{public_base_url}/{quote(object_key)}"
+        if public_base_url
+        else ""
+    )
     try:
         client = boto3.client(
             "s3",
@@ -47,11 +55,58 @@ def upload_video(video_path: str, clip_id: str) -> dict[str, str]:
             aws_access_key_id=required["aws_access_key_id"],
             aws_secret_access_key=required["aws_secret_access_key"],
         )
+        try:
+            existing = client.head_object(
+                Bucket=required["bucket"],
+                Key=object_key,
+            )
+            existing_size = int(existing.get("ContentLength") or 0)
+            if existing_size == video_size:
+                print(
+                    "MEDIA TRANSFER SKIPPED | "
+                    "reason=object_already_exists | "
+                    f"clip_id={safe_clip_id} | bytes={video_size}"
+                )
+                return {
+                    "object_key": object_key,
+                    "durable_url": durable_url,
+                }
+            raise RuntimeError(
+                "Existing object size does not match the final clip."
+            )
+        except Exception as error:
+            error_response = getattr(error, "response", {})
+            status_code = int(
+                error_response.get("ResponseMetadata", {}).get(
+                    "HTTPStatusCode",
+                    0,
+                )
+                or 0
+            )
+            error_code = str(
+                error_response.get("Error", {}).get("Code") or ""
+            )
+            if status_code != 404 and error_code not in {
+                "404",
+                "NoSuchKey",
+                "NotFound",
+            }:
+                raise
+        print(
+            "OBJECT STORAGE UPLOAD START | "
+            f"clip_id={safe_clip_id} | key={object_key}"
+        )
         client.upload_file(
             str(path),
             required["bucket"],
             object_key,
             ExtraArgs={"ContentType": "video/mp4"},
+        )
+        print(
+            "MEDIA TRANSFER | "
+            "direction=outbound | destination=r2 | "
+            "purpose=final_clip_upload | "
+            f"clip_id={safe_clip_id} | bytes={video_size} | duplicate=false"
         )
     except Exception as error:
         print(
@@ -59,12 +114,6 @@ def upload_video(video_path: str, clip_id: str) -> dict[str, str]:
             f"clip_id={safe_clip_id} | key={object_key} | error={error!r}"
         )
         raise
-    public_base_url = os.getenv("OBJECT_STORAGE_PUBLIC_BASE_URL", "").rstrip("/")
-    durable_url = (
-        f"{public_base_url}/{quote(object_key)}"
-        if public_base_url
-        else ""
-    )
     print(f"OBJECT STORAGE UPLOAD COMPLETE | clip_id={safe_clip_id} | key={object_key}")
     return {"object_key": object_key, "durable_url": durable_url}
 

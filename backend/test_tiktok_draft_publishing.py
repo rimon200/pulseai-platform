@@ -5,7 +5,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, mock_open, patch
+from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 from fastapi import HTTPException
 
@@ -74,13 +74,62 @@ class TikTokDraftPublishingTests(unittest.IsolatedAsyncioTestCase):
 
         creator_info.assert_not_awaited()
         claim.assert_called_once()
-        upload.assert_awaited_once_with(str(self.video_path))
+        upload.assert_awaited_once_with(
+            str(self.video_path),
+            "",
+            "fake-generated-clip",
+        )
         mark_uploaded.assert_called_once()
         self.assertEqual(
             mark_uploaded.call_args.args[1],
             "fake-publish-id",
         )
         self.assertTrue(result["success"])
+
+    async def test_draft_prefers_tiktok_pull_from_r2(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "data": {"publish_id": "fake-pull-id"},
+            "error": {"code": "ok"},
+        }
+        client = MagicMock()
+        client.post = AsyncMock(return_value=response)
+        client.put = AsyncMock()
+        client_context = MagicMock()
+        client_context.__aenter__ = AsyncMock(return_value=client)
+        client_context.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(
+            main,
+            "_load_provider_token_data",
+            return_value={"access_token": "fake-token"},
+        ):
+            with patch.object(
+                main,
+                "_extract_tiktok_token_fields",
+                return_value={"access_token": "fake-token"},
+            ):
+                with patch.object(
+                    main,
+                    "_is_tiktok_access_token_expiring",
+                    return_value=False,
+                ):
+                    with patch.object(
+                        main.httpx,
+                        "AsyncClient",
+                        return_value=client_context,
+                    ):
+                        result = await main.upload_tiktok_draft(
+                            "",
+                            "https://media.invalid/clips/fake.mp4",
+                        )
+        self.assertEqual(result["publish_id"], "fake-pull-id")
+        self.assertEqual(result["transfer_method"], "PULL_FROM_URL")
+        client.put.assert_not_awaited()
+        self.assertEqual(
+            client.post.await_args.kwargs["json"]["source_info"]["source"],
+            "PULL_FROM_URL",
+        )
 
     async def test_direct_post_still_requires_creator_info(self):
         creator_error = HTTPException(
