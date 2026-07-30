@@ -20,15 +20,28 @@ JOB_ADVISORY_LOCK_ID = 22616960936427851
 EMBEDDED_WORKER_ADVISORY_LOCK_ID = 22616960936427852
 
 
-def _automatic_success_today_predicate(alias: str = "") -> str:
+def _trusted_automatic_job_predicate(alias: str = "") -> str:
     prefix = f"{alias}." if alias else ""
     return (
         f"{prefix}trigger_type = 'automatic' "
+        f"AND {prefix}requested_creator_id IS NOT NULL "
+        f"AND {prefix}eligibility_stream_id IS NOT NULL"
+    )
+
+
+def _automatic_success_today_predicate(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"{_trusted_automatic_job_predicate(alias)} "
         f"AND {prefix}status = 'completed' "
         f"AND {prefix}outcome = 'clip_created' "
         f"AND {prefix}result_clip_id IS NOT NULL "
-        f"AND ({prefix}completed_at AT TIME ZONE %s)::date = "
-        "(NOW() AT TIME ZONE %s)::date"
+        "AND EXISTS ("
+        "SELECT 1 FROM twitch_clip_history AS generated_clip "
+        f"WHERE generated_clip.generated_clip_id = {prefix}result_clip_id "
+        "AND generated_clip.generated_at IS NOT NULL "
+        "AND (generated_clip.generated_at AT TIME ZONE %s)::date = "
+        "(NOW() AT TIME ZONE %s)::date)"
     )
 
 
@@ -219,15 +232,15 @@ def automatic_usage_snapshot(
                 f"""
                 SELECT
                     COUNT(*) FILTER (
-                        WHERE trigger_type = 'automatic'
+                        WHERE {_trusted_automatic_job_predicate()}
                           AND (created_at AT TIME ZONE %s)::date =
                               (NOW() AT TIME ZONE %s)::date
                     ) AS automatic_jobs_enqueued_today,
-                    COUNT(*) FILTER (
+                    COUNT(DISTINCT result_clip_id) FILTER (
                         WHERE {_automatic_success_today_predicate()}
                     ) AS automatic_clips_created_today,
                     COALESCE(SUM(estimated_outbound_bytes) FILTER (
-                        WHERE trigger_type = 'automatic'
+                        WHERE {_trusted_automatic_job_predicate()}
                           AND (created_at AT TIME ZONE %s)::date =
                               (NOW() AT TIME ZONE %s)::date
                     ), 0) AS estimated_outbound_bytes,
@@ -278,7 +291,7 @@ def automatic_usage_snapshot(
                 cursor.execute(
                     f"""
                     SELECT
-                        COUNT(*) FILTER (
+                        COUNT(DISTINCT result_clip_id) FILTER (
                             WHERE {_automatic_success_today_predicate()}
                         ) AS creator_clips_created,
                         MAX(created_at) FILTER (
@@ -385,15 +398,15 @@ def enqueue_eligible_automatic_job(
                 f"""
                 SELECT
                     COUNT(*) FILTER (
-                        WHERE trigger_type = 'automatic'
+                        WHERE {_trusted_automatic_job_predicate()}
                           AND (created_at AT TIME ZONE %s)::date =
                               (NOW() AT TIME ZONE %s)::date
                     ) AS daily_jobs,
-                    COUNT(*) FILTER (
+                    COUNT(DISTINCT result_clip_id) FILTER (
                         WHERE {_automatic_success_today_predicate()}
                     ) AS daily_clips,
                     COALESCE(SUM(estimated_outbound_bytes) FILTER (
-                        WHERE trigger_type = 'automatic'
+                        WHERE {_trusted_automatic_job_predicate()}
                           AND (created_at AT TIME ZONE %s)::date =
                               (NOW() AT TIME ZONE %s)::date
                     ), 0) AS estimated_bytes
@@ -412,7 +425,7 @@ def enqueue_eligible_automatic_job(
             cursor.execute(
                 f"""
                 SELECT
-                    COUNT(*) FILTER (
+                    COUNT(DISTINCT result_clip_id) FILTER (
                         WHERE {_automatic_success_today_predicate()}
                     ) AS daily_creator_clips,
                     MAX(created_at) AS last_enqueue

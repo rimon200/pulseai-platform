@@ -5548,6 +5548,19 @@ async def get_automation_status():
             status_code=503,
             detail="Automation status is unavailable.",
         ) from error
+    automatic_jobs_enqueued_today = int(
+        usage.get("automatic_jobs_enqueued_today") or 0
+    )
+    automatic_clips_created_today = int(
+        usage.get("automatic_clips_created_today") or 0
+    )
+    print(
+        "AUTOMATION COUNTER DIAGNOSTIC | "
+        f"automatic_jobs_enqueued_today={automatic_jobs_enqueued_today} | "
+        f"automatic_clips_created_today={automatic_clips_created_today} | "
+        f"unique_result_clip_ids={automatic_clips_created_today} | "
+        f"timezone={workspace_timezone}"
+    )
     return {
         "enabled": (
             os.getenv(
@@ -5556,15 +5569,9 @@ async def get_automation_status():
             ).strip().lower()
             == "true"
         ),
-        "automatic_jobs_enqueued_today": int(
-            usage.get("automatic_jobs_enqueued_today") or 0
-        ),
-        "automatic_clips_created_today": int(
-            usage.get("automatic_clips_created_today") or 0
-        ),
-        "clips_created_today": int(
-            usage.get("automatic_clips_created_today") or 0
-        ),
+        "automatic_jobs_enqueued_today": automatic_jobs_enqueued_today,
+        "automatic_clips_created_today": automatic_clips_created_today,
+        "clips_created_today": automatic_clips_created_today,
         "daily_clip_limit": config["global_daily_limit"],
         "estimated_outbound_mb_today": round(
             int(usage.get("estimated_outbound_bytes") or 0) / 1048576,

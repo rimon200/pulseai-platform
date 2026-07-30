@@ -163,6 +163,38 @@ class AutomaticSchedulerUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 202)
         enqueue.assert_called_once_with("manual")
 
+    async def test_automation_status_emits_counter_diagnostic(self):
+        output = io.StringIO()
+        original_ready = getattr(main.app.state, "clip_history_ready", False)
+        main.app.state.clip_history_ready = True
+        try:
+            with (
+                patch.object(main, "DATABASE_URL", "postgresql://not-used"),
+                patch.object(
+                    main,
+                    "_automatic_workspace_timezone",
+                    return_value="America/New_York",
+                ),
+                patch.object(
+                    main,
+                    "automatic_usage_snapshot",
+                    return_value={
+                        "automatic_jobs_enqueued_today": 4,
+                        "automatic_clips_created_today": 1,
+                    },
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                payload = await main.get_automation_status()
+        finally:
+            main.app.state.clip_history_ready = original_ready
+        self.assertEqual(payload["automatic_jobs_enqueued_today"], 4)
+        self.assertEqual(payload["automatic_clips_created_today"], 1)
+        diagnostic = output.getvalue()
+        self.assertIn("AUTOMATION COUNTER DIAGNOSTIC", diagnostic)
+        self.assertIn("unique_result_clip_ids=1", diagnostic)
+        self.assertIn("timezone=America/New_York", diagnostic)
+
 
 @unittest.skipUnless(
     os.getenv("TEST_DATABASE_URL", "").strip(),
@@ -214,6 +246,19 @@ class AutomaticSchedulerPostgreSQLTests(unittest.TestCase):
 
     def setUp(self):
         self.assertTrue(generation_jobs.ensure_generation_jobs_table())
+        import psycopg
+
+        with psycopg.connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS twitch_clip_history (
+                        generated_clip_id TEXT,
+                        generated_at TIMESTAMPTZ
+                    )
+                    """
+                )
+            connection.commit()
 
     def tearDown(self):
         import psycopg
@@ -225,6 +270,7 @@ class AutomaticSchedulerPostgreSQLTests(unittest.TestCase):
                     "clip_generation_jobs"
                 )
                 cursor.execute("TRUNCATE auto_clip_automation_state")
+                cursor.execute("TRUNCATE twitch_clip_history")
             connection.commit()
 
     def _enqueue(self, creator_id="creator-1", **overrides):
@@ -245,12 +291,26 @@ class AutomaticSchedulerPostgreSQLTests(unittest.TestCase):
     def _complete(self, job, outcome="clip_created"):
         claimed = generation_jobs.claim_generation_job("test-worker")
         self.assertEqual(str(claimed["id"]), str(job["id"]))
-        return generation_jobs.complete_generation_job(
+        completed = generation_jobs.complete_generation_job(
             str(job["id"]),
             "test-worker",
             "fake-clip" if outcome == "clip_created" else None,
             outcome=outcome,
         )
+        if outcome == "clip_created":
+            import psycopg
+
+            with psycopg.connect(self.database_url) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        INSERT INTO twitch_clip_history (
+                            generated_clip_id, generated_at
+                        ) VALUES ('fake-clip', NOW())
+                        """
+                    )
+                connection.commit()
+        return completed
 
     def test_repeated_and_deferred_jobs_block_enqueue(self):
         first, reason, _ = self._enqueue()
@@ -367,11 +427,13 @@ class AutomaticSchedulerPostgreSQLTests(unittest.TestCase):
                         """
                         INSERT INTO clip_generation_jobs (
                             id, status, trigger_type, requested_creator,
-                            requested_creator_id, result_clip_id, outcome,
+                            requested_creator_id, eligibility_stream_id,
+                            result_clip_id, outcome,
                             created_at, completed_at
                         ) VALUES (
                             %s, %s, %s, 'fake_creator', 'creator-1',
-                            %s, %s, NOW() + (%s * INTERVAL '1 day'),
+                            'fake-stream', %s, %s,
+                            NOW() + (%s * INTERVAL '1 day'),
                             NOW() + (%s * INTERVAL '1 day')
                         )
                         """,
@@ -385,6 +447,15 @@ class AutomaticSchedulerPostgreSQLTests(unittest.TestCase):
                             day_offset,
                         ),
                     )
+                cursor.execute(
+                    """
+                    INSERT INTO twitch_clip_history (
+                        generated_clip_id, generated_at
+                    ) VALUES
+                        ('real-clip', NOW()),
+                        ('yesterday-clip', NOW() - INTERVAL '1 day')
+                    """
+                )
             connection.commit()
         usage = generation_jobs.automatic_usage_snapshot(
             "creator-1",
@@ -435,10 +506,11 @@ class AutomaticSchedulerPostgreSQLTests(unittest.TestCase):
                         """
                         INSERT INTO clip_generation_jobs (
                             id, status, trigger_type, requested_creator_id,
-                            result_clip_id, outcome, created_at, completed_at
+                            eligibility_stream_id, result_clip_id, outcome,
+                            created_at, completed_at
                         ) VALUES (
                             %s, 'completed', 'automatic', 'creator-1',
-                            %s, 'clip_created', %s, %s
+                            'fake-stream', %s, 'clip_created', %s, %s
                         )
                         """,
                         (
@@ -448,11 +520,64 @@ class AutomaticSchedulerPostgreSQLTests(unittest.TestCase):
                             completed_at,
                         ),
                     )
+                    cursor.execute(
+                        """
+                        INSERT INTO twitch_clip_history (
+                            generated_clip_id, generated_at
+                        ) VALUES (%s, %s)
+                        """,
+                        (clip_id, completed_at),
+                    )
             connection.commit()
         usage = generation_jobs.automatic_usage_snapshot(
             "creator-1",
             workspace_timezone,
         )
+        self.assertEqual(usage["automatic_clips_created_today"], 1)
+        self.assertEqual(usage["creator_clips_created"], 1)
+
+    def test_duplicate_nonexistent_and_legacy_results_are_excluded(self):
+        import psycopg
+
+        with psycopg.connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO twitch_clip_history (
+                        generated_clip_id, generated_at
+                    ) VALUES ('one-real-clip', NOW())
+                    """
+                )
+                for result_clip_id, creator_id, stream_id in (
+                    ("one-real-clip", "creator-1", "stream-1"),
+                    ("one-real-clip", "creator-1", "stream-1"),
+                    ("missing-clip", "creator-1", "stream-1"),
+                    ("legacy-clip", None, None),
+                ):
+                    cursor.execute(
+                        """
+                        INSERT INTO clip_generation_jobs (
+                            id, status, trigger_type, requested_creator_id,
+                            eligibility_stream_id, result_clip_id, outcome,
+                            created_at, completed_at
+                        ) VALUES (
+                            %s, 'completed', 'automatic', %s, %s, %s,
+                            'clip_created', NOW(), NOW()
+                        )
+                        """,
+                        (
+                            uuid.uuid4(),
+                            creator_id,
+                            stream_id,
+                            result_clip_id,
+                        ),
+                    )
+            connection.commit()
+        usage = generation_jobs.automatic_usage_snapshot(
+            "creator-1",
+            "UTC",
+        )
+        self.assertEqual(usage["automatic_jobs_enqueued_today"], 3)
         self.assertEqual(usage["automatic_clips_created_today"], 1)
         self.assertEqual(usage["creator_clips_created"], 1)
 
