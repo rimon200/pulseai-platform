@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 import subprocess
 import traceback
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from download_service import DownloadService
 import asyncio
 import time
@@ -1470,6 +1471,35 @@ def _automatic_scheduler_config() -> dict[str, int]:
     }
 
 
+def _automatic_workspace_timezone() -> str:
+    configured_timezone = os.getenv("AUTO_PUBLISH_TIMEZONE", "UTC").strip()
+    if DATABASE_URL:
+        try:
+            import psycopg
+
+            with psycopg.connect(DATABASE_URL) as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT timezone FROM pulseai_settings
+                        WHERE singleton = TRUE
+                        """
+                    )
+                    row = cursor.fetchone()
+                    if row and row[0]:
+                        configured_timezone = str(row[0]).strip()
+        except Exception as error:
+            print(
+                "AUTO GENERATION TIMEZONE FALLBACK | "
+                f"error={error.__class__.__name__}"
+            )
+    try:
+        ZoneInfo(configured_timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        return "UTC"
+    return configured_timezone
+
+
 def _automatic_stream_material(
     channel_data: dict[str, Any],
     usage: dict[str, Any],
@@ -1529,6 +1559,7 @@ def _automatic_stream_material(
 
 async def _run_smart_automatic_scheduler_pass() -> None:
     config = _automatic_scheduler_config()
+    workspace_timezone = _automatic_workspace_timezone()
     creators = load_creators()
     for creator in creators:
         creator_login = str(creator.get("channel") or "")
@@ -1537,7 +1568,10 @@ async def _run_smart_automatic_scheduler_pass() -> None:
             creator_id = str(channel_data.get("user_id") or "")
             if not creator_id:
                 continue
-            usage = automatic_usage_snapshot(creator_id)
+            usage = automatic_usage_snapshot(
+                creator_id,
+                workspace_timezone,
+            )
             stream_id, range_end, new_material_seconds = (
                 _automatic_stream_material(channel_data, usage)
             )
@@ -1575,6 +1609,7 @@ async def _run_smart_automatic_scheduler_pass() -> None:
                 global_daily_limit=config["global_daily_limit"],
                 cooldown_minutes=config["cooldown_minutes"],
                 outbound_daily_budget_bytes=config["outbound_budget_bytes"],
+                workspace_timezone=workspace_timezone,
             )
             if job is None:
                 print(
@@ -1593,7 +1628,9 @@ async def _run_smart_automatic_scheduler_pass() -> None:
                 f"creator={creator_login or 'unknown'} | "
                 f"reason=scheduler_error | error={error!r}"
             )
-    summary = automatic_usage_snapshot()
+    summary = automatic_usage_snapshot(
+        workspace_timezone=workspace_timezone,
+    )
     print(
         "AUTO GENERATION DAILY SUMMARY | "
         f"jobs_enqueued={int(summary.get('jobs_enqueued') or 0)} | "
@@ -5500,8 +5537,11 @@ async def get_automation_status():
             detail="Automation status is unavailable.",
         )
     config = _automatic_scheduler_config()
+    workspace_timezone = _automatic_workspace_timezone()
     try:
-        usage = automatic_usage_snapshot()
+        usage = automatic_usage_snapshot(
+            workspace_timezone=workspace_timezone,
+        )
     except Exception as error:
         print(f"AUTO GENERATION STATUS FAILED | error={error!r}")
         raise HTTPException(
@@ -5516,7 +5556,15 @@ async def get_automation_status():
             ).strip().lower()
             == "true"
         ),
-        "clips_created_today": int(usage.get("clips_created") or 0),
+        "automatic_jobs_enqueued_today": int(
+            usage.get("automatic_jobs_enqueued_today") or 0
+        ),
+        "automatic_clips_created_today": int(
+            usage.get("automatic_clips_created_today") or 0
+        ),
+        "clips_created_today": int(
+            usage.get("automatic_clips_created_today") or 0
+        ),
         "daily_clip_limit": config["global_daily_limit"],
         "estimated_outbound_mb_today": round(
             int(usage.get("estimated_outbound_bytes") or 0) / 1048576,

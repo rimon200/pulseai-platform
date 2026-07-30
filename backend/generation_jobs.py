@@ -20,6 +20,18 @@ JOB_ADVISORY_LOCK_ID = 22616960936427851
 EMBEDDED_WORKER_ADVISORY_LOCK_ID = 22616960936427852
 
 
+def _automatic_success_today_predicate(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"{prefix}trigger_type = 'automatic' "
+        f"AND {prefix}status = 'completed' "
+        f"AND {prefix}outcome = 'clip_created' "
+        f"AND {prefix}result_clip_id IS NOT NULL "
+        f"AND ({prefix}completed_at AT TIME ZONE %s)::date = "
+        "(NOW() AT TIME ZONE %s)::date"
+    )
+
+
 def _database_url() -> str:
     return os.getenv("DATABASE_URL", "").strip()
 
@@ -193,6 +205,7 @@ def enqueue_generation_job(
 
 def automatic_usage_snapshot(
     creator_id: str | None = None,
+    workspace_timezone: str = "UTC",
 ) -> dict[str, Any]:
     database_url = _database_url()
     if not database_url:
@@ -203,20 +216,20 @@ def automatic_usage_snapshot(
     with psycopg.connect(database_url, row_factory=dict_row) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                """
+                f"""
                 SELECT
                     COUNT(*) FILTER (
                         WHERE trigger_type = 'automatic'
-                          AND created_at >= date_trunc('day', NOW())
-                    ) AS jobs_enqueued,
+                          AND (created_at AT TIME ZONE %s)::date =
+                              (NOW() AT TIME ZONE %s)::date
+                    ) AS automatic_jobs_enqueued_today,
                     COUNT(*) FILTER (
-                        WHERE trigger_type = 'automatic'
-                          AND outcome = 'clip_created'
-                          AND completed_at >= date_trunc('day', NOW())
-                    ) AS clips_created,
+                        WHERE {_automatic_success_today_predicate()}
+                    ) AS automatic_clips_created_today,
                     COALESCE(SUM(estimated_outbound_bytes) FILTER (
                         WHERE trigger_type = 'automatic'
-                          AND created_at >= date_trunc('day', NOW())
+                          AND (created_at AT TIME ZONE %s)::date =
+                              (NOW() AT TIME ZONE %s)::date
                     ), 0) AS estimated_outbound_bytes,
                     COALESCE(SUM(actual_outbound_bytes) FILTER (
                         WHERE trigger_type = 'automatic'
@@ -230,29 +243,43 @@ def automatic_usage_snapshot(
                         WHERE trigger_type = 'automatic'
                     ) AS last_automatic_run
                 FROM clip_generation_jobs
-                """
+                """,
+                (
+                    workspace_timezone,
+                    workspace_timezone,
+                    workspace_timezone,
+                    workspace_timezone,
+                    workspace_timezone,
+                    workspace_timezone,
+                ),
             )
             snapshot = dict(cursor.fetchone())
+            snapshot["jobs_enqueued"] = snapshot[
+                "automatic_jobs_enqueued_today"
+            ]
+            snapshot["clips_created"] = snapshot[
+                "automatic_clips_created_today"
+            ]
             cursor.execute(
                 """
                 SELECT COALESCE(SUM(transfer.bytes), 0) AS actual_outbound_bytes
                 FROM clip_generation_outbound_transfers AS transfer
                 JOIN clip_generation_jobs AS job ON job.id = transfer.job_id
                 WHERE job.trigger_type = 'automatic'
-                  AND transfer.created_at >= date_trunc('day', NOW())
-                """
+                  AND (transfer.created_at AT TIME ZONE %s)::date =
+                      (NOW() AT TIME ZONE %s)::date
+                """,
+                (workspace_timezone, workspace_timezone),
             )
             snapshot["actual_outbound_bytes"] = int(
                 cursor.fetchone()["actual_outbound_bytes"]
             )
             if creator_id:
                 cursor.execute(
-                    """
+                    f"""
                     SELECT
                         COUNT(*) FILTER (
-                            WHERE trigger_type = 'automatic'
-                              AND outcome = 'clip_created'
-                              AND completed_at >= date_trunc('day', NOW())
+                            WHERE {_automatic_success_today_predicate()}
                         ) AS creator_clips_created,
                         MAX(created_at) FILTER (
                             WHERE trigger_type = 'automatic'
@@ -260,7 +287,11 @@ def automatic_usage_snapshot(
                     FROM clip_generation_jobs
                     WHERE requested_creator_id = %s
                     """,
-                    (creator_id,),
+                    (
+                        workspace_timezone,
+                        workspace_timezone,
+                        creator_id,
+                    ),
                 )
                 snapshot.update(dict(cursor.fetchone()))
                 cursor.execute(
@@ -327,6 +358,7 @@ def enqueue_eligible_automatic_job(
     global_daily_limit: int,
     cooldown_minutes: int,
     outbound_daily_budget_bytes: int,
+    workspace_timezone: str = "UTC",
 ) -> tuple[dict[str, Any] | None, str, dict[str, Any]]:
     database_url = _database_url()
     if not database_url:
@@ -350,38 +382,49 @@ def enqueue_eligible_automatic_job(
             )
             active_count = int(cursor.fetchone()["active_count"])
             cursor.execute(
-                """
+                f"""
                 SELECT
                     COUNT(*) FILTER (
                         WHERE trigger_type = 'automatic'
-                          AND created_at >= date_trunc('day', NOW())
+                          AND (created_at AT TIME ZONE %s)::date =
+                              (NOW() AT TIME ZONE %s)::date
                     ) AS daily_jobs,
                     COUNT(*) FILTER (
-                        WHERE trigger_type = 'automatic'
-                          AND outcome = 'clip_created'
-                          AND completed_at >= date_trunc('day', NOW())
+                        WHERE {_automatic_success_today_predicate()}
                     ) AS daily_clips,
                     COALESCE(SUM(estimated_outbound_bytes) FILTER (
                         WHERE trigger_type = 'automatic'
-                          AND created_at >= date_trunc('day', NOW())
+                          AND (created_at AT TIME ZONE %s)::date =
+                              (NOW() AT TIME ZONE %s)::date
                     ), 0) AS estimated_bytes
                 FROM clip_generation_jobs
-                """
+                """,
+                (
+                    workspace_timezone,
+                    workspace_timezone,
+                    workspace_timezone,
+                    workspace_timezone,
+                    workspace_timezone,
+                    workspace_timezone,
+                ),
             )
             global_usage = dict(cursor.fetchone())
             cursor.execute(
-                """
+                f"""
                 SELECT
                     COUNT(*) FILTER (
-                        WHERE outcome = 'clip_created'
-                          AND completed_at >= date_trunc('day', NOW())
+                        WHERE {_automatic_success_today_predicate()}
                     ) AS daily_creator_clips,
                     MAX(created_at) AS last_enqueue
                 FROM clip_generation_jobs
                 WHERE trigger_type = 'automatic'
                   AND requested_creator_id = %s
                 """,
-                (creator_id,),
+                (
+                    workspace_timezone,
+                    workspace_timezone,
+                    creator_id,
+                ),
             )
             creator_usage = dict(cursor.fetchone())
             cursor.execute(

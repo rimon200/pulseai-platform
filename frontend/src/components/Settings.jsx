@@ -114,7 +114,7 @@ function Settings() {
           <>
             <p>Status: {automation.enabled ? "Enabled" : "Disabled"}</p>
             <p>
-              Clips today: {automation.clips_created_today}
+              Automatic clips today: {automation.automatic_clips_created_today}
               {" / "}{automation.daily_clip_limit}
             </p>
             <p>

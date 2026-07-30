@@ -8,6 +8,7 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
 import generation_jobs
 import main
@@ -333,6 +334,127 @@ class AutomaticSchedulerPostgreSQLTests(unittest.TestCase):
         usage = generation_jobs.automatic_usage_snapshot("creator-2")
         self.assertEqual(usage["clips_created"], 1)
         self.assertEqual(usage["creator_clips_created"], 0)
+
+    def test_dashboard_count_uses_strict_success_predicate(self):
+        import psycopg
+
+        rows = [
+            ("manual", "completed", "clip_created", "manual-clip", 0),
+            ("automatic", "completed", "no_clip_found", None, 0),
+            ("automatic", "failed", "clip_created", "failed-clip", 0),
+            (
+                "automatic",
+                "deferred_memory",
+                "clip_created",
+                "deferred-clip",
+                0,
+            ),
+            ("automatic", "queued", "clip_created", "queued-clip", 0),
+            ("automatic", "completed", "clip_created", None, 0),
+            ("automatic", "completed", "clip_created", "real-clip", 0),
+            (
+                "automatic",
+                "completed",
+                "clip_created",
+                "yesterday-clip",
+                -1,
+            ),
+        ]
+        with psycopg.connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                for trigger, status, outcome, clip_id, day_offset in rows:
+                    cursor.execute(
+                        """
+                        INSERT INTO clip_generation_jobs (
+                            id, status, trigger_type, requested_creator,
+                            requested_creator_id, result_clip_id, outcome,
+                            created_at, completed_at
+                        ) VALUES (
+                            %s, %s, %s, 'fake_creator', 'creator-1',
+                            %s, %s, NOW() + (%s * INTERVAL '1 day'),
+                            NOW() + (%s * INTERVAL '1 day')
+                        )
+                        """,
+                        (
+                            uuid.uuid4(),
+                            status,
+                            trigger,
+                            clip_id,
+                            outcome,
+                            day_offset,
+                            day_offset,
+                        ),
+                    )
+            connection.commit()
+        usage = generation_jobs.automatic_usage_snapshot(
+            "creator-1",
+            "UTC",
+        )
+        self.assertEqual(usage["automatic_jobs_enqueued_today"], 6)
+        self.assertEqual(usage["automatic_clips_created_today"], 1)
+        self.assertEqual(usage["creator_clips_created"], 1)
+
+        with psycopg.connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    DELETE FROM clip_generation_jobs
+                    WHERE result_clip_id IS DISTINCT FROM 'real-clip'
+                    """
+                )
+            connection.commit()
+        blocked, reason, scheduler_usage = self._enqueue(
+            creator_id="creator-2",
+            global_daily_limit=1,
+            cooldown_minutes=0,
+            workspace_timezone="UTC",
+        )
+        self.assertIsNone(blocked)
+        self.assertEqual(reason, "global_daily_limit")
+        self.assertEqual(scheduler_usage["daily_clips"], 1)
+
+    def test_workspace_timezone_date_boundary(self):
+        import psycopg
+
+        workspace_timezone = "America/Los_Angeles"
+        zone = ZoneInfo(workspace_timezone)
+        local_today = datetime.now(zone).date()
+        local_midnight = datetime.combine(
+            local_today,
+            datetime.min.time(),
+            tzinfo=zone,
+        )
+        instants = (
+            ("inside-today", local_midnight + timedelta(minutes=1)),
+            ("outside-today", local_midnight - timedelta(minutes=1)),
+        )
+        with psycopg.connect(self.database_url) as connection:
+            with connection.cursor() as cursor:
+                for clip_id, completed_at in instants:
+                    cursor.execute(
+                        """
+                        INSERT INTO clip_generation_jobs (
+                            id, status, trigger_type, requested_creator_id,
+                            result_clip_id, outcome, created_at, completed_at
+                        ) VALUES (
+                            %s, 'completed', 'automatic', 'creator-1',
+                            %s, 'clip_created', %s, %s
+                        )
+                        """,
+                        (
+                            uuid.uuid4(),
+                            clip_id,
+                            completed_at,
+                            completed_at,
+                        ),
+                    )
+            connection.commit()
+        usage = generation_jobs.automatic_usage_snapshot(
+            "creator-1",
+            workspace_timezone,
+        )
+        self.assertEqual(usage["automatic_clips_created_today"], 1)
+        self.assertEqual(usage["creator_clips_created"], 1)
 
     def test_simultaneous_scheduler_claims_create_one_job(self):
         results = []

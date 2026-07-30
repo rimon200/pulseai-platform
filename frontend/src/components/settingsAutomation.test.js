@@ -10,7 +10,8 @@ const source = readFileSync(
 test("Settings loads the bandwidth-aware automation status endpoint", () => {
   assert.match(source, /\/api\/settings\/automation/);
   assert.match(source, /automation\.enabled/);
-  assert.match(source, /automation\.clips_created_today/);
+  assert.match(source, /Automatic clips today:/);
+  assert.match(source, /automation\.automatic_clips_created_today/);
   assert.match(source, /automation\.daily_clip_limit/);
   assert.match(source, /automation\.estimated_outbound_mb_today/);
   assert.match(source, /automation\.daily_outbound_budget_mb/);
