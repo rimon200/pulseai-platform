@@ -65,7 +65,9 @@ class BandwidthSafeguardTests(unittest.TestCase):
                         str(self.media_path),
                         "FakeClip",
                     )
-        self.assertEqual(first, second)
+        self.assertEqual(first["object_key"], second["object_key"])
+        self.assertGreater(first["transferred_bytes"], 0)
+        self.assertEqual(second["transferred_bytes"], 0)
         client.upload_file.assert_called_once()
         self.assertIn("destination=r2", output.getvalue())
         self.assertIn("reason=object_already_exists", output.getvalue())

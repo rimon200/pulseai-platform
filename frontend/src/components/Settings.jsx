@@ -4,6 +4,7 @@ const API_BASE_URL = import.meta.env.VITE_API_URL;
 
 function Settings() {
   const [settings, setSettings] = useState(null);
+  const [automation, setAutomation] = useState(null);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
@@ -11,6 +12,10 @@ function Settings() {
       .then((response) => response.json())
       .then(setSettings)
       .catch(() => setMessage("Unable to load settings."));
+    fetch(`${API_BASE_URL}/api/settings/automation`)
+      .then((response) => response.json())
+      .then(setAutomation)
+      .catch(() => setAutomation(null));
   }, []);
 
   const update = (name, value) => {
@@ -95,6 +100,35 @@ function Settings() {
           Connect / Reconnect TikTok
         </button>
         {message && <p>{message}</p>}
+      </section>
+      <section
+        style={{
+          marginTop: 24,
+          padding: 24,
+          background: "#1a2342",
+          borderRadius: 12,
+        }}
+      >
+        <h2>Automatic clip generation</h2>
+        {automation ? (
+          <>
+            <p>Status: {automation.enabled ? "Enabled" : "Disabled"}</p>
+            <p>
+              Clips today: {automation.clips_created_today}
+              {" / "}{automation.daily_clip_limit}
+            </p>
+            <p>
+              Estimated outbound today: {automation.estimated_outbound_mb_today} MB
+              {" / "}{automation.daily_outbound_budget_mb} MB
+            </p>
+            <p>
+              Last automatic run: {automation.last_automatic_run || "Never"}
+            </p>
+            <p>Last skip reason: {automation.last_skip_reason || "None"}</p>
+          </>
+        ) : (
+          <p>Automation status is unavailable.</p>
+        )}
       </section>
     </div>
   );

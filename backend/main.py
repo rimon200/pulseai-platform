@@ -42,9 +42,14 @@ from ai import (
 from video_editing import create_tiktok_edited_video
 from storage_service import object_storage_enabled, upload_video
 from generation_jobs import (
+    automatic_usage_snapshot,
     enqueue_generation_job,
+    enqueue_eligible_automatic_job,
     ensure_generation_jobs_table,
     get_generation_job,
+    record_automatic_skip,
+    record_clip_outbound_bytes,
+    record_generation_job_outbound_bytes,
     serialize_generation_job,
     update_generation_job_stage,
 )
@@ -1439,8 +1444,170 @@ async def end_clip_generation() -> None:
         _release_generation_db_lease(database_lease)
 
 
+def _automatic_scheduler_config() -> dict[str, int]:
+    return {
+        "poll_seconds": _bounded_environment_int(
+            "AUTO_CLIP_AUTOMATIC_POLL_SECONDS", 300, 30, 3600
+        ),
+        "global_daily_limit": _bounded_environment_int(
+            "AUTO_CLIP_MAX_AUTOMATIC_CLIPS_PER_DAY", 6, 0, 100
+        ),
+        "creator_daily_limit": _bounded_environment_int(
+            "AUTO_CLIP_MAX_AUTOMATIC_CLIPS_PER_CREATOR_PER_DAY", 2, 0, 100
+        ),
+        "min_new_material_seconds": _bounded_environment_int(
+            "AUTO_CLIP_MIN_NEW_MATERIAL_SECONDS", 600, 60, 86400
+        ),
+        "cooldown_minutes": _bounded_environment_int(
+            "AUTO_CLIP_AUTOMATIC_COOLDOWN_MINUTES", 60, 0, 1440
+        ),
+        "outbound_budget_bytes": _bounded_environment_int(
+            "AUTO_CLIP_MAX_ESTIMATED_OUTBOUND_MB_PER_DAY",
+            150,
+            1,
+            100000,
+        ) * 1024 * 1024,
+    }
+
+
+def _automatic_stream_material(
+    channel_data: dict[str, Any],
+    usage: dict[str, Any],
+) -> tuple[str, datetime | None, int]:
+    now = datetime.now(timezone.utc)
+    if channel_data.get("is_live") and channel_data.get("stream_id"):
+        stream = {
+            "stream_id": str(channel_data["stream_id"]),
+            "started_at": _parse_twitch_created_at(
+                channel_data.get("started_at")
+            ),
+            "ended_at": now,
+            "is_live": True,
+        }
+    else:
+        stream = channel_data.get("newest_completed_stream") or {}
+    stream_id = str(stream.get("stream_id") or "")
+    started_at = _parse_twitch_created_at(stream.get("started_at"))
+    range_end = _parse_twitch_created_at(stream.get("ended_at"))
+    if not stream_id or started_at is None or range_end is None:
+        return stream_id, range_end, 0
+    creator_id = str(channel_data.get("user_id") or "")
+    durable_stream_state = (
+        get_stream_state(creator_id, stream_id) if creator_id else None
+    ) or {}
+    if (
+        not stream.get("is_live")
+        and durable_stream_state.get("processing_state") == "exhausted"
+    ):
+        return stream_id, range_end, 0
+    baseline = started_at
+    for candidate in (
+        durable_stream_state.get("last_evaluated_range_end"),
+        durable_stream_state.get("last_checked_at"),
+    ):
+        if isinstance(candidate, datetime):
+            baseline = max(baseline, candidate)
+    automation_state = usage.get("creator_state") or {}
+    if (
+        str(automation_state.get("last_eligibility_stream_id") or "")
+        == stream_id
+        and isinstance(
+            automation_state.get("last_eligibility_range_end"),
+            datetime,
+        )
+    ):
+        baseline = max(
+            baseline,
+            automation_state["last_eligibility_range_end"],
+        )
+    return (
+        stream_id,
+        range_end,
+        max(0, int((range_end - baseline).total_seconds())),
+    )
+
+
+async def _run_smart_automatic_scheduler_pass() -> None:
+    config = _automatic_scheduler_config()
+    creators = load_creators()
+    for creator in creators:
+        creator_login = str(creator.get("channel") or "")
+        try:
+            channel_data = await get_twitch_channel_data(creator_login)
+            creator_id = str(channel_data.get("user_id") or "")
+            if not creator_id:
+                continue
+            usage = automatic_usage_snapshot(creator_id)
+            stream_id, range_end, new_material_seconds = (
+                _automatic_stream_material(channel_data, usage)
+            )
+            recent_average = int(usage.get("recent_average_bytes") or 0)
+            estimated_bytes = recent_average or (18 * 1024 * 1024)
+            print(
+                "AUTO GENERATION CHECK | "
+                f"creator={creator_login} | "
+                f"stream_id={stream_id or 'none'} | "
+                f"new_material_seconds={new_material_seconds} | "
+                f"daily_creator_count={int(usage.get('creator_clips_created') or 0)} | "
+                f"daily_global_count={int(usage.get('clips_created') or 0)} | "
+                f"estimated_outbound_mb={estimated_bytes / 1048576:.1f}"
+            )
+            if (
+                not stream_id
+                or range_end is None
+                or new_material_seconds
+                < config["min_new_material_seconds"]
+            ):
+                reason = "no_new_material"
+                record_automatic_skip(creator_id, creator_login, reason)
+                print(
+                    "AUTO GENERATION SKIPPED | "
+                    f"creator={creator_login} | reason={reason}"
+                )
+                continue
+            job, reason, _ = enqueue_eligible_automatic_job(
+                creator_login=creator_login,
+                creator_id=creator_id,
+                stream_id=stream_id,
+                range_end=range_end,
+                estimated_outbound_bytes=estimated_bytes,
+                creator_daily_limit=config["creator_daily_limit"],
+                global_daily_limit=config["global_daily_limit"],
+                cooldown_minutes=config["cooldown_minutes"],
+                outbound_daily_budget_bytes=config["outbound_budget_bytes"],
+            )
+            if job is None:
+                print(
+                    "AUTO GENERATION SKIPPED | "
+                    f"creator={creator_login} | reason={reason}"
+                )
+                continue
+            print(
+                "AUTO GENERATION ENQUEUED | "
+                f"creator={creator_login} | job_id={job['id']} | "
+                "reason=new_material"
+            )
+        except Exception as error:
+            print(
+                "AUTO GENERATION SKIPPED | "
+                f"creator={creator_login or 'unknown'} | "
+                f"reason=scheduler_error | error={error!r}"
+            )
+    summary = automatic_usage_snapshot()
+    print(
+        "AUTO GENERATION DAILY SUMMARY | "
+        f"jobs_enqueued={int(summary.get('jobs_enqueued') or 0)} | "
+        f"clips_created={int(summary.get('clips_created') or 0)} | "
+        "estimated_outbound_mb="
+        f"{int(summary.get('estimated_outbound_bytes') or 0) / 1048576:.1f} | "
+        "actual_outbound_mb="
+        f"{int(summary.get('actual_outbound_bytes') or 0) / 1048576:.1f}"
+    )
+
+
 async def _auto_clip_loop():
-    await asyncio.sleep(AUTO_CLIP_INTERVAL_SECONDS)
+    poll_seconds = _automatic_scheduler_config()["poll_seconds"]
+    await asyncio.sleep(poll_seconds)
     print("AUTO MODE STARTED")
 
     while True:
@@ -1454,11 +1621,7 @@ async def _auto_clip_loop():
         )
         if automatic_generation_enabled:
             try:
-                job, created = enqueue_generation_job("automatic")
-                print(
-                    "AUTO GENERATION JOB | "
-                    f"job_id={job['id']} | created={str(created).lower()}"
-                )
+                await _run_smart_automatic_scheduler_pass()
             except Exception as error:
                 print("AUTO ERROR:", repr(error))
         else:
@@ -1475,7 +1638,7 @@ async def _auto_clip_loop():
         except Exception as error:
             print(f"TIKTOK POST STATUS | error={error!r}")
         print("AUTO CYCLE COMPLETE")
-        await asyncio.sleep(AUTO_CLIP_INTERVAL_SECONDS)
+        await asyncio.sleep(poll_seconds)
 
 
 async def _run_auto_publish_once() -> None:
@@ -4284,6 +4447,7 @@ async def upload_tiktok_draft(
         f"clip_id={clip_id or 'unknown'} | "
         f"bytes={video_size} | duplicate=false"
     )
+    record_clip_outbound_bytes(clip_id, video_size)
 
     return {
         "publish_id": publish_id,
@@ -5325,6 +5489,50 @@ async def get_publish_settings():
         **defaults,
         **dict(zip(keys, row)),
         "direct_post_available": False,
+    }
+
+
+@app.get("/api/settings/automation")
+async def get_automation_status():
+    if not DATABASE_URL or not getattr(app.state, "clip_history_ready", False):
+        raise HTTPException(
+            status_code=503,
+            detail="Automation status is unavailable.",
+        )
+    config = _automatic_scheduler_config()
+    try:
+        usage = automatic_usage_snapshot()
+    except Exception as error:
+        print(f"AUTO GENERATION STATUS FAILED | error={error!r}")
+        raise HTTPException(
+            status_code=503,
+            detail="Automation status is unavailable.",
+        ) from error
+    return {
+        "enabled": (
+            os.getenv(
+                "AUTO_CLIP_AUTOMATIC_GENERATION_ENABLED",
+                "false",
+            ).strip().lower()
+            == "true"
+        ),
+        "clips_created_today": int(usage.get("clips_created") or 0),
+        "daily_clip_limit": config["global_daily_limit"],
+        "estimated_outbound_mb_today": round(
+            int(usage.get("estimated_outbound_bytes") or 0) / 1048576,
+            1,
+        ),
+        "daily_outbound_budget_mb": round(
+            config["outbound_budget_bytes"] / 1048576,
+            1,
+        ),
+        "actual_outbound_mb_today": round(
+            int(usage.get("actual_outbound_bytes") or 0) / 1048576,
+            1,
+        ),
+        "last_automatic_run": usage.get("last_automatic_run"),
+        "last_scheduler_check": usage.get("last_scheduler_check_at"),
+        "last_skip_reason": usage.get("last_skip_reason"),
     }
 
 
@@ -6938,6 +7146,11 @@ async def _run_auto_generate_clip_pipeline(
                 str(best_clip.get("twitch_clip_id") or uuid.uuid4()),
             )
             best_clip.update(storage_result)
+            record_generation_job_outbound_bytes(
+                generation_job_id,
+                int(storage_result.get("transferred_bytes") or 0),
+                "r2",
+            )
         except Exception:
             _log_candidate_rejection(
                 best_clip,

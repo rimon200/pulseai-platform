@@ -8,7 +8,7 @@ def object_storage_enabled() -> bool:
     return os.getenv("OBJECT_STORAGE_ENABLED", "false").strip().lower() == "true"
 
 
-def upload_video(video_path: str, clip_id: str) -> dict[str, str]:
+def upload_video(video_path: str, clip_id: str) -> dict[str, object]:
     path = Path(video_path).resolve()
     if not path.is_file() or path.stat().st_size <= 0:
         raise ValueError("Object storage upload requires a non-empty video file.")
@@ -70,6 +70,7 @@ def upload_video(video_path: str, clip_id: str) -> dict[str, str]:
                 return {
                     "object_key": object_key,
                     "durable_url": durable_url,
+                    "transferred_bytes": 0,
                 }
             raise RuntimeError(
                 "Existing object size does not match the final clip."
@@ -115,7 +116,11 @@ def upload_video(video_path: str, clip_id: str) -> dict[str, str]:
         )
         raise
     print(f"OBJECT STORAGE UPLOAD COMPLETE | clip_id={safe_clip_id} | key={object_key}")
-    return {"object_key": object_key, "durable_url": durable_url}
+    return {
+        "object_key": object_key,
+        "durable_url": durable_url,
+        "transferred_bytes": video_size,
+    }
 
 
 def delete_video_object(object_key: str) -> bool:

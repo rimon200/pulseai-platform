@@ -86,7 +86,10 @@ class PostgreSQLGenerationJobTests(unittest.TestCase):
 
         with psycopg.connect(self.database_url) as connection:
             with connection.cursor() as cursor:
-                cursor.execute("TRUNCATE clip_generation_jobs")
+                cursor.execute(
+                    "TRUNCATE clip_generation_outbound_transfers, "
+                    "clip_generation_jobs"
+                )
             connection.commit()
 
     def test_enqueue_is_idempotent_for_one_active_job(self):

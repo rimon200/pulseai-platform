@@ -177,9 +177,39 @@ async def evaluate_claimed_job(job: dict[str, Any], worker_id: str) -> dict[str,
         }
     main.app.state.clip_history_ready = True
     try:
+        pipeline_arguments: dict[str, Any] = {
+            "generation_job_id": job_id,
+            "generation_worker_id": worker_id,
+        }
+        requested_creator = str(job.get("requested_creator") or "").strip()
+        if requested_creator:
+            creator = next(
+                (
+                    item
+                    for item in main.load_creators()
+                    if str(item.get("channel") or "").lower()
+                    == requested_creator.lower()
+                ),
+                None,
+            )
+            if creator is None:
+                return {
+                    "status": "failed",
+                    "error_message": (
+                        "The requested automatic creator is unavailable."
+                    ),
+                }
+            channel_data = await main.get_twitch_channel_data(
+                requested_creator
+            )
+            pipeline_arguments.update(
+                {
+                    "_forced_creator": creator,
+                    "_forced_channel_data": channel_data,
+                }
+            )
         result = await main._run_auto_generate_clip_pipeline(
-            generation_job_id=job_id,
-            generation_worker_id=worker_id,
+            **pipeline_arguments,
         )
         message = (
             str(result.get("message") or "")
