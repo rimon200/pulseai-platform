@@ -78,6 +78,18 @@ from stream_providers import (
     KickStreamProvider,
     StreamProviderError,
     TwitchStreamProvider,
+    YouTubeUploadProvider,
+)
+from youtube_uploads import (
+    YouTubeSourceError,
+    configure_creator_source,
+    encrypt_source_config,
+    ensure_youtube_tables,
+    get_youtube_upload,
+    list_youtube_uploads,
+    store_detected_uploads,
+    validate_source_configuration,
+    youtube_config,
 )
 
 load_dotenv()
@@ -1401,6 +1413,7 @@ app.state.kick_diagnostics = {
     "rate_limit_status": None,
 }
 kick_stream_provider = KickStreamProvider()
+youtube_upload_provider = YouTubeUploadProvider()
 
 CLIP_GENERATION_ADVISORY_LOCK_ID = 22616960936427850
 
@@ -1697,6 +1710,15 @@ async def _auto_clip_loop():
 
     while True:
         print("AUTO CYCLE START")
+        if youtube_config()["enabled"]:
+            try:
+                await _poll_youtube_creators()
+            except Exception as error:
+                print(
+                    "YOUTUBE CHANNEL CHECK | creator_id=unknown | "
+                    "channel_id=unknown | outcome=api_error | "
+                    f"error={error.__class__.__name__}"
+                )
         automatic_generation_enabled = (
             os.getenv(
                 "AUTO_CLIP_AUTOMATIC_GENERATION_ENABLED",
@@ -1766,6 +1788,7 @@ async def _run_auto_publish_once() -> None:
                 """
                 SELECT generated_clip_id FROM twitch_clip_history
                 WHERE status = 'scheduled' AND scheduled_for <= NOW()
+                  AND COALESCE(source_platform, provider) <> 'youtube'
                 ORDER BY scheduled_for LIMIT 1
                 """
             )
@@ -1783,6 +1806,9 @@ async def _start_auto_clip_task():
     _ensure_oauth_tokens_table()
     if not _ensure_clip_history_table():
         print("CLIP HISTORY INITIALIZATION FAILED")
+        return
+    if DATABASE_URL and not ensure_youtube_tables(DATABASE_URL):
+        print("YOUTUBE UPLOAD INITIALIZATION FAILED")
         return
     if not ensure_generation_jobs_table():
         print("GENERATION JOB INITIALIZATION FAILED")
@@ -3086,7 +3112,7 @@ DEFAULT_CREATORS = [
 class CreatorCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     channel: str = Field(min_length=1, max_length=100)
-    provider: str = Field(default="twitch", pattern="^(twitch|kick)$")
+    provider: str = Field(default="twitch", pattern="^(twitch|kick|youtube)$")
 
 
 def clean_channel_name(channel: str) -> str:
@@ -3163,7 +3189,11 @@ def load_creators() -> list[dict[str, str]]:
                            platform_username, platform_channel_slug,
                            platform_display_name, platform_avatar_url,
                            platform_connected_at, platform_connection_status,
-                           platform_connection_error
+                           platform_connection_error, uploads_playlist_id,
+                           authorized_media_source_type,
+                           youtube_last_checked_at, youtube_last_video_id,
+                           youtube_last_successful_request_at,
+                           youtube_last_polling_error
                     FROM monitored_creators
                     WHERE enabled = TRUE
                     ORDER BY priority, created_at, id
@@ -3175,7 +3205,10 @@ def load_creators() -> list[dict[str, str]]:
             "platform_username", "platform_channel_slug",
             "platform_display_name", "platform_avatar_url",
             "platform_connected_at", "platform_connection_status",
-            "platform_connection_error",
+            "platform_connection_error", "uploads_playlist_id",
+            "authorized_media_source_type", "youtube_last_checked_at",
+            "youtube_last_video_id", "youtube_last_successful_request_at",
+            "youtube_last_polling_error",
         )
         return [dict(zip(keys, row)) for row in rows]
     except Exception as error:
@@ -4814,6 +4847,23 @@ async def get_creators():
             creator.get("platform_channel_slug") or creator.get("channel") or ""
         )
         try:
+            if provider_name == "youtube":
+                creator_results.append({
+                    **creator,
+                    "display_name": creator.get("platform_display_name") or creator.get("name"),
+                    "channel": channel,
+                    "status": "UPLOAD_MONITORING",
+                    "is_live": False,
+                    "viewer_count": 0,
+                    "generation_available": bool(
+                        creator.get("authorized_media_source_type")
+                    ),
+                    "source_status": (
+                        "ready" if creator.get("authorized_media_source_type")
+                        else "not_configured"
+                    ),
+                })
+                continue
             if provider_name == "kick":
                 kick_data = await kick_stream_provider.get_live_status(creator)
                 creator_results.append(kick_data)
@@ -4895,15 +4945,210 @@ async def get_creators():
     return creator_results
 
 
+async def _poll_youtube_creators(*, force: bool = False) -> dict[str, int]:
+    if not DATABASE_URL:
+        return {"checked": 0, "detected": 0, "failed": 0}
+    config = youtube_config()
+    if not config["enabled"]:
+        return {"checked": 0, "detected": 0, "failed": 0}
+    creators = [
+        creator for creator in load_creators()
+        if str(creator.get("provider") or "twitch") == "youtube"
+    ]
+    checked = detected = failed = 0
+    now = datetime.now(timezone.utc)
+    for creator in creators:
+        last_checked = creator.get("youtube_last_checked_at")
+        if (
+            not force and isinstance(last_checked, datetime)
+            and last_checked > now - timedelta(minutes=config["poll_interval_minutes"])
+        ):
+            continue
+        creator_id = creator.get("id")
+        channel_id = str(creator.get("platform_user_id") or "unknown")
+        checked += 1
+        try:
+            uploads = await youtube_upload_provider.check_new_uploads(
+                creator, max_results=50,
+            )
+            new_rows = store_detected_uploads(DATABASE_URL, creator, uploads)
+            detected += len(new_rows)
+            if config["automatic_generation_enabled"]:
+                import psycopg
+                for upload in new_rows:
+                    if (
+                        upload.get("processing_status") != "detected"
+                        or upload.get("source_status") != "ready"
+                    ):
+                        continue
+                    with psycopg.connect(DATABASE_URL) as connection:
+                        with connection.cursor() as cursor:
+                            cursor.execute(
+                                """
+                                SELECT
+                                  COUNT(*) FILTER (
+                                    WHERE creator_id = %s
+                                      AND completed_at >= date_trunc('day', NOW())
+                                      AND processing_status = 'completed'
+                                  ),
+                                  COALESCE(SUM(clips_created) FILTER (
+                                    WHERE creator_id = %s
+                                      AND completed_at >= date_trunc('day', NOW())
+                                  ), 0),
+                                  COALESCE(SUM(clips_created) FILTER (
+                                    WHERE completed_at >= date_trunc('day', NOW())
+                                  ), 0)
+                                FROM youtube_uploads
+                                """,
+                                (creator_id, creator_id),
+                            )
+                            videos_today, creator_clips, global_clips = cursor.fetchone()
+                    if (
+                        int(videos_today) >= config["max_videos_per_creator_per_day"]
+                        or int(creator_clips) >= config["max_clips_per_creator_per_day"]
+                        or int(global_clips) >= config["global_max_clips_per_day"]
+                    ):
+                        continue
+                    enqueue_generation_job(
+                        "automatic",
+                        str(creator.get("channel") or ""),
+                        provider="youtube",
+                        source_upload_id=str(upload["id"]),
+                    )
+            print(
+                "YOUTUBE CHANNEL CHECK | "
+                f"creator_id={creator_id} | channel_id={channel_id} | outcome=success"
+            )
+        except StreamProviderError as error:
+            failed += 1
+            outcome = error.code if error.code in {
+                "not_found", "quota_exceeded", "api_error",
+                "rate_limited", "auth_error", "disabled",
+            } else "api_error"
+            print(
+                "YOUTUBE CHANNEL CHECK | "
+                f"creator_id={creator_id} | channel_id={channel_id} | outcome={outcome}"
+            )
+            try:
+                import psycopg
+                with psycopg.connect(DATABASE_URL) as connection:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            UPDATE monitored_creators SET
+                                youtube_last_checked_at = NOW(),
+                                youtube_last_polling_error = %s, updated_at = NOW()
+                            WHERE id = %s AND provider = 'youtube'
+                            """,
+                            (outcome, creator_id),
+                        )
+                    connection.commit()
+            except Exception as persistence_error:
+                print(
+                    "YOUTUBE CHANNEL CHECK | "
+                    f"creator_id={creator_id} | channel_id={channel_id} | "
+                    f"outcome=api_error | persistence_error={persistence_error.__class__.__name__}"
+                )
+        except Exception as error:
+            failed += 1
+            print(
+                "YOUTUBE CHANNEL CHECK | "
+                f"creator_id={creator_id} | channel_id={channel_id} | "
+                f"outcome=api_error | error={error.__class__.__name__}"
+            )
+    return {"checked": checked, "detected": detected, "failed": failed}
+
+
+@app.post("/api/youtube/poll")
+async def poll_youtube_uploads():
+    if not youtube_config()["enabled"]:
+        raise HTTPException(status_code=503, detail="YouTube integration is disabled.")
+    return await _poll_youtube_creators(force=True)
+
+
+@app.get("/api/youtube/uploads")
+async def get_youtube_uploads(
+    limit: int = Query(25, ge=1, le=100),
+    creator_id: Optional[int] = Query(None),
+):
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="YouTube upload storage is unavailable.")
+    rows = list_youtube_uploads(DATABASE_URL, limit=limit, creator_id=creator_id)
+    for row in rows:
+        for key, value in tuple(row.items()):
+            if isinstance(value, (datetime, uuid.UUID)):
+                row[key] = str(value.isoformat() if isinstance(value, datetime) else value)
+        row.pop("source_reference_encrypted", None)
+    return {"uploads": rows, "count": len(rows)}
+
+
+@app.get("/api/youtube/status")
+async def youtube_status():
+    config = youtube_config()
+    connected = 0
+    ready_sources = 0
+    last_success = None
+    last_error = None
+    if DATABASE_URL:
+        import psycopg
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*),
+                           COUNT(*) FILTER (
+                             WHERE authorized_media_source_type IS NOT NULL
+                           ),
+                           MAX(youtube_last_successful_request_at),
+                           MAX(youtube_last_polling_error) FILTER (
+                             WHERE youtube_last_polling_error IS NOT NULL
+                           )
+                    FROM monitored_creators
+                    WHERE provider = 'youtube' AND enabled = TRUE
+                    """
+                )
+                connected, ready_sources, last_success, last_error = cursor.fetchone()
+    return {
+        "enabled": config["enabled"],
+        "configured": bool(os.getenv("YOUTUBE_API_KEY", "").strip()),
+        "connected_creator_count": int(connected or 0),
+        "approved_source_count": int(ready_sources or 0),
+        "last_successful_request": last_success.isoformat() if last_success else None,
+        "last_polling_error": last_error,
+        "polling_interval_minutes": config["poll_interval_minutes"],
+        "automatic_generation_enabled": config["automatic_generation_enabled"],
+    }
+
+
+@app.put("/api/youtube/creators/{creator_id}/source")
+async def configure_youtube_source(creator_id: int, payload: dict):
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="YouTube upload storage is unavailable.")
+    source_type = str(payload.get("source_type") or "")
+    source_config = payload.get("config")
+    if not isinstance(source_config, dict):
+        raise HTTPException(status_code=400, detail="Source configuration is required.")
+    try:
+        saved = configure_creator_source(
+            DATABASE_URL, creator_id, source_type, source_config,
+        )
+    except YouTubeSourceError as error:
+        status_code = 404 if error.code == "not_found" else 422
+        raise HTTPException(
+            status_code=status_code,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+    return {**saved, "source_status": "ready"}
+
+
 @app.post("/creators", status_code=status.HTTP_201_CREATED)
 async def add_creator(creator: CreatorCreate):
     clean_name = creator.name.strip()
     provider_name = creator.provider.lower()
-    provider = (
-        kick_stream_provider
-        if provider_name == "kick"
-        else TwitchStreamProvider(get_twitch_channel_data)
-    )
+    provider = {
+        "kick": kick_stream_provider,
+        "youtube": youtube_upload_provider,
+    }.get(provider_name) or TwitchStreamProvider(get_twitch_channel_data)
     try:
         clean_channel = provider.normalize_channel_identifier(creator.channel)
     except StreamProviderError as error:
@@ -4914,10 +5159,10 @@ async def add_creator(creator: CreatorCreate):
             status_code=400,
             detail="Creator name and channel are required.",
         )
-    if provider_name == "kick" and not DATABASE_URL:
+    if provider_name in {"kick", "youtube"} and not DATABASE_URL:
         raise HTTPException(
             status_code=503,
-            detail="Kick creator monitoring requires PostgreSQL.",
+            detail=f"{provider_name.title()} creator monitoring requires PostgreSQL.",
         )
 
     saved_creators = load_creators()
@@ -4963,9 +5208,9 @@ async def add_creator(creator: CreatorCreate):
                             platform_channel_slug, platform_display_name,
                             platform_avatar_url, platform_connected_at,
                             platform_connection_status, platform_connection_error,
-                            enabled
+                            uploads_playlist_id, enabled
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                  NOW(), 'connected', NULL, TRUE)
+                                  NOW(), 'connected', NULL, %s, TRUE)
                         ON CONFLICT (provider, platform_user_id)
                             WHERE platform_user_id IS NOT NULL DO UPDATE SET
                             twitch_user_id = COALESCE(
@@ -4978,6 +5223,10 @@ async def add_creator(creator: CreatorCreate):
                             platform_channel_slug = EXCLUDED.platform_channel_slug,
                             platform_display_name = EXCLUDED.platform_display_name,
                             platform_avatar_url = EXCLUDED.platform_avatar_url,
+                            uploads_playlist_id = COALESCE(
+                                EXCLUDED.uploads_playlist_id,
+                                monitored_creators.uploads_playlist_id
+                            ),
                             platform_connection_status = 'connected',
                             platform_connection_error = NULL,
                             enabled = TRUE,
@@ -4994,6 +5243,7 @@ async def add_creator(creator: CreatorCreate):
                             provider_data.get("platform_channel_slug") or clean_channel,
                             provider_data.get("platform_display_name") or clean_name,
                             provider_data.get("platform_avatar_url") or "",
+                            provider_data.get("uploads_playlist_id"),
                         ),
                     )
                     saved_row = cursor.fetchone()
@@ -5025,6 +5275,15 @@ async def add_creator(creator: CreatorCreate):
         return await provider.get_live_status({
             **provider_data, "id": saved_row[0] if DATABASE_URL else None,
         })
+    if provider_name == "youtube":
+        return {
+            **provider_data,
+            "id": saved_row[0],
+            "status": "UPLOAD_MONITORING",
+            "is_live": False,
+            "source_status": "not_configured",
+            "generation_available": False,
+        }
     provider_data["generation_available"] = True
     return provider_data
 
@@ -5094,6 +5353,7 @@ def _queue_row_to_dict(row: tuple[object, ...]) -> dict[str, object]:
         "scheduled_for", "generated_at", "created_at", "tiktok_publish_id",
         "tiktok_publish_mode",
         "tiktok_post_status", "tiktok_failure_reason", "rights_status",
+        "provider",
     )
     return dict(zip(keys, row))
 
@@ -5231,12 +5491,27 @@ def _persist_generated_clip_record(
 ) -> dict[str, object] | None:
     if not DATABASE_URL:
         return {"clip_id": "", "status": "ready_for_review"}
-    clip_id, clip_url = _normalized_twitch_identifiers(clip)
+    provider_name = str(
+        clip.get("source_platform") or clip.get("provider") or "twitch"
+    ).strip().lower()
+    if provider_name == "youtube":
+        video_id = str(
+            clip.get("youtube_video_id") or clip.get("platform_video_id") or ""
+        ).strip()
+        start_ms = int(float(clip.get("clip_start_seconds") or 0) * 1000)
+        end_ms = int(float(clip.get("clip_end_seconds") or 0) * 1000)
+        clip_id = f"{video_id}:{start_ms}-{end_ms}" if video_id else ""
+        clip_url = (
+            f"https://www.youtube.com/watch?v={video_id}#t={start_ms}ms"
+            if video_id else ""
+        )
+    else:
+        clip_id, clip_url = _normalized_twitch_identifiers(clip)
     if not clip_id:
         _log_queue_persistence_recovery(
             "",
             clip.get("object_key"),
-            "invalid or mismatched Twitch clip ID/URL",
+            f"invalid or mismatched {provider_name} clip ID/URL",
         )
         return None
     try:
@@ -5264,10 +5539,10 @@ def _persist_generated_clip_record(
                         title_relevance_score, title_generation_version,
                         title_fallback_used
                     ) VALUES (
-                        'twitch', %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s,
                         'ready_for_review', %s, %s, %s, %s, %s, %s, %s, %s,
                         %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s, %s,
-                        NOW(), 'title-v3', %s, 'twitch', %s,
+                        NOW(), 'title-v3', %s, %s, %s,
                         %s, %s, %s, %s, %s::jsonb, %s::jsonb,
                         %s, %s, %s, %s, %s
                     )
@@ -5430,7 +5705,7 @@ def _persist_generated_clip_record(
                               COALESCE(generated_at, created_at) AS created_at
                     """,
                     (
-                        clip_id, clip_url,
+                        provider_name, clip_id, clip_url,
                         clip.get("creator_id") or clip.get("broadcaster_id"),
                         clip.get("creator") or clip.get("creator_name"),
                         clip.get("created_at"), clip.get("score"),
@@ -5452,6 +5727,7 @@ def _persist_generated_clip_record(
                             or clip.get("creator_id")
                             or clip.get("broadcaster_id")
                         ),
+                        provider_name,
                         clip.get("rights_status") or "unknown",
                         clip.get("visual_layout_mode"),
                         clip.get("visual_layout_confidence"),
@@ -5527,7 +5803,7 @@ def _verify_generated_clip_retrieval(
                     """
                     SELECT generated_clip_id
                     FROM twitch_clip_history
-                    WHERE provider = 'twitch'
+                    WHERE provider IN ('twitch', 'youtube')
                       AND generated_clip_id IS NOT NULL
                     ORDER BY COALESCE(generated_at, created_at) DESC NULLS LAST,
                              clip_id DESC
@@ -5614,7 +5890,7 @@ async def get_clips(
         return response
     if not getattr(app.state, "clip_history_ready", False):
         raise HTTPException(status_code=503, detail="Clip history is unavailable.")
-    clauses = ["provider = 'twitch'", "generated_clip_id IS NOT NULL"]
+    clauses = ["provider IN ('twitch', 'youtube')", "generated_clip_id IS NOT NULL"]
     parameters: list[object] = []
     status_clause, status_parameters = _clip_status_filter(status_filter)
     if status_clause:
@@ -5648,7 +5924,8 @@ async def get_clips(
                                generated_at,
                                COALESCE(generated_at, created_at) AS created_at,
                                provider_publish_id, tiktok_publish_mode,
-                               tiktok_post_status, tiktok_failure_reason, rights_status
+                               tiktok_post_status, tiktok_failure_reason, rights_status,
+                               provider
                         FROM twitch_clip_history WHERE
                         """
                     )
@@ -6561,6 +6838,56 @@ async def auto_generate_clip(payload: Optional[dict] = None):
                 ),
             },
         )
+    if provider_name == "youtube":
+        upload_id = str(request_payload.get("upload_id") or "").strip()
+        upload = get_youtube_upload(DATABASE_URL, upload_id) if DATABASE_URL and upload_id else None
+        if not upload:
+            raise HTTPException(status_code=404, detail="YouTube upload was not found.")
+        if (
+            not upload.get("authorized_media_source_type")
+            or not upload.get("authorized_media_source_config_encrypted")
+        ):
+            print(
+                "YOUTUBE SOURCE STATUS | "
+                f"creator_id={upload.get('creator_id')} | "
+                f"video_id={upload.get('platform_video_id')} | status=not_configured"
+            )
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "code": "youtube_source_not_configured",
+                    "message": (
+                        "This YouTube creator does not yet have an approved "
+                        "source-media connection."
+                    ),
+                },
+            )
+        if upload.get("source_status") != "ready":
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "code": "youtube_source_unavailable",
+                    "message": "The approved YouTube source media is unavailable.",
+                },
+            )
+        try:
+            job, created = enqueue_generation_job(
+                "manual",
+                str(upload.get("platform_channel_slug") or ""),
+                provider="youtube",
+                source_upload_id=upload_id,
+            )
+        except Exception as error:
+            print(
+                "GENERATION JOB ENQUEUE FAILED | provider=youtube | "
+                f"upload_id={upload_id} | error={error!r}"
+            )
+            raise HTTPException(
+                status_code=503, detail="Clip generation queue is unavailable."
+            ) from error
+        response_payload = serialize_generation_job(job)
+        response_payload["reused"] = not created
+        return JSONResponse(status_code=202, content=response_payload)
     try:
         job, created = enqueue_generation_job("manual")
     except Exception as error:

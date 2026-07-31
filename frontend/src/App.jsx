@@ -153,7 +153,7 @@ function App() {
 
     if (!cleanName || !cleanChannel) {
       setCreatorError(
-        `Enter both the creator name and ${creatorProvider === "kick" ? "Kick" : "Twitch"} channel.`,
+        `Enter both the creator name and ${creatorProvider === "kick" ? "Kick" : creatorProvider === "youtube" ? "YouTube" : "Twitch"} channel.`,
       );
       return;
     }
@@ -244,6 +244,7 @@ function App() {
   const renderCreatorRow = (creator) => {
     const provider = creator.provider || "twitch";
     const isKick = provider === "kick";
+    const isYouTube = provider === "youtube";
     const isLive = creator.status === "LIVE";
     const hasError = creator.status === "ERROR";
     const isDeleting = deletingChannel === `${provider}:${creator.channel}`;
@@ -260,6 +261,10 @@ function App() {
       badgeText = "ERROR";
       badgeBackground = "#78350f";
       badgeColor = "#fef3c7";
+    } else if (isYouTube) {
+      badgeText = "MONITORING";
+      badgeBackground = "#7f1d1d";
+      badgeColor = "#fee2e2";
     }
 
     return (
@@ -286,9 +291,9 @@ function App() {
               padding: "2px 7px",
               borderRadius: 999,
               fontSize: 10,
-              background: isKick ? "#16a34a" : "#6441a5",
+              background: isKick ? "#16a34a" : isYouTube ? "#dc2626" : "#6441a5",
             }}>
-              {isKick ? "KICK" : "TWITCH"}
+              {isKick ? "KICK" : isYouTube ? "YOUTUBE" : "TWITCH"}
             </span>
           </div>
 
@@ -299,7 +304,9 @@ function App() {
                 )}`
               : hasError
                 ? creator.error
-                : `@${creator.channel} • Currently offline`}
+                : isYouTube
+                  ? `@${creator.channel} • Upload monitoring • Source ${creator.source_status || "not_configured"}`
+                  : `@${creator.channel} • Currently offline`}
           </div>
 
           {isLive && creator.title && (
@@ -312,16 +319,18 @@ function App() {
         </div>
 
         <div style={styles.creatorActions}>
-          {isLive && (
+          {(isLive || isYouTube) && (
   <a
     href={isKick
       ? `https://kick.com/${creator.channel}`
-      : `https://www.twitch.tv/${creator.channel}`}
+      : isYouTube
+        ? `https://www.youtube.com/@${creator.channel}`
+        : `https://www.twitch.tv/${creator.channel}`}
     target="_blank"
     rel="noreferrer"
     style={styles.watchButton}
   >
-    Watch Live
+    {isYouTube ? "View Channel" : "Watch Live"}
   </a>
 )}
           {isKick && isLive && (

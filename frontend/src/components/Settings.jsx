@@ -7,6 +7,7 @@ function Settings() {
   const [automation, setAutomation] = useState(null);
   const [r2Cleanup, setR2Cleanup] = useState(null);
   const [kickStatus, setKickStatus] = useState(null);
+  const [youtubeStatus, setYoutubeStatus] = useState(null);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
@@ -26,6 +27,10 @@ function Settings() {
       .then((response) => response.json())
       .then(setKickStatus)
       .catch(() => setKickStatus(null));
+    fetch(`${API_BASE_URL}/api/youtube/status`)
+      .then((response) => response.json())
+      .then(setYoutubeStatus)
+      .catch(() => setYoutubeStatus(null));
   }, []);
 
   const update = (name, value) => {
@@ -110,6 +115,23 @@ function Settings() {
           Connect / Reconnect TikTok
         </button>
         {message && <p>{message}</p>}
+      </section>
+      <section style={{ marginTop: 24, padding: 24, background: "#1a2342", borderRadius: 12 }}>
+        <h2>YouTube long-form monitoring</h2>
+        {youtubeStatus ? (
+          <div>
+            <p>Integration: {youtubeStatus.enabled ? "Enabled" : "Disabled"}</p>
+            <p>Configuration: {youtubeStatus.configured ? "Configured" : "Not configured"}</p>
+            <p>Monitored channels: {youtubeStatus.connected_creator_count || 0}</p>
+            <p>Approved media sources: {youtubeStatus.approved_source_count || 0}</p>
+            <p>Last successful request: {youtubeStatus.last_successful_request || "Never"}</p>
+            <p>Last polling error: {youtubeStatus.last_polling_error || "None"}</p>
+            <p>Polling interval: {youtubeStatus.polling_interval_minutes} minutes</p>
+            <p>Automatic generation: {youtubeStatus.automatic_generation_enabled ? "Enabled" : "Disabled"}</p>
+          </div>
+        ) : (
+          <p>YouTube integration status is unavailable.</p>
+        )}
       </section>
       <section style={{ marginTop: 24, padding: 24, background: "#1a2342", borderRadius: 12 }}>
         <h2>Kick integration</h2>

@@ -250,6 +250,240 @@ class KickStreamProvider(StreamProvider):
             return {"provider": "kick", "valid": False, "code": error.code}
 
 
+def _iso8601_duration_seconds(value: object) -> int | None:
+    text = str(value or "").strip().upper()
+    match = re.fullmatch(
+        r"P(?:(?P<days>\d+)D)?T(?:(?P<hours>\d+)H)?"
+        r"(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?",
+        text,
+    )
+    if not match:
+        return None
+    values = {key: int(number or 0) for key, number in match.groupdict().items()}
+    return (
+        values["days"] * 86400 + values["hours"] * 3600
+        + values["minutes"] * 60 + values["seconds"]
+    )
+
+
+class YouTubeUploadProvider(StreamProvider):
+    provider = "youtube"
+    api_base_url = "https://www.googleapis.com/youtube/v3"
+
+    def __init__(self, *, client: httpx.AsyncClient | None = None):
+        self._client = client
+        self.last_successful_request: str | None = None
+        self.last_polling_error: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return os.getenv("YOUTUBE_INTEGRATION_ENABLED", "false").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+
+    @property
+    def configured(self) -> bool:
+        return bool(os.getenv("YOUTUBE_API_KEY", "").strip())
+
+    def _timeout(self) -> float:
+        try:
+            return max(
+                1.0,
+                min(float(os.getenv("YOUTUBE_REQUEST_TIMEOUT_SECONDS", "15")), 60.0),
+            )
+        except ValueError:
+            return 15.0
+
+    def normalize_channel_identifier(self, value: object) -> str:
+        raw = str(value or "").strip()
+        raw = re.sub(
+            r"^https?://(?:www\.)?youtube\.com/(?:channel/|@)", "", raw,
+            flags=re.IGNORECASE,
+        ).split("/", 1)[0]
+        if raw.startswith("UC") and re.fullmatch(r"UC[A-Za-z0-9_-]{20,30}", raw):
+            return raw
+        handle = raw.removeprefix("@").lower()
+        if not handle or len(handle) > 30 or not re.fullmatch(r"[a-z0-9._-]+", handle):
+            raise StreamProviderError(
+                "invalid_channel", "Invalid YouTube channel ID or handle."
+            )
+        return f"@{handle}"
+
+    async def _request(self, resource: str, params: dict[str, object]) -> dict[str, Any]:
+        if not self.enabled:
+            raise StreamProviderError("disabled", "YouTube integration is disabled.")
+        api_key = os.getenv("YOUTUBE_API_KEY", "").strip()
+        if not api_key:
+            raise StreamProviderError("auth_error", "YouTube API key is unavailable.")
+        request_params = {**params, "key": api_key}
+        if self._client is not None:
+            response = await self._client.get(
+                f"{self.api_base_url}/{resource}", params=request_params,
+            )
+        else:
+            async with httpx.AsyncClient(timeout=self._timeout()) as client:
+                response = await client.get(
+                    f"{self.api_base_url}/{resource}", params=request_params,
+                )
+        if response.status_code == 429:
+            self.last_polling_error = "rate_limited"
+            raise StreamProviderError("rate_limited", "YouTube API rate limit reached.")
+        if response.status_code in {401, 403}:
+            reason = "quota_exceeded"
+            try:
+                errors = response.json().get("error", {}).get("errors", [])
+                api_reason = str((errors or [{}])[0].get("reason") or "")
+                if api_reason not in {"quotaExceeded", "dailyLimitExceeded"}:
+                    reason = "auth_error"
+            except (AttributeError, IndexError, ValueError):
+                reason = "auth_error"
+            self.last_polling_error = reason
+            raise StreamProviderError(reason, "YouTube API request was rejected.")
+        if response.status_code >= 400:
+            self.last_polling_error = "api_error"
+            raise StreamProviderError("api_error", "YouTube API request failed.")
+        self.last_successful_request = datetime.now(timezone.utc).isoformat()
+        self.last_polling_error = None
+        return response.json()
+
+    async def resolve_channel(self, identifier: object) -> dict[str, Any]:
+        normalized = self.normalize_channel_identifier(identifier)
+        selector = (
+            {"id": normalized}
+            if normalized.startswith("UC")
+            else {"forHandle": normalized}
+        )
+        payload = await self._request(
+            "channels", {"part": "snippet,contentDetails", **selector},
+        )
+        rows = payload.get("items") or []
+        if not rows:
+            raise StreamProviderError("not_found", "YouTube channel was not found.")
+        channel = rows[0]
+        snippet = channel.get("snippet") or {}
+        thumbnails = snippet.get("thumbnails") or {}
+        avatar = (thumbnails.get("high") or thumbnails.get("default") or {}).get("url")
+        uploads = (
+            (channel.get("contentDetails") or {}).get("relatedPlaylists") or {}
+        ).get("uploads")
+        if not uploads:
+            raise StreamProviderError("api_error", "YouTube uploads playlist is unavailable.")
+        custom_url = str(snippet.get("customUrl") or "").removeprefix("@")
+        return {
+            "provider": "youtube",
+            "platform_user_id": str(channel.get("id") or ""),
+            "platform_username": custom_url,
+            "platform_channel_slug": custom_url or str(channel.get("id") or ""),
+            "platform_display_name": str(snippet.get("title") or custom_url),
+            "platform_avatar_url": str(avatar or ""),
+            "uploads_playlist_id": str(uploads),
+            "channel": custom_url or str(channel.get("id") or ""),
+            "display_name": str(snippet.get("title") or custom_url),
+        }
+
+    async def resolve_creator(self, identifier: object) -> dict[str, Any]:
+        return await self.resolve_channel(identifier)
+
+    async def get_uploads_playlist(self, creator: dict[str, Any]) -> str:
+        playlist = str(creator.get("uploads_playlist_id") or "").strip()
+        if playlist:
+            return playlist
+        resolved = await self.resolve_channel(
+            creator.get("platform_user_id")
+            or creator.get("platform_channel_slug")
+            or creator.get("channel")
+        )
+        return str(resolved["uploads_playlist_id"])
+
+    async def get_video_metadata(self, video_ids: list[str]) -> list[dict[str, Any]]:
+        identifiers = [str(item).strip() for item in video_ids if str(item).strip()]
+        if not identifiers:
+            return []
+        payload = await self._request(
+            "videos",
+            {
+                "part": "snippet,contentDetails,status,liveStreamingDetails",
+                "id": ",".join(identifiers[:50]),
+                "maxResults": 50,
+            },
+        )
+        results = []
+        for video in payload.get("items") or []:
+            snippet = video.get("snippet") or {}
+            status = video.get("status") or {}
+            thumbnails = snippet.get("thumbnails") or {}
+            thumbnail = (
+                thumbnails.get("maxres") or thumbnails.get("high")
+                or thumbnails.get("medium") or thumbnails.get("default") or {}
+            ).get("url")
+            duration = _iso8601_duration_seconds(
+                (video.get("contentDetails") or {}).get("duration")
+            )
+            live_details = video.get("liveStreamingDetails") or {}
+            results.append({
+                "provider": "youtube",
+                "video_id": str(video.get("id") or ""),
+                "title": str(snippet.get("title") or ""),
+                "description": str(snippet.get("description") or ""),
+                "published_at": snippet.get("publishedAt"),
+                "duration_seconds": duration,
+                "thumbnail_url": str(thumbnail or ""),
+                "channel_title": str(snippet.get("channelTitle") or ""),
+                "privacy_status": str(status.get("privacyStatus") or ""),
+                "upload_status": str(status.get("uploadStatus") or ""),
+                "live_broadcast_content": str(snippet.get("liveBroadcastContent") or "none"),
+                "actual_start_time": live_details.get("actualStartTime"),
+                "actual_end_time": live_details.get("actualEndTime"),
+            })
+        returned_ids = {str(item.get("video_id") or "") for item in results}
+        for missing_id in identifiers:
+            if missing_id not in returned_ids:
+                results.append({
+                    "provider": "youtube", "video_id": missing_id,
+                    "title": "Unavailable YouTube upload", "description": "",
+                    "published_at": None, "duration_seconds": None,
+                    "thumbnail_url": "", "channel_title": "",
+                    "privacy_status": "unavailable", "upload_status": "unavailable",
+                    "live_broadcast_content": "none",
+                    "actual_start_time": None, "actual_end_time": None,
+                })
+        return results
+
+    async def check_new_uploads(
+        self, creator: dict[str, Any], *, max_results: int = 10,
+    ) -> list[dict[str, Any]]:
+        playlist_id = await self.get_uploads_playlist(creator)
+        payload = await self._request(
+            "playlistItems",
+            {
+                "part": "contentDetails,snippet,status",
+                "playlistId": playlist_id,
+                "maxResults": max(1, min(int(max_results), 50)),
+            },
+        )
+        video_ids = []
+        for item in payload.get("items") or []:
+            video_id = str((item.get("contentDetails") or {}).get("videoId") or "")
+            if video_id and video_id not in video_ids:
+                video_ids.append(video_id)
+        return await self.get_video_metadata(video_ids)
+
+    async def get_live_status(self, creator: dict[str, Any]) -> dict[str, Any]:
+        uploads = await self.check_new_uploads(creator, max_results=1)
+        return {
+            **creator, "provider": "youtube", "is_live": False,
+            "status": "UPLOAD_MONITORING", "latest_upload": uploads[0] if uploads else None,
+            "generation_available": bool(creator.get("authorized_media_source_type")),
+        }
+
+    async def validate_connection(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {"provider": "youtube", "valid": False, "code": "disabled"}
+        if not self.configured:
+            return {"provider": "youtube", "valid": False, "code": "auth_error"}
+        return {"provider": "youtube", "valid": True}
+
+
 async def poll_creators_independently(
     creators: list[dict[str, Any]],
     providers: dict[str, StreamProvider],

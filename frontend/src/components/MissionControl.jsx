@@ -29,7 +29,7 @@ function MissionControl({
           <h1 style={styles.pageTitle}>Mission Control</h1>
 
           <p style={styles.subtitle}>
-            Your AI content team is connected to real Twitch data.
+            Your AI content team monitors authorized Twitch, Kick, and YouTube creators.
           </p>
         </div>
 
@@ -188,7 +188,7 @@ function MissionControl({
             <h2 style={styles.modalTitle}>Add Creator</h2>
 
             <p style={styles.modalDescription}>
-              PulseAI will verify and save the Twitch or Kick channel through its official API.
+              PulseAI will verify the creator through the platform's official API.
             </p>
 
             <label style={styles.label}>Platform</label>
@@ -200,6 +200,7 @@ function MissionControl({
             >
               <option value="twitch">Twitch</option>
               <option value="kick">Kick</option>
+              <option value="youtube">YouTube</option>
             </select>
 
             <label style={styles.label}>Creator display name</label>
@@ -214,7 +215,7 @@ function MissionControl({
             />
 
             <label style={styles.label}>
-              {creatorProvider === "kick" ? "Kick" : "Twitch"} channel name
+              {creatorProvider === "kick" ? "Kick" : creatorProvider === "youtube" ? "YouTube" : "Twitch"} channel name
             </label>
 
             <input

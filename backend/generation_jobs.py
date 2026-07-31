@@ -69,6 +69,8 @@ def ensure_generation_jobs_table() -> bool:
                         status TEXT NOT NULL,
                         trigger_type TEXT NOT NULL,
                         requested_creator TEXT,
+                        provider TEXT NOT NULL DEFAULT 'twitch',
+                        source_upload_id UUID,
                         requested_creator_id TEXT,
                         eligibility_stream_id TEXT,
                         eligibility_range_end TIMESTAMPTZ,
@@ -105,6 +107,8 @@ def ensure_generation_jobs_table() -> bool:
                     """
                 )
                 for definition in (
+                    "provider TEXT NOT NULL DEFAULT 'twitch'",
+                    "source_upload_id UUID",
                     "requested_creator_id TEXT",
                     "eligibility_stream_id TEXT",
                     "eligibility_range_end TIMESTAMPTZ",
@@ -150,6 +154,13 @@ def ensure_generation_jobs_table() -> bool:
                     )
                     """
                 )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS clip_generation_jobs_youtube_upload_idx
+                    ON clip_generation_jobs (provider, source_upload_id)
+                    WHERE source_upload_id IS NOT NULL
+                    """
+                )
             connection.commit()
         return True
     except Exception as error:
@@ -166,6 +177,9 @@ def _row_to_job(row: Any) -> dict[str, Any] | None:
 def enqueue_generation_job(
     trigger_type: str,
     requested_creator: str | None = None,
+    *,
+    provider: str = "twitch",
+    source_upload_id: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     database_url = _database_url()
     if not database_url:
@@ -182,6 +196,19 @@ def enqueue_generation_job(
                 "SELECT pg_advisory_xact_lock(%s)",
                 (JOB_ADVISORY_LOCK_ID,),
             )
+            if source_upload_id:
+                cursor.execute(
+                    """
+                    SELECT * FROM clip_generation_jobs
+                    WHERE provider = %s AND source_upload_id = %s
+                    LIMIT 1 FOR UPDATE
+                    """,
+                    (provider, source_upload_id),
+                )
+                existing_source_job = cursor.fetchone()
+                if existing_source_job:
+                    connection.commit()
+                    return dict(existing_source_job), False
             cursor.execute(
                 """
                 SELECT * FROM clip_generation_jobs
@@ -200,11 +227,16 @@ def enqueue_generation_job(
             cursor.execute(
                 """
                 INSERT INTO clip_generation_jobs (
-                    id, status, trigger_type, requested_creator
-                ) VALUES (%s, 'queued', %s, %s)
+                    id, status, trigger_type, requested_creator,
+                    provider, source_upload_id
+                ) VALUES (%s, 'queued', %s, %s, %s, %s)
                 RETURNING *
                 """,
-                (job_id, normalized_trigger, requested_creator),
+                (
+                    job_id, normalized_trigger, requested_creator,
+                    provider if provider in {"twitch", "youtube"} else "twitch",
+                    source_upload_id,
+                ),
             )
             created = cursor.fetchone()
         connection.commit()

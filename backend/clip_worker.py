@@ -160,6 +160,10 @@ def _child_memory_admitted() -> tuple[bool, float | None, float]:
 
 async def evaluate_claimed_job(job: dict[str, Any], worker_id: str) -> dict[str, Any]:
     """Execute one claimed job without applying its terminal database state."""
+    if str(job.get("provider") or "twitch") == "youtube":
+        from youtube_generation import process_youtube_job
+
+        return await process_youtube_job(job, worker_id)
     import main
     from stream_history import ensure_stream_history_tables
 

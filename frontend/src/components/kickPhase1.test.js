@@ -13,7 +13,7 @@ test("creator form offers Twitch and Kick providers", () => {
 });
 
 test("creator rows render provider badges and provider-aware links", () => {
-  assert.match(app, /isKick \? "KICK" : "TWITCH"/);
+  assert.match(app, /isKick \? "KICK" : isYouTube \? "YOUTUBE" : "TWITCH"/);
   assert.match(app, /https:\/\/kick\.com/);
   assert.match(app, /https:\/\/www\.twitch\.tv/);
 });
