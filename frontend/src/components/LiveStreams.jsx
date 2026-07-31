@@ -11,7 +11,7 @@ function LiveStreams({
         <div>
           <h1 style={styles.pageTitle}>Live Streams</h1>
           <p style={styles.subtitle}>
-            Monitor your saved Twitch creators and see who is live.
+            Monitor your saved Twitch and Kick creators and see who is live.
           </p>
         </div>
       </div>
@@ -26,7 +26,7 @@ function LiveStreams({
         <div style={styles.statCard}>
           <span style={styles.statLabel}>Creators Monitored</span>
           <strong style={styles.statNumber}>{creators.length}</strong>
-          <span style={styles.statDetail}>Saved Twitch channels</span>
+          <span style={styles.statDetail}>Saved Twitch and Kick channels</span>
         </div>
       </div>
 
@@ -35,7 +35,7 @@ function LiveStreams({
           <div>
             <h2 style={styles.panelTitle}>Monitored Creators</h2>
             <p style={styles.panelSubtitle}>
-              Live Twitch status for every saved creator.
+              Live provider status for every saved creator.
             </p>
           </div>
 
@@ -51,7 +51,7 @@ function LiveStreams({
           creators.map(renderCreatorRow)
         ) : (
           <div style={styles.emptyState}>
-            Add your first Twitch creator from Mission Control.
+            Add your first Twitch or Kick creator from Mission Control.
           </div>
         )}
       </section>

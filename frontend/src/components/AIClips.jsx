@@ -448,6 +448,9 @@ return (
                 <div style={styles.clipContent}>
                   <div style={styles.clipTitle}>{clip.ai_title || clip.title}</div>
                   <div style={styles.clipCreator}>{clip.creator}</div>
+                  <span style={{ fontSize: 10, opacity: 0.75 }}>
+                    {(clip.provider || "twitch").toUpperCase()}
+                  </span>
 
                   <div style={styles.clipFooter}>
                     <span style={styles.scoreBadge}>

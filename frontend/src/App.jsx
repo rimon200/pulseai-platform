@@ -18,6 +18,7 @@ function App() {
   const [showCreatorForm, setShowCreatorForm] = useState(false);
   const [creatorName, setCreatorName] = useState("");
   const [creatorChannel, setCreatorChannel] = useState("");
+  const [creatorProvider, setCreatorProvider] = useState("twitch");
   const [creatorError, setCreatorError] = useState("");
 
   const [isLoadingCreators, setIsLoadingCreators] = useState(true);
@@ -151,7 +152,9 @@ function App() {
       .toLowerCase();
 
     if (!cleanName || !cleanChannel) {
-      setCreatorError("Enter both the creator name and Twitch channel.");
+      setCreatorError(
+        `Enter both the creator name and ${creatorProvider === "kick" ? "Kick" : "Twitch"} channel.`,
+      );
       return;
     }
 
@@ -167,6 +170,7 @@ function App() {
         body: JSON.stringify({
           name: cleanName,
           channel: cleanChannel,
+          provider: creatorProvider,
         }),
       });
 
@@ -179,6 +183,7 @@ function App() {
       setCreators((currentCreators) => [...currentCreators, data]);
       setCreatorName("");
       setCreatorChannel("");
+      setCreatorProvider("twitch");
       setShowCreatorForm(false);
     } catch (error) {
       setCreatorError(error.message);
@@ -187,19 +192,19 @@ function App() {
     }
   };
 
-  const deleteCreator = async (channel) => {
+  const deleteCreator = async (channel, provider = "twitch") => {
     const confirmed = window.confirm(
       `Remove @${channel} from PulseAI monitoring?`
     );
 
     if (!confirmed) return;
 
-    setDeletingChannel(channel);
+    setDeletingChannel(`${provider}:${channel}`);
     setCreatorError("");
 
     try {
       const response = await fetch(
-        `${API_BASE_URL}/creators/${encodeURIComponent(channel)}`,
+        `${API_BASE_URL}/creators/${encodeURIComponent(channel)}?provider=${encodeURIComponent(provider)}`,
         {
           method: "DELETE",
         }
@@ -212,7 +217,10 @@ function App() {
       }
 
       setCreators((currentCreators) =>
-        currentCreators.filter((creator) => creator.channel !== channel)
+        currentCreators.filter((creator) => (
+          creator.channel !== channel
+          || (creator.provider || "twitch") !== provider
+        ))
       );
     } catch (error) {
       setCreatorError(error.message);
@@ -227,15 +235,18 @@ function App() {
     setShowCreatorForm(false);
     setCreatorName("");
     setCreatorChannel("");
+    setCreatorProvider("twitch");
     setCreatorError("");
   };
 
   const liveCreators = creators.filter((creator) => creator.is_live);
 
   const renderCreatorRow = (creator) => {
+    const provider = creator.provider || "twitch";
+    const isKick = provider === "kick";
     const isLive = creator.status === "LIVE";
     const hasError = creator.status === "ERROR";
-    const isDeleting = deletingChannel === creator.channel;
+    const isDeleting = deletingChannel === `${provider}:${creator.channel}`;
 
     let badgeText = "OFFLINE";
     let badgeBackground = "#334155";
@@ -252,7 +263,7 @@ function App() {
     }
 
     return (
-      <div key={creator.channel} style={styles.creatorRow}>
+      <div key={`${provider}:${creator.platform_user_id || creator.channel}`} style={styles.creatorRow}>
         {creator.profile_image_url ? (
           <img
             src={creator.profile_image_url}
@@ -270,6 +281,15 @@ function App() {
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={styles.creatorName}>
             {creator.display_name || creator.channel}
+            <span style={{
+              marginLeft: 8,
+              padding: "2px 7px",
+              borderRadius: 999,
+              fontSize: 10,
+              background: isKick ? "#16a34a" : "#6441a5",
+            }}>
+              {isKick ? "KICK" : "TWITCH"}
+            </span>
           </div>
 
           <div style={styles.creatorMeta}>
@@ -294,7 +314,9 @@ function App() {
         <div style={styles.creatorActions}>
           {isLive && (
   <a
-    href={`https://www.twitch.tv/${creator.channel}`}
+    href={isKick
+      ? `https://kick.com/${creator.channel}`
+      : `https://www.twitch.tv/${creator.channel}`}
     target="_blank"
     rel="noreferrer"
     style={styles.watchButton}
@@ -302,6 +324,20 @@ function App() {
     Watch Live
   </a>
 )}
+          {isKick && isLive && (
+            <div>
+              <button
+                disabled
+                title="Clip generation unavailable pending supported Kick playback access."
+                style={{ ...styles.secondaryButton, opacity: 0.55, cursor: "not-allowed" }}
+              >
+                Generate Clip Unavailable
+              </button>
+              <div style={{ marginTop: "6px", maxWidth: "220px", fontSize: "11px", color: "#94a3b8" }}>
+                Clip generation unavailable pending supported Kick playback access.
+              </div>
+            </div>
+          )}
           <span
             style={{
               ...styles.statusBadge,
@@ -313,7 +349,7 @@ function App() {
           </span>
 
           <button
-            onClick={() => deleteCreator(creator.channel)}
+            onClick={() => deleteCreator(creator.channel, provider)}
             disabled={isDeleting}
             title="Remove creator"
             style={{
@@ -373,6 +409,8 @@ function App() {
   setCreatorName={setCreatorName}
   creatorChannel={creatorChannel}
   setCreatorChannel={setCreatorChannel}
+  creatorProvider={creatorProvider}
+  setCreatorProvider={setCreatorProvider}
   creatorError={creatorError}
   setCreatorError={setCreatorError}
   addCreator={addCreator}

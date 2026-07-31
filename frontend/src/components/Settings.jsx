@@ -6,6 +6,7 @@ function Settings() {
   const [settings, setSettings] = useState(null);
   const [automation, setAutomation] = useState(null);
   const [r2Cleanup, setR2Cleanup] = useState(null);
+  const [kickStatus, setKickStatus] = useState(null);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
@@ -21,6 +22,10 @@ function Settings() {
       .then((response) => response.json())
       .then(setR2Cleanup)
       .catch(() => setR2Cleanup(null));
+    fetch(`${API_BASE_URL}/api/kick/status`)
+      .then((response) => response.json())
+      .then(setKickStatus)
+      .catch(() => setKickStatus(null));
   }, []);
 
   const update = (name, value) => {
@@ -105,6 +110,32 @@ function Settings() {
           Connect / Reconnect TikTok
         </button>
         {message && <p>{message}</p>}
+      </section>
+      <section style={{ marginTop: 24, padding: 24, background: "#1a2342", borderRadius: 12 }}>
+        <h2>Kick integration</h2>
+        {kickStatus ? (
+          <div>
+            <p>Integration: {kickStatus.enabled ? "Enabled" : "Disabled"}</p>
+            <p>Configuration: {kickStatus.configured ? "Configured" : "Not configured"}</p>
+            <p>Connected creators: {kickStatus.connected_creator_count || 0}</p>
+            <p>Last successful request: {kickStatus.last_successful_request || "Never"}</p>
+            <p>Last polling error: {kickStatus.last_polling_error || "None"}</p>
+            <p>Rate limit: {kickStatus.rate_limit_status || "Unknown"}</p>
+            <p>Polling interval: {kickStatus.polling_interval_seconds} seconds</p>
+            <p>
+              Playback ingestion:{" "}
+              <strong>{kickStatus.playback_ingestion || "unavailable"}</strong>
+            </p>
+            <button
+              disabled={!kickStatus.enabled || !kickStatus.configured}
+              onClick={() => window.location.assign(`${API_BASE_URL}/api/kick/connect`)}
+            >
+              Connect Kick
+            </button>
+          </div>
+        ) : (
+          <p>Kick integration status is unavailable.</p>
+        )}
       </section>
       <section style={{ marginTop: 24, padding: 24, background: "#1a2342", borderRadius: 12 }}>
         <h2>R2 lifecycle cleanup</h2>

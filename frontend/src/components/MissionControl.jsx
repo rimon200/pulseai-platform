@@ -15,6 +15,8 @@ function MissionControl({
   setCreatorName,
   creatorChannel,
   setCreatorChannel,
+  creatorProvider,
+  setCreatorProvider,
   creatorError,
   setCreatorError,
   addCreator,
@@ -183,11 +185,22 @@ function MissionControl({
       {showCreatorForm && (
         <div style={styles.modalOverlay}>
           <form onSubmit={addCreator} style={styles.modal}>
-            <h2 style={styles.modalTitle}>Add Twitch Creator</h2>
+            <h2 style={styles.modalTitle}>Add Creator</h2>
 
             <p style={styles.modalDescription}>
-              PulseAI will verify and save the channel through the backend.
+              PulseAI will verify and save the Twitch or Kick channel through its official API.
             </p>
+
+            <label style={styles.label}>Platform</label>
+            <select
+              value={creatorProvider}
+              onChange={(event) => setCreatorProvider(event.target.value)}
+              style={styles.formInput}
+              disabled={isAddingCreator}
+            >
+              <option value="twitch">Twitch</option>
+              <option value="kick">Kick</option>
+            </select>
 
             <label style={styles.label}>Creator display name</label>
 
@@ -200,12 +213,14 @@ function MissionControl({
               autoFocus
             />
 
-            <label style={styles.label}>Twitch channel name</label>
+            <label style={styles.label}>
+              {creatorProvider === "kick" ? "Kick" : "Twitch"} channel name
+            </label>
 
             <input
               value={creatorChannel}
               onChange={(event) => setCreatorChannel(event.target.value)}
-              placeholder="Example: pokimane"
+              placeholder={creatorProvider === "kick" ? "Example: xqc" : "Example: pokimane"}
               style={styles.formInput}
               disabled={isAddingCreator}
             />
@@ -232,7 +247,9 @@ function MissionControl({
                   opacity: isAddingCreator ? 0.65 : 1,
                 }}
               >
-                {isAddingCreator ? "Checking Twitch..." : "Add Creator"}
+                {isAddingCreator
+                  ? `Checking ${creatorProvider === "kick" ? "Kick" : "Twitch"}...`
+                  : "Add Creator"}
               </button>
             </div>
           </form>

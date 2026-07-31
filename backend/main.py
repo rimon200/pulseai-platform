@@ -13,7 +13,7 @@ import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 import uuid
 import httpx
 from dotenv import load_dotenv
@@ -73,6 +73,11 @@ from stream_history import (
     register_historical_stream,
     register_newest_stream,
     update_stream_progress,
+)
+from stream_providers import (
+    KickStreamProvider,
+    StreamProviderError,
+    TwitchStreamProvider,
 )
 
 load_dotenv()
@@ -1389,6 +1394,13 @@ app.state.clip_generation_admission_lock = asyncio.Lock()
 app.state.clip_generation_busy = False
 app.state.clip_generation_db_lease = None
 app.state.video_edit_lock = asyncio.Lock()
+app.state.kick_oauth_states = {}
+app.state.kick_diagnostics = {
+    "last_successful_request": None,
+    "last_polling_error": None,
+    "rate_limit_status": None,
+}
+kick_stream_provider = KickStreamProvider()
 
 CLIP_GENERATION_ADVISORY_LOCK_ID = 22616960936427850
 
@@ -1575,6 +1587,30 @@ async def _run_smart_automatic_scheduler_pass() -> None:
     creators = load_creators()
     for creator in creators:
         creator_login = str(creator.get("channel") or "")
+        provider_name = str(creator.get("provider") or "twitch").lower()
+        if provider_name == "kick":
+            outcome = "disabled"
+            stream_id = "unknown"
+            if kick_stream_provider.enabled:
+                try:
+                    kick_status = await kick_stream_provider.get_live_status(creator)
+                    outcome = "live" if kick_status.get("is_live") else "offline"
+                    stream_id = str(kick_status.get("stream_id") or "unknown")
+                except StreamProviderError as error:
+                    outcome = error.code
+                except Exception:
+                    outcome = "api_error"
+            print(
+                "STREAM PROVIDER CHECK | provider=kick | "
+                f"creator_id={creator.get('id') or 'unknown'} | "
+                f"channel={creator_login} | outcome={outcome}"
+            )
+            print(
+                "KICK GENERATION BLOCKED | "
+                f"creator_id={creator.get('id') or 'unknown'} | "
+                f"stream_id={stream_id} | reason=playback_api_unavailable"
+            )
+            continue
         try:
             channel_data = await get_twitch_channel_data(creator_login)
             creator_id = str(channel_data.get("user_id") or "")
@@ -1972,7 +2008,7 @@ def _ensure_clip_history_table() -> bool:
                     CREATE TABLE IF NOT EXISTS monitored_creators (
                         id BIGSERIAL PRIMARY KEY,
                         twitch_user_id TEXT,
-                        login TEXT NOT NULL UNIQUE,
+                        login TEXT NOT NULL,
                         display_name TEXT NOT NULL,
                         enabled BOOLEAN NOT NULL DEFAULT TRUE,
                         priority INTEGER NOT NULL DEFAULT 0,
@@ -1980,6 +2016,66 @@ def _ensure_clip_history_table() -> bool:
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS kick_oauth_states (
+                        state TEXT PRIMARY KEY,
+                        code_verifier TEXT NOT NULL,
+                        expires_at TIMESTAMPTZ NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                monitored_creator_columns = {
+                    "provider": "TEXT NOT NULL DEFAULT 'twitch'",
+                    "platform_user_id": "TEXT",
+                    "platform_username": "TEXT",
+                    "platform_channel_slug": "TEXT",
+                    "platform_display_name": "TEXT",
+                    "platform_avatar_url": "TEXT",
+                    "platform_connected_at": "TIMESTAMPTZ",
+                    "platform_connection_status": "TEXT NOT NULL DEFAULT 'connected'",
+                    "platform_connection_error": "TEXT",
+                    "platform_access_token_encrypted": "TEXT",
+                    "platform_refresh_token_encrypted": "TEXT",
+                    "platform_token_expires_at": "TIMESTAMPTZ",
+                }
+                for column_name, column_type in monitored_creator_columns.items():
+                    cursor.execute(
+                        sql.SQL(
+                            "ALTER TABLE monitored_creators ADD COLUMN IF NOT EXISTS {} "
+                        ).format(sql.Identifier(column_name))
+                        + sql.SQL(column_type)
+                    )
+                cursor.execute(
+                    "ALTER TABLE monitored_creators DROP CONSTRAINT IF EXISTS monitored_creators_login_key"
+                )
+                cursor.execute(
+                    """
+                    UPDATE monitored_creators SET
+                        provider = COALESCE(NULLIF(provider, ''), 'twitch'),
+                        platform_user_id = COALESCE(platform_user_id, twitch_user_id),
+                        platform_username = COALESCE(platform_username, login),
+                        platform_channel_slug = COALESCE(platform_channel_slug, login),
+                        platform_display_name = COALESCE(platform_display_name, display_name),
+                        platform_connected_at = COALESCE(platform_connected_at, created_at),
+                        platform_connection_status = COALESCE(platform_connection_status, 'connected')
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS monitored_creators_provider_user_idx
+                    ON monitored_creators (provider, platform_user_id)
+                    WHERE platform_user_id IS NOT NULL
+                    """
+                )
+                cursor.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS monitored_creators_provider_slug_idx
+                    ON monitored_creators (provider, platform_channel_slug)
+                    WHERE platform_channel_slug IS NOT NULL
                     """
                 )
                 _backfill_monitored_creators(cursor)
@@ -2990,6 +3086,7 @@ DEFAULT_CREATORS = [
 class CreatorCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     channel: str = Field(min_length=1, max_length=100)
+    provider: str = Field(default="twitch", pattern="^(twitch|kick)$")
 
 
 def clean_channel_name(channel: str) -> str:
@@ -3014,7 +3111,10 @@ def _load_creators_from_json() -> list[dict[str, str]]:
         name = str(item.get("name", "")).strip()
         channel = clean_channel_name(str(item.get("channel", "")))
         if name and channel:
-            creators.append({"name": name, "channel": channel})
+            creators.append({
+                "name": name, "channel": channel, "provider": "twitch",
+                "platform_channel_slug": channel,
+            })
     return creators
 
 
@@ -3025,12 +3125,19 @@ def _backfill_monitored_creators(cursor: object) -> None:
         cursor.execute(
             """
             INSERT INTO monitored_creators (
-                login, display_name, enabled, priority
-            ) VALUES (%s, %s, TRUE, %s)
-            ON CONFLICT (login) DO NOTHING
+                provider, login, display_name, platform_username,
+                platform_channel_slug, platform_display_name,
+                platform_connected_at, platform_connection_status,
+                enabled, priority
+            ) VALUES ('twitch', %s, %s, %s, %s, %s, NOW(), 'connected', TRUE, %s)
+            ON CONFLICT (provider, platform_channel_slug)
+                WHERE platform_channel_slug IS NOT NULL DO NOTHING
             RETURNING login
             """,
-            (creator["channel"], creator["name"], priority),
+            (
+                creator["channel"], creator["name"], creator["channel"],
+                creator["channel"], creator["name"], priority,
+            ),
         )
         if cursor.fetchone():
             inserted += 1
@@ -3052,13 +3159,25 @@ def load_creators() -> list[dict[str, str]]:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT display_name, login FROM monitored_creators
+                    SELECT id, display_name, login, provider, platform_user_id,
+                           platform_username, platform_channel_slug,
+                           platform_display_name, platform_avatar_url,
+                           platform_connected_at, platform_connection_status,
+                           platform_connection_error
+                    FROM monitored_creators
                     WHERE enabled = TRUE
                     ORDER BY priority, created_at, id
                     """
                 )
                 rows = cursor.fetchall()
-        return [{"name": row[0], "channel": row[1]} for row in rows]
+        keys = (
+            "id", "name", "channel", "provider", "platform_user_id",
+            "platform_username", "platform_channel_slug",
+            "platform_display_name", "platform_avatar_url",
+            "platform_connected_at", "platform_connection_status",
+            "platform_connection_error",
+        )
+        return [dict(zip(keys, row)) for row in rows]
     except Exception as error:
         print(f"MONITORED CREATOR LOAD FAILED | error={error!r}")
         raise HTTPException(
@@ -4690,14 +4809,62 @@ async def get_creators():
     creator_results = []
 
     for creator in saved_creators:
+        provider_name = str(creator.get("provider") or "twitch").lower()
+        channel = str(
+            creator.get("platform_channel_slug") or creator.get("channel") or ""
+        )
         try:
-            twitch_data = await get_twitch_channel_data(creator["channel"])
-            creator_results.append(twitch_data)
-        except HTTPException as error:
+            if provider_name == "kick":
+                kick_data = await kick_stream_provider.get_live_status(creator)
+                creator_results.append(kick_data)
+                outcome = "live" if kick_data["is_live"] else "offline"
+                app.state.kick_diagnostics.update({
+                    "last_successful_request": kick_stream_provider.last_successful_request,
+                    "last_polling_error": None,
+                    "rate_limit_status": kick_stream_provider.rate_limit_status,
+                })
+            else:
+                twitch_data = await TwitchStreamProvider(
+                    get_twitch_channel_data
+                ).get_live_status(creator)
+                twitch_data.update({
+                    "provider": "twitch",
+                    "creator_id": creator.get("id"),
+                    "platform_user_id": str(
+                        creator.get("platform_user_id")
+                        or twitch_data.get("user_id") or ""
+                    ),
+                    "generation_available": True,
+                })
+                creator_results.append(twitch_data)
+                continue
+            print(
+                "STREAM PROVIDER CHECK | provider=kick | "
+                f"creator_id={creator.get('id') or 'unknown'} | "
+                f"channel={channel} | outcome={outcome}"
+            )
+            if kick_data["is_live"]:
+                print(
+                    "STREAM DETECTED | provider=kick | "
+                    f"creator_id={creator.get('id') or 'unknown'} | "
+                    f"stream_id={kick_data.get('stream_id') or 'unknown'} | "
+                    f"started_at={kick_data.get('started_at') or 'unknown'}"
+                )
+        except (HTTPException, StreamProviderError) as error:
+            error_code = getattr(error, "code", "api_error")
+            if provider_name == "kick":
+                app.state.kick_diagnostics["last_polling_error"] = error_code
+                print(
+                    "STREAM PROVIDER CHECK | provider=kick | "
+                    f"creator_id={creator.get('id') or 'unknown'} | "
+                    f"channel={channel} | outcome={error_code}"
+                )
             creator_results.append(
                 {
                     "display_name": creator["name"],
-                    "channel": creator["channel"],
+                    "channel": channel,
+                    "provider": provider_name,
+                    "creator_id": creator.get("id"),
                     "status": "ERROR",
                     "is_live": False,
                     "viewer_count": 0,
@@ -4706,9 +4873,24 @@ async def get_creators():
                     "started_at": None,
                     "profile_image_url": None,
                     "thumbnail_url": None,
-                    "error": error.detail,
+                    "error": getattr(error, "detail", str(error)),
+                    "generation_available": provider_name == "twitch",
                 }
             )
+        except Exception as error:
+            if provider_name == "kick":
+                app.state.kick_diagnostics["last_polling_error"] = "api_error"
+                print(
+                    "STREAM PROVIDER CHECK | provider=kick | "
+                    f"creator_id={creator.get('id') or 'unknown'} | "
+                    f"channel={channel} | outcome=api_error"
+                )
+            creator_results.append({
+                **creator, "channel": channel, "provider": provider_name,
+                "status": "ERROR", "is_live": False, "viewer_count": 0,
+                "error": "Provider status is temporarily unavailable.",
+                "generation_available": provider_name == "twitch",
+            })
 
     return creator_results
 
@@ -4716,28 +4898,56 @@ async def get_creators():
 @app.post("/creators", status_code=status.HTTP_201_CREATED)
 async def add_creator(creator: CreatorCreate):
     clean_name = creator.name.strip()
-    clean_channel = clean_channel_name(creator.channel)
+    provider_name = creator.provider.lower()
+    provider = (
+        kick_stream_provider
+        if provider_name == "kick"
+        else TwitchStreamProvider(get_twitch_channel_data)
+    )
+    try:
+        clean_channel = provider.normalize_channel_identifier(creator.channel)
+    except StreamProviderError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
     if not clean_name or not clean_channel:
         raise HTTPException(
             status_code=400,
-            detail="Creator name and Twitch channel are required.",
+            detail="Creator name and channel are required.",
+        )
+    if provider_name == "kick" and not DATABASE_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="Kick creator monitoring requires PostgreSQL.",
         )
 
     saved_creators = load_creators()
 
     already_exists = any(
-        existing["channel"] == clean_channel
+        str(existing.get("provider") or "twitch") == provider_name
+        and existing["channel"] == clean_channel
         for existing in saved_creators
     )
 
     if already_exists:
         raise HTTPException(
             status_code=409,
-            detail="That Twitch creator is already being monitored.",
+            detail=f"That {provider_name.title()} creator is already being monitored.",
         )
 
-    twitch_data = await get_twitch_channel_data(clean_channel)
+    try:
+        provider_data = await provider.resolve_creator(clean_channel)
+    except StreamProviderError as error:
+        status_code = 404 if error.code == "not_found" else 503
+        raise HTTPException(status_code=status_code, detail=str(error)) from error
+    if provider_name == "twitch":
+        provider_data.update({
+            "provider": "twitch",
+            "platform_user_id": str(provider_data.get("user_id") or ""),
+            "platform_username": provider_data.get("channel"),
+            "platform_channel_slug": provider_data.get("channel"),
+            "platform_display_name": provider_data.get("display_name"),
+            "platform_avatar_url": provider_data.get("profile_image_url"),
+        })
 
     if DATABASE_URL:
         try:
@@ -4748,22 +4958,42 @@ async def add_creator(creator: CreatorCreate):
                     cursor.execute(
                         """
                         INSERT INTO monitored_creators (
-                            twitch_user_id, login, display_name, enabled
-                        ) VALUES (%s, %s, %s, TRUE)
-                        ON CONFLICT (login) DO UPDATE SET
+                            twitch_user_id, login, display_name, provider,
+                            platform_user_id, platform_username,
+                            platform_channel_slug, platform_display_name,
+                            platform_avatar_url, platform_connected_at,
+                            platform_connection_status, platform_connection_error,
+                            enabled
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                  NOW(), 'connected', NULL, TRUE)
+                        ON CONFLICT (provider, platform_user_id)
+                            WHERE platform_user_id IS NOT NULL DO UPDATE SET
                             twitch_user_id = COALESCE(
                                 EXCLUDED.twitch_user_id,
                                 monitored_creators.twitch_user_id
                             ),
                             display_name = EXCLUDED.display_name,
+                            login = EXCLUDED.login,
+                            platform_username = EXCLUDED.platform_username,
+                            platform_channel_slug = EXCLUDED.platform_channel_slug,
+                            platform_display_name = EXCLUDED.platform_display_name,
+                            platform_avatar_url = EXCLUDED.platform_avatar_url,
+                            platform_connection_status = 'connected',
+                            platform_connection_error = NULL,
                             enabled = TRUE,
                             updated_at = NOW()
                         RETURNING id, (xmax = 0) AS inserted
                         """,
                         (
-                            twitch_data.get("user_id"),
-                            twitch_data["channel"],
-                            twitch_data["display_name"] or clean_name,
+                            provider_data.get("user_id") if provider_name == "twitch" else None,
+                            provider_data.get("platform_channel_slug") or clean_channel,
+                            provider_data.get("platform_display_name") or clean_name,
+                            provider_name,
+                            provider_data.get("platform_user_id"),
+                            provider_data.get("platform_username") or clean_channel,
+                            provider_data.get("platform_channel_slug") or clean_channel,
+                            provider_data.get("platform_display_name") or clean_name,
+                            provider_data.get("platform_avatar_url") or "",
                         ),
                     )
                     saved_row = cursor.fetchone()
@@ -4773,7 +5003,7 @@ async def add_creator(creator: CreatorCreate):
             action = "ADDED" if saved_row[1] else "UPDATED"
             print(
                 f"MONITORED CREATOR {action} | "
-                f"login={twitch_data['channel']}"
+                f"provider={provider_name} | login={clean_channel}"
             )
         except Exception as error:
             print(f"MONITORED CREATOR UPDATE FAILED | error={error!r}")
@@ -4784,18 +5014,25 @@ async def add_creator(creator: CreatorCreate):
     else:
         saved_creators.append(
             {
-                "name": twitch_data["display_name"] or clean_name,
-                "channel": twitch_data["channel"],
+                "name": provider_data["display_name"] or clean_name,
+                "channel": provider_data["channel"],
+                "provider": "twitch",
             }
         )
         save_creators(saved_creators)
 
-    return twitch_data
+    if provider_name == "kick":
+        return await provider.get_live_status({
+            **provider_data, "id": saved_row[0] if DATABASE_URL else None,
+        })
+    provider_data["generation_available"] = True
+    return provider_data
 
 
 @app.delete("/creators/{channel_name}")
-def delete_creator(channel_name: str):
+def delete_creator(channel_name: str, provider: str = Query("twitch")):
     clean_channel = clean_channel_name(channel_name)
+    provider_name = provider.strip().lower()
     if DATABASE_URL:
         try:
             import psycopg
@@ -4806,10 +5043,10 @@ def delete_creator(channel_name: str):
                         """
                         UPDATE monitored_creators
                         SET enabled = FALSE, updated_at = NOW()
-                        WHERE login = %s AND enabled = TRUE
+                        WHERE provider = %s AND login = %s AND enabled = TRUE
                         RETURNING id
                         """,
-                        (clean_channel,),
+                        (provider_name, clean_channel),
                     )
                     disabled = cursor.fetchone()
                 connection.commit()
@@ -6303,7 +6540,27 @@ async def generate_clip():
     return clip
 
 @app.post("/api/clips/auto")
-async def auto_generate_clip():
+async def auto_generate_clip(payload: Optional[dict] = None):
+    request_payload = payload or {}
+    provider_name = str(request_payload.get("provider") or "twitch").lower()
+    if provider_name == "kick":
+        creator_id = str(request_payload.get("creator_id") or "unknown")
+        stream_id = str(request_payload.get("stream_id") or "unknown")
+        print(
+            "KICK GENERATION BLOCKED | "
+            f"creator_id={creator_id} | stream_id={stream_id} | "
+            "reason=playback_api_unavailable"
+        )
+        return JSONResponse(
+            status_code=422,
+            content={
+                "code": "kick_playback_unavailable",
+                "message": (
+                    "Kick clip generation is unavailable because Kick does not "
+                    "currently provide a supported viewer playback API."
+                ),
+            },
+        )
     try:
         job, created = enqueue_generation_job("manual")
     except Exception as error:
@@ -7631,6 +7888,351 @@ async def twitch_callback(code: str):
         "success": True,
         "message": "Twitch account connected. You may close this tab.",
     }
+
+
+def _kick_configuration() -> dict[str, object]:
+    try:
+        poll_interval = max(15, min(int(os.getenv("KICK_POLL_INTERVAL_SECONDS", "60")), 3600))
+    except ValueError:
+        poll_interval = 60
+    return {
+        "enabled": os.getenv("KICK_INTEGRATION_ENABLED", "false").strip().lower()
+        in {"1", "true", "yes", "on"},
+        "client_id": os.getenv("KICK_CLIENT_ID", "").strip(),
+        "client_secret": os.getenv("KICK_CLIENT_SECRET", "").strip(),
+        "redirect_uri": os.getenv("KICK_REDIRECT_URI", "").strip(),
+        "poll_interval_seconds": poll_interval,
+    }
+
+
+def _kick_encryption_key() -> bytes:
+    secret = str(_kick_configuration()["client_secret"])
+    if not secret:
+        raise RuntimeError("Kick client secret is unavailable.")
+    return hashlib.sha256(f"pulseai:kick:{secret}".encode("utf-8")).digest()
+
+
+def _encrypt_kick_token(token: object) -> str:
+    value = str(token or "")
+    if not value:
+        return ""
+    from Cryptodome.Cipher import AES
+
+    cipher = AES.new(_kick_encryption_key(), AES.MODE_GCM)
+    ciphertext, tag = cipher.encrypt_and_digest(value.encode("utf-8"))
+    return base64.urlsafe_b64encode(cipher.nonce + tag + ciphertext).decode("ascii")
+
+
+def _decrypt_kick_token(value: object) -> str:
+    encrypted = str(value or "")
+    if not encrypted:
+        return ""
+    from Cryptodome.Cipher import AES
+
+    payload = base64.urlsafe_b64decode(encrypted.encode("ascii"))
+    nonce, tag, ciphertext = payload[:16], payload[16:32], payload[32:]
+    cipher = AES.new(_kick_encryption_key(), AES.MODE_GCM, nonce=nonce)
+    return cipher.decrypt_and_verify(ciphertext, tag).decode("utf-8")
+
+
+def _validated_kick_redirect_uri() -> str:
+    redirect_uri = str(_kick_configuration()["redirect_uri"])
+    parsed = urlparse(redirect_uri)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.fragment:
+        raise HTTPException(status_code=503, detail="Kick redirect URI is invalid.")
+    return redirect_uri
+
+
+@app.get("/api/kick/connect")
+async def kick_connect():
+    configuration = _kick_configuration()
+    if not configuration["enabled"]:
+        raise HTTPException(status_code=503, detail="Kick integration is disabled.")
+    if not configuration["client_id"] or not configuration["client_secret"]:
+        raise HTTPException(status_code=503, detail="Kick integration is not configured.")
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="Kick connection requires PostgreSQL.")
+    redirect_uri = _validated_kick_redirect_uri()
+    state = secrets.token_urlsafe(32)
+    verifier, challenge = _generate_pkce_pair()
+    import psycopg
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM kick_oauth_states WHERE expires_at <= NOW()")
+            cursor.execute(
+                "INSERT INTO kick_oauth_states (state, code_verifier, expires_at) "
+                "VALUES (%s, %s, NOW() + INTERVAL '10 minutes')",
+                (state, verifier),
+            )
+        connection.commit()
+    return RedirectResponse(
+        "https://id.kick.com/oauth/authorize?" + urlencode({
+            "response_type": "code",
+            "client_id": configuration["client_id"],
+            "redirect_uri": redirect_uri,
+            "scope": "user:read channel:read",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        })
+    )
+
+
+@app.get("/api/kick/callback")
+async def kick_callback(code: str, state: str):
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="Kick connection requires PostgreSQL.")
+    import psycopg
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "DELETE FROM kick_oauth_states WHERE state = %s AND expires_at > NOW() "
+                "RETURNING code_verifier",
+                (state,),
+            )
+            state_row = cursor.fetchone()
+        connection.commit()
+    if not state_row:
+        raise HTTPException(status_code=400, detail="Kick OAuth state is invalid or expired.")
+    configuration = _kick_configuration()
+    redirect_uri = _validated_kick_redirect_uri()
+    async with httpx.AsyncClient(timeout=kick_stream_provider._timeout()) as client:
+        token_response = await client.post(
+            "https://id.kick.com/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": configuration["client_id"],
+                "client_secret": configuration["client_secret"],
+                "redirect_uri": redirect_uri,
+                "code_verifier": state_row[0],
+                "code": code,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if token_response.status_code != 200:
+            raise HTTPException(status_code=502, detail="Kick authorization failed.")
+        token_data = token_response.json()
+        access_token = str(token_data.get("access_token") or "")
+        if not access_token:
+            raise HTTPException(status_code=502, detail="Kick authorization response was invalid.")
+        authorization = {"Authorization": f"Bearer {access_token}"}
+        user_response = await client.get(
+            "https://api.kick.com/public/v1/users", headers=authorization,
+        )
+        channel_response = await client.get(
+            "https://api.kick.com/public/v1/channels", headers=authorization,
+        )
+    if user_response.status_code != 200 or channel_response.status_code != 200:
+        raise HTTPException(status_code=502, detail="Kick account metadata could not be loaded.")
+    users = user_response.json().get("data") or []
+    channels = channel_response.json().get("data") or []
+    if not users or not channels:
+        raise HTTPException(status_code=502, detail="Kick account has no available channel.")
+    user, channel = users[0], channels[0]
+    user_id = str(user.get("user_id") or channel.get("broadcaster_user_id") or "")
+    slug = kick_stream_provider.normalize_channel_identifier(channel.get("slug"))
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=max(60, int(token_data.get("expires_in") or 3600))
+    )
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO monitored_creators (
+                    provider, platform_user_id, platform_username,
+                    platform_channel_slug, platform_display_name,
+                    platform_avatar_url, platform_connected_at,
+                    platform_connection_status, platform_connection_error,
+                    platform_access_token_encrypted,
+                    platform_refresh_token_encrypted,
+                    platform_token_expires_at, login, display_name, enabled
+                ) VALUES (
+                    'kick', %s, %s, %s, %s, %s, NOW(), 'connected', NULL,
+                    %s, %s, %s, %s, %s, TRUE
+                )
+                ON CONFLICT (provider, platform_user_id)
+                    WHERE platform_user_id IS NOT NULL DO UPDATE SET
+                    platform_username = EXCLUDED.platform_username,
+                    platform_channel_slug = EXCLUDED.platform_channel_slug,
+                    platform_display_name = EXCLUDED.platform_display_name,
+                    platform_avatar_url = EXCLUDED.platform_avatar_url,
+                    platform_connected_at = NOW(),
+                    platform_connection_status = 'connected',
+                    platform_connection_error = NULL,
+                    platform_access_token_encrypted = EXCLUDED.platform_access_token_encrypted,
+                    platform_refresh_token_encrypted = EXCLUDED.platform_refresh_token_encrypted,
+                    platform_token_expires_at = EXCLUDED.platform_token_expires_at,
+                    login = EXCLUDED.login, display_name = EXCLUDED.display_name,
+                    enabled = TRUE, updated_at = NOW()
+                """,
+                (
+                    user_id, user.get("name") or slug, slug,
+                    user.get("name") or slug, user.get("profile_picture") or "",
+                    _encrypt_kick_token(access_token),
+                    _encrypt_kick_token(token_data.get("refresh_token")),
+                    expires_at, slug, user.get("name") or slug,
+                ),
+            )
+        connection.commit()
+    return {"success": True, "message": "Kick account connected. You may close this tab."}
+
+
+@app.get("/api/kick/status")
+async def kick_connection_status():
+    configuration = _kick_configuration()
+    connected_count = 0
+    if DATABASE_URL:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, platform_refresh_token_encrypted
+                    FROM monitored_creators
+                    WHERE provider = 'kick' AND enabled = TRUE
+                      AND platform_token_expires_at <= NOW() + INTERVAL '1 minute'
+                      AND platform_refresh_token_encrypted IS NOT NULL
+                    """
+                )
+                expired_rows = cursor.fetchall()
+        for expired_creator_id, encrypted_refresh_token in expired_rows:
+            try:
+                refresh_token = _decrypt_kick_token(encrypted_refresh_token)
+                async with httpx.AsyncClient(
+                    timeout=kick_stream_provider._timeout()
+                ) as client:
+                    response = await client.post(
+                        "https://id.kick.com/oauth/token",
+                        data={
+                            "grant_type": "refresh_token",
+                            "client_id": configuration["client_id"],
+                            "client_secret": configuration["client_secret"],
+                            "refresh_token": refresh_token,
+                        },
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    )
+                if response.status_code != 200:
+                    raise RuntimeError("refresh_rejected")
+                refreshed = response.json()
+                refreshed_access = str(refreshed.get("access_token") or "")
+                if not refreshed_access:
+                    raise RuntimeError("refresh_invalid")
+                refreshed_expiry = datetime.now(timezone.utc) + timedelta(
+                    seconds=max(60, int(refreshed.get("expires_in") or 3600))
+                )
+                with psycopg.connect(DATABASE_URL) as connection:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            UPDATE monitored_creators SET
+                                platform_access_token_encrypted = %s,
+                                platform_refresh_token_encrypted = %s,
+                                platform_token_expires_at = %s,
+                                platform_connection_status = 'connected',
+                                platform_connection_error = NULL,
+                                updated_at = NOW()
+                            WHERE id = %s AND provider = 'kick'
+                            """,
+                            (
+                                _encrypt_kick_token(refreshed_access),
+                                _encrypt_kick_token(
+                                    refreshed.get("refresh_token") or refresh_token
+                                ),
+                                refreshed_expiry, expired_creator_id,
+                            ),
+                        )
+                    connection.commit()
+            except Exception:
+                with psycopg.connect(DATABASE_URL) as connection:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            """
+                            UPDATE monitored_creators SET
+                                platform_connection_status = 'auth_error',
+                                platform_connection_error = 'Token refresh failed.',
+                                updated_at = NOW()
+                            WHERE id = %s AND provider = 'kick'
+                            """,
+                            (expired_creator_id,),
+                        )
+                    connection.commit()
+        with psycopg.connect(DATABASE_URL) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM monitored_creators WHERE provider = 'kick' "
+                    "AND enabled = TRUE AND platform_connection_status = 'connected'"
+                )
+                connected_count = int(cursor.fetchone()[0])
+    return {
+        "enabled": configuration["enabled"],
+        "configured": bool(
+            configuration["client_id"] and configuration["client_secret"]
+            and configuration["redirect_uri"]
+        ),
+        "connected_creator_count": connected_count,
+        "last_successful_request": app.state.kick_diagnostics["last_successful_request"],
+        "last_polling_error": app.state.kick_diagnostics["last_polling_error"],
+        "rate_limit_status": app.state.kick_diagnostics["rate_limit_status"],
+        "polling_interval_seconds": configuration["poll_interval_seconds"],
+        "playback_ingestion": "unavailable",
+    }
+
+
+@app.delete("/api/kick/disconnect/{creator_id}")
+async def disconnect_kick_creator(creator_id: int):
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="Kick connection requires PostgreSQL.")
+    import psycopg
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT platform_access_token_encrypted,
+                       platform_refresh_token_encrypted
+                FROM monitored_creators
+                WHERE id = %s AND provider = 'kick' FOR UPDATE
+                """,
+                (creator_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Kick creator was not found.")
+            tokens = []
+            for encrypted, token_type in zip(row, ("access_token", "refresh_token")):
+                try:
+                    token = _decrypt_kick_token(encrypted)
+                    if token:
+                        tokens.append((token, token_type))
+                except Exception:
+                    pass
+            cursor.execute(
+                """
+                UPDATE monitored_creators SET enabled = FALSE,
+                    platform_connection_status = 'disconnected',
+                    platform_connection_error = NULL,
+                    platform_access_token_encrypted = NULL,
+                    platform_refresh_token_encrypted = NULL,
+                    platform_token_expires_at = NULL, updated_at = NOW()
+                WHERE id = %s AND provider = 'kick'
+                """,
+                (creator_id,),
+            )
+        connection.commit()
+    async with httpx.AsyncClient(timeout=kick_stream_provider._timeout()) as client:
+        for token, token_type in tokens:
+            try:
+                await client.post(
+                    "https://id.kick.com/oauth/revoke",
+                    params={"token": token, "token_hint_type": token_type},
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+            except httpx.HTTPError:
+                pass
+    return {"success": True, "status": "disconnected"}
 
 @app.get("/api/tiktok/login")
 async def tiktok_login():

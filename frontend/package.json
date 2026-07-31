@@ -8,6 +8,7 @@
     "build": "vite build",
     "test:ai-clips": "node --test src/components/aiClipsGeneration.test.js src/components/aiClipsPagination.test.js",
     "test:settings": "node --test src/components/settingsAutomation.test.js",
+    "test:kick": "node --test src/components/kickPhase1.test.js",
     "lint": "eslint .",
     "preview": "vite preview"
   },

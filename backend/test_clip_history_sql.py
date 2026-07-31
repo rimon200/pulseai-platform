@@ -150,6 +150,37 @@ class PostgreSQLClipHistorySQLTests(unittest.TestCase):
         self.assertIs(state["is_refreshable"], True)
         self.assertEqual(state["stream_id"], stream_id)
 
+    def test_same_channel_name_is_unique_per_provider(self):
+        with self.psycopg.connect(self.schema_url) as connection:
+            with connection.cursor() as cursor:
+                for provider, platform_user_id in (
+                    ("twitch", "fake-twitch-user"),
+                    ("kick", "fake-kick-user"),
+                ):
+                    cursor.execute(
+                        """
+                        INSERT INTO monitored_creators (
+                            provider, platform_user_id, login, display_name,
+                            platform_channel_slug
+                        ) VALUES (%s, %s, 'same_name', 'Same Name', 'same_name')
+                        """,
+                        (provider, platform_user_id),
+                    )
+                cursor.execute(
+                    """
+                    SELECT provider, platform_user_id
+                    FROM monitored_creators
+                    WHERE platform_channel_slug = 'same_name'
+                    ORDER BY provider
+                    """
+                )
+                rows = cursor.fetchall()
+            connection.commit()
+        self.assertEqual(
+            rows,
+            [("kick", "fake-kick-user"), ("twitch", "fake-twitch-user")],
+        )
+
     def test_legacy_missing_and_bad_records_do_not_abort_backfill(self):
         with tempfile.TemporaryDirectory() as directory:
             base_dir = Path(directory)
