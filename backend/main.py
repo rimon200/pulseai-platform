@@ -17,7 +17,7 @@ from typing import Any
 import uuid
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pathlib import Path
@@ -45,6 +45,12 @@ from storage_service import (
     get_video_preview_url,
     object_storage_enabled,
     upload_video,
+)
+from r2_cleanup import (
+    cleanup_config,
+    cleanup_loop,
+    cleanup_report,
+    cleanup_storage_snapshot,
 )
 from generation_jobs import (
     automatic_usage_snapshot,
@@ -1376,6 +1382,8 @@ TWITCH_REDIRECT_URI = os.getenv(
 
 app.state.auto_clip_task = None
 app.state.embedded_clip_worker_task = None
+app.state.r2_cleanup_task = None
+app.state.r2_cleanup_stop_event = None
 app.state.embedded_clip_worker_stop_event = None
 app.state.clip_generation_admission_lock = asyncio.Lock()
 app.state.clip_generation_busy = False
@@ -1768,10 +1776,29 @@ async def _start_auto_clip_task():
         app.state.embedded_clip_worker_task = asyncio.create_task(
             clip_worker.run_worker_loop(stop_event, embedded=True)
         )
+    cleanup_stop_event = asyncio.Event()
+    app.state.r2_cleanup_stop_event = cleanup_stop_event
+    app.state.r2_cleanup_task = asyncio.create_task(
+        cleanup_loop(DATABASE_URL, cleanup_stop_event)
+    )
 
 
 @app.on_event("shutdown")
 async def _stop_auto_clip_task():
+    cleanup_stop_event = app.state.r2_cleanup_stop_event
+    cleanup_task = app.state.r2_cleanup_task
+    if cleanup_stop_event is not None:
+        cleanup_stop_event.set()
+    if cleanup_task is not None:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            app.state.r2_cleanup_task = None
+            app.state.r2_cleanup_stop_event = None
+
     embedded_stop_event = app.state.embedded_clip_worker_stop_event
     embedded_task = app.state.embedded_clip_worker_task
     if embedded_stop_event is not None:
@@ -1902,6 +1929,16 @@ def _ensure_clip_history_table() -> bool:
                     "title_relevance_score": "DOUBLE PRECISION",
                     "title_generation_version": "TEXT",
                     "title_fallback_used": "BOOLEAN",
+                    "deleted_at": "TIMESTAMPTZ",
+                    "deletion_reason": "TEXT",
+                    "object_deleted_at": "TIMESTAMPTZ",
+                    "retention_locked": "BOOLEAN NOT NULL DEFAULT FALSE",
+                    "last_cleanup_checked_at": "TIMESTAMPTZ",
+                    "deletion_pending_at": "TIMESTAMPTZ",
+                    "deletion_error": "TEXT",
+                    "is_favorited": "BOOLEAN NOT NULL DEFAULT FALSE",
+                    "is_retained": "BOOLEAN NOT NULL DEFAULT FALSE",
+                    "object_size_bytes": "BIGINT",
                 }
                 for column_name, column_type in additive_columns.items():
                     cursor.execute(
@@ -5676,6 +5713,126 @@ async def get_automation_status():
         "last_scheduler_check": usage.get("last_scheduler_check_at"),
         "last_skip_reason": usage.get("last_skip_reason"),
     }
+
+
+@app.get("/api/settings/r2-cleanup")
+async def get_r2_cleanup_settings():
+    settings = cleanup_config()
+    snapshot = await asyncio.to_thread(cleanup_storage_snapshot, DATABASE_URL)
+    return {
+        **settings,
+        **snapshot,
+        "estimated_reclaimable_mb": round(
+            int(snapshot.get("estimated_reclaimable_bytes") or 0) / 1048576,
+            1,
+        ),
+        "bytes_reclaimed_mb": round(
+            int(snapshot.get("bytes_reclaimed") or 0) / 1048576,
+            1,
+        ),
+    }
+
+
+def _require_r2_cleanup_admin(provided_token: str) -> None:
+    configured_token = os.getenv("R2_CLEANUP_ADMIN_TOKEN", "").strip()
+    if not configured_token:
+        raise HTTPException(
+            status_code=503,
+            detail="R2 cleanup administration is not configured.",
+        )
+    if not secrets.compare_digest(
+        configured_token,
+        str(provided_token or "").strip(),
+    ):
+        raise HTTPException(status_code=403, detail="R2 cleanup access denied.")
+
+
+@app.post("/api/admin/r2-cleanup")
+async def run_r2_cleanup(
+    payload: dict,
+    x_r2_cleanup_admin_token: str = Header(""),
+):
+    _require_r2_cleanup_admin(x_r2_cleanup_admin_token)
+    if not DATABASE_URL or not getattr(app.state, "clip_history_ready", False):
+        raise HTTPException(status_code=503, detail="Clip history is unavailable.")
+    execute = bool(payload.get("execute", False))
+    settings = cleanup_config()
+    if execute:
+        if not settings["enabled"] or settings["dry_run"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Execution requires R2_CLEANUP_ENABLED=true and "
+                    "R2_CLEANUP_DRY_RUN=false."
+                ),
+            )
+        if payload.get("confirm") != "DELETE ELIGIBLE R2 OBJECTS":
+            raise HTTPException(status_code=400, detail="Cleanup confirmation is required.")
+    else:
+        settings = {**settings, "dry_run": True}
+    return await asyncio.to_thread(cleanup_report, DATABASE_URL, config=settings)
+
+
+@app.patch("/api/admin/r2-cleanup/clips/{clip_id}/protection")
+async def set_r2_cleanup_protection(
+    clip_id: str,
+    payload: dict,
+    x_r2_cleanup_admin_token: str = Header(""),
+):
+    _require_r2_cleanup_admin(x_r2_cleanup_admin_token)
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="PostgreSQL is required.")
+    locked = bool(payload.get("retention_locked", True))
+    import psycopg
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE twitch_clip_history
+                SET retention_locked = %s,
+                    deletion_pending_at = CASE WHEN %s THEN NULL ELSE deletion_pending_at END,
+                    deletion_error = CASE WHEN %s THEN NULL ELSE deletion_error END
+                WHERE generated_clip_id = %s AND object_deleted_at IS NULL
+                RETURNING generated_clip_id, retention_locked
+                """,
+                (locked, locked, locked, clip_id),
+            )
+            row = cursor.fetchone()
+        connection.commit()
+    if not row:
+        raise HTTPException(status_code=404, detail="Clip was not found or is already deleted.")
+    return {"clip_id": row[0], "retention_locked": row[1]}
+
+
+@app.post("/api/admin/r2-cleanup/clips/{clip_id}/restore")
+async def restore_r2_cleanup_eligibility(
+    clip_id: str,
+    x_r2_cleanup_admin_token: str = Header(""),
+):
+    _require_r2_cleanup_admin(x_r2_cleanup_admin_token)
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="PostgreSQL is required.")
+    import psycopg
+
+    with psycopg.connect(DATABASE_URL) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE twitch_clip_history
+                SET deletion_pending_at = NULL, deletion_reason = NULL,
+                    deletion_error = NULL, deleted_at = NULL,
+                    retention_locked = TRUE
+                WHERE generated_clip_id = %s AND object_deleted_at IS NULL
+                RETURNING generated_clip_id
+                """,
+                (clip_id,),
+            )
+            row = cursor.fetchone()
+        connection.commit()
+    if not row:
+        raise HTTPException(status_code=404, detail="Clip cannot be restored.")
+    return {"clip_id": row[0], "restored": True, "retention_locked": True}
 
 
 @app.put("/api/settings/publishing")

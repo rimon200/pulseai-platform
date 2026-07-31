@@ -5,6 +5,7 @@ const API_BASE_URL = import.meta.env.VITE_API_URL;
 function Settings() {
   const [settings, setSettings] = useState(null);
   const [automation, setAutomation] = useState(null);
+  const [r2Cleanup, setR2Cleanup] = useState(null);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
@@ -16,6 +17,10 @@ function Settings() {
       .then((response) => response.json())
       .then(setAutomation)
       .catch(() => setAutomation(null));
+    fetch(`${API_BASE_URL}/api/settings/r2-cleanup`)
+      .then((response) => response.json())
+      .then(setR2Cleanup)
+      .catch(() => setR2Cleanup(null));
   }, []);
 
   const update = (name, value) => {
@@ -100,6 +105,23 @@ function Settings() {
           Connect / Reconnect TikTok
         </button>
         {message && <p>{message}</p>}
+      </section>
+      <section style={{ marginTop: 24, padding: 24, background: "#1a2342", borderRadius: 12 }}>
+        <h2>R2 lifecycle cleanup</h2>
+        {r2Cleanup ? (
+          <div>
+            <p>Cleanup: <strong>{r2Cleanup.enabled ? "Enabled" : "Disabled"}</strong></p>
+            <p>Dry run: <strong>{r2Cleanup.dry_run ? "Enabled" : "Disabled"}</strong></p>
+            <p>Unpublished retention: {r2Cleanup.unpublished_retention_days} days</p>
+            <p>Failed retention: {r2Cleanup.failed_retention_days} days</p>
+            <p>Estimated reclaimable storage: {r2Cleanup.estimated_reclaimable_mb || 0} MB</p>
+            <p>Last cleanup run: {r2Cleanup.last_cleanup_run || "Never"}</p>
+            <p>Objects deleted: {r2Cleanup.objects_deleted || 0}</p>
+            <p>Bytes reclaimed: {r2Cleanup.bytes_reclaimed_mb || 0} MB</p>
+          </div>
+        ) : (
+          <p>R2 cleanup status is unavailable.</p>
+        )}
       </section>
       <section
         style={{

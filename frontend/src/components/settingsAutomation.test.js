@@ -22,3 +22,15 @@ test("Settings loads the bandwidth-aware automation status endpoint", () => {
 test("Settings automation status does not expose credential fields", () => {
   assert.doesNotMatch(source, /access_token|secret_access_key|database_url/i);
 });
+
+test("Settings shows safe R2 cleanup configuration and audit metrics", () => {
+  assert.match(source, /\/api\/settings\/r2-cleanup/);
+  assert.match(source, /r2Cleanup\.enabled/);
+  assert.match(source, /r2Cleanup\.dry_run/);
+  assert.match(source, /r2Cleanup\.unpublished_retention_days/);
+  assert.match(source, /r2Cleanup\.failed_retention_days/);
+  assert.match(source, /r2Cleanup\.estimated_reclaimable_mb/);
+  assert.match(source, /r2Cleanup\.last_cleanup_run/);
+  assert.match(source, /r2Cleanup\.objects_deleted/);
+  assert.match(source, /r2Cleanup\.bytes_reclaimed_mb/);
+});

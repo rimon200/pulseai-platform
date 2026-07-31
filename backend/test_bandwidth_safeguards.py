@@ -87,6 +87,19 @@ class BandwidthSafeguardTests(unittest.TestCase):
         client.upload_file.assert_not_called()
         self.assertEqual(result["durable_url"].split("/")[2], "media.invalid")
 
+    def test_cleanup_treats_an_already_missing_exact_object_as_deleted(self):
+        client = self._client()
+        client.head_object.side_effect = self._missing_object_error()
+        boto3_module = SimpleNamespace(client=MagicMock(return_value=client))
+        with patch.dict(os.environ, self.environment, clear=False):
+            with patch.dict(sys.modules, {"boto3": boto3_module}):
+                result = storage_service.delete_video_object_with_result(
+                    "clips/FakeClip/video.mp4",
+                )
+        self.assertTrue(result["deleted"])
+        self.assertTrue(result["already_missing"])
+        client.delete_object.assert_not_called()
+
     def test_frontend_uses_direct_r2_only_after_user_action(self):
         frontend_root = Path(__file__).resolve().parents[1] / "frontend" / "src"
         ai_clips = (

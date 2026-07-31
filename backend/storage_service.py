@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import os
 from pathlib import Path
@@ -262,37 +264,92 @@ def upload_video(video_path: str, clip_id: str) -> dict[str, object]:
     }
 
 
+def get_video_object_size(object_key: object) -> int | None:
+    safe_key = _safe_object_key(object_key)
+    configuration = _storage_configuration()
+    if (
+        not safe_key
+        or not object_storage_enabled()
+        or not all(configuration.values())
+    ):
+        return None
+    try:
+        response = _storage_client(configuration).head_object(
+            Bucket=configuration["bucket"], Key=safe_key,
+        )
+        return int(response.get("ContentLength") or 0)
+    except Exception:
+        return None
+
+
+def delete_video_object_with_result(object_key: object) -> dict[str, object]:
+    """Delete and confirm one exact owned object, returning audit metadata."""
+    safe_key = _safe_object_key(object_key)
+    configuration = _storage_configuration()
+    if not safe_key:
+        return {"deleted": False, "bytes": 0, "error": "unsafe_key"}
+    if not object_storage_enabled() or not all(configuration.values()):
+        return {
+            "deleted": False, "bytes": 0,
+            "error": "object_storage_unavailable",
+        }
+    try:
+        client = _storage_client(configuration)
+        try:
+            existing = client.head_object(
+                Bucket=configuration["bucket"], Key=safe_key,
+            )
+        except Exception as error:
+            response = getattr(error, "response", {})
+            status_code = int(
+                response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+                or 0
+            )
+            error_code = str(response.get("Error", {}).get("Code") or "")
+            if status_code == 404 or error_code in {
+                "404", "NoSuchKey", "NotFound",
+            }:
+                return {
+                    "deleted": True, "bytes": 0, "error": "",
+                    "already_missing": True,
+                }
+            raise
+        object_bytes = int(existing.get("ContentLength") or 0)
+        client.delete_object(Bucket=configuration["bucket"], Key=safe_key)
+        try:
+            client.head_object(Bucket=configuration["bucket"], Key=safe_key)
+        except Exception as error:
+            response = getattr(error, "response", {})
+            status_code = int(
+                response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+                or 0
+            )
+            error_code = str(response.get("Error", {}).get("Code") or "")
+            if status_code == 404 or error_code in {
+                "404", "NoSuchKey", "NotFound",
+            }:
+                return {"deleted": True, "bytes": object_bytes, "error": ""}
+            raise
+        return {
+            "deleted": False, "bytes": 0,
+            "error": "deletion_not_confirmed",
+        }
+    except Exception as error:
+        return {
+            "deleted": False, "bytes": 0,
+            "error": error.__class__.__name__,
+        }
+
+
 def delete_video_object(object_key: str) -> bool:
     """Delete one owned clip object when a future retention job requests it."""
+    result = delete_video_object_with_result(object_key)
     safe_key = str(object_key or "").strip()
-    if not object_storage_enabled():
-        return False
-    if (
-        not safe_key.startswith("clips/")
-        or safe_key.startswith("/")
-        or ".." in Path(safe_key).parts
-    ):
-        print(
-            "OBJECT STORAGE DELETE FAILED | "
-            f"key={safe_key!r} | reason=unsafe_key"
-        )
-        return False
-
-    required = _storage_configuration()
-    if not all(required.values()):
-        print(
-            "OBJECT STORAGE DELETE FAILED | "
-            f"key={safe_key} | reason=incomplete_configuration"
-        )
-        return False
-    try:
-        client = _storage_client(required)
-        client.delete_object(Bucket=required["bucket"], Key=safe_key)
+    if result["deleted"]:
         print(f"OBJECT STORAGE DELETE | key={safe_key}")
         return True
-    except Exception as error:
-        print(
-            "OBJECT STORAGE DELETE FAILED | "
-            f"key={safe_key} | error={error!r}"
-        )
-        return False
+    print(
+        "OBJECT STORAGE DELETE FAILED | "
+        f"key={safe_key!r} | reason={result.get('error') or 'unknown'}"
+    )
+    return False
